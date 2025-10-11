@@ -1,0 +1,133 @@
+# src/core/planner.py
+"""
+Compiles a high-level instruction into a symbolic plan.
+Corresponds to the Planner (Π) in the architecture.
+"""
+from typing import List, Dict, Any
+import re
+import copy
+
+# Use relative import as requested
+from ..knowledge.rule_pool import RulePool
+
+
+class Planner:
+    """
+    A planner that creates and repairs sequences of operators to fulfill an instruction.
+    """
+
+    def __init__(self, config: Dict[str, Any], rule_pool: RulePool):
+        """
+        Initializes the Planner.
+
+        Args:
+            config: Planner-specific configuration.
+            rule_pool: The shared, persistent RulePool instance.
+        """
+        self.config = config
+        self.rule_pool = rule_pool
+
+    def compile(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Takes a natural language instruction and returns an initial plan with grounded operators.
+        """
+        print(f"PLANNER: Compiling instruction -> '{instruction}'")
+        plan = []
+        instruction_lower = instruction.lower()
+
+        # Check for and plan hotel bookings
+        if "hotel" in instruction_lower:
+            op = self.rule_pool.get_operator("BookHotel")
+            if op:
+                params = self._ground_hotel_params(instruction, state)
+                if params:
+                    grounded_op = {"operator": op, "params": params}
+                    plan.append(grounded_op)
+                    print(f"PLANNER: Added 'BookHotel' to plan with params: {params}")
+            else:
+                print("PLANNER: Warning - Could not find 'BookHotel' operator in Rule Pool.")
+
+        # Check for and plan flight bookings
+        if "flight" in instruction_lower:
+            op = self.rule_pool.get_operator("BookFlight")
+            if op:
+                params = self._ground_flight_params(instruction)
+                if params:
+                    grounded_op = {"operator": op, "params": params}
+                    plan.append(grounded_op)
+                    print(f"PLANNER: Added 'BookFlight' to plan with params: {params}")
+            else:
+                print("PLANNER: Warning - 'BookFlight' operator not found in Rule Pool.")
+
+        if plan:
+            operator_names = [p['operator'].name for p in plan]
+            print(f"PLANNER: Plan created with {len(plan)} step(s) -> {operator_names}")
+        else:
+            print("PLANNER: ❌ No plan generated (no matching operators or failed grounding).")
+
+        return plan
+
+    def replan(self, instruction: str, state: Dict[str, Any], failed_plan: List[Dict[str, Any]]) -> List[
+        Dict[str, Any]]:
+        """
+        **NEW**: Attempts to generate an alternative plan when a precondition fails.
+        This is the "Local Repair" mechanism discussed.
+        """
+        print("PLANNER: Attempting to replan after precondition failure...")
+
+        # Simple replan logic for the walkthrough example:
+        # If the BookHotel operator failed with a Corporate Card, try switching to a Personal Card.
+        for i, step in enumerate(failed_plan):
+            if step["operator"].name == "BookHotel":
+                if "CorporateCard" in step["params"].get("payment", ""):
+                    print("PLANNER: Detected failure with Corporate Card. Attempting to switch payment method.")
+
+                    # Create a deep copy to avoid modifying the original failed plan
+                    new_plan = copy.deepcopy(failed_plan)
+
+                    # In a real system, you would query the state for alternatives.
+                    # For this demo, we'll use the known alternative.
+                    alternative_payment = "PersonalCard:PC-1134"
+
+                    # Find the BookHotel step in the new plan and modify its parameters
+                    new_plan[i]["params"]["payment"] = alternative_payment
+                    print(f"PLANNER: New plan generated with payment method: {alternative_payment}")
+                    return new_plan
+
+        print("PLANNER: ❌ No local repair strategy found for this failure.")
+        return failed_plan  # Return the original plan if no alternative is found
+
+    def _ground_hotel_params(self, instruction: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Simulates a Neural Parser for grounding hotel booking details.
+        """
+        params = {}
+
+        loc_match = re.search(r'in\s([\w\s]+?)(?=\sfor|\son)', instruction, re.IGNORECASE)
+        if loc_match:
+            params['location'] = loc_match.group(1).strip()
+
+        date_match = re.search(r'(\w+\s\d+-\d+)', instruction)
+        if date_match:
+            params['dates'] = date_match.group(1)
+
+        # Ground the payment method from the current state
+        params['payment'] = state.get("payment_method", "CorporateCard:CC-5512")
+
+        return params if 'location' in params and 'dates' in params else None
+
+    def _ground_flight_params(self, instruction: str) -> Dict[str, Any]:
+        """
+        Simulates a Neural Parser for grounding flight booking details.
+        """
+        params = {}
+
+        origin_match = re.search(r'from\s([\w\s]+?)(?=\sto|\son)', instruction, re.IGNORECASE)
+        if origin_match:
+            params['origin'] = origin_match.group(1).strip()
+
+        dest_match = re.search(r'to\s([\w\s]+?)(?=\sfor|\son)', instruction, re.IGNORECASE)
+        if dest_match:
+            params['destination'] = dest_match.group(1).strip()
+
+        return params if 'origin' in params else None

@@ -1,0 +1,109 @@
+# SELFEVOLVE Configuration File
+# Based on paper: "A Self-Evolving Neuro-symbolic Architecture for Open-World Instructability"
+
+# System-wide settings
+system:
+  name: "SELFEVOLVE"
+  version: "1.0.0"
+  domain: "travel_planning"
+
+# Planner settings (HTN compiler)
+planner:
+  type: "HTN"
+  max_depth: 5
+  timeout_ms: 100
+
+# Executor settings
+executor:
+  max_retries: 2
+  timeout_seconds: 30
+  enable_verification: true
+
+# Metacognitive control (Section VII)
+metacognition:
+  tau_u: 0.5  # Uncertainty threshold for S1/S2 arbitration
+  tau_p: 0.3  # Violation probability threshold
+  budget_ms: 2000 # Budget for regulation
+  enable_reflection: true
+
+# FDKA Pipeline (Section VIII)
+fdka:
+  scoring_weights:
+    plausibility: 0.35
+    consistency: 0.35
+    utility: 0.20
+    risk: 0.10
+  threshold: 0.48
+  propose_edit:
+    llm_provider: "transformers" # Options: "mock", "transformers"
+
+    # UPDATED: Define multiple offline models and select one to be active.
+    # To switch models, simply change the 'active_model' value below.
+    active_model: "llama3" # Options: "gemma", "llama3", "mistral", or add your own
+
+    local_models:
+      gemma: "google/gemma-1.1-7b-it"
+      llama3: "meta-llama/Llama-3.1-8B"
+      mistral: "mistralai/Mistral-7B-Instruct-v0.3"
+
+    model: "gpt-4" # Fallback or metadata identifier
+    temperature: 0.3
+    num_examples: 3
+  consistency:
+    use_z3: false # Set to true to enable Z3 solver for consistency checks
+  utility:
+    k_similar_traces: 20
+  risk:
+    eta: 0.2 # blast radius weight
+
+# Governance (Section IX)
+governance:
+  provenance:
+    enable: true
+    log_path: "data/logs/provenance.jsonl"
+  trust:
+    alpha: 2 # success prior
+    beta: 1  # failure prior
+  gates:
+    tau_impact: 0.6
+    tau_conf: 0.5
+  canary:
+    num_tests: 5
+  rollback:
+    enable: true
+
+# Knowledge Graphs
+knowledge:
+  process_kg_path: "data/knowledge/process_kg.json"
+  rule_pool_path: "data/knowledge/operators.json"
+
+# Scenarios
+scenario:
+  name: "travel_planning"
+  num_tasks: 50
+  failure_rate: 0.3
+  policy_flip_at: 25
+  seeds:
+    task_generation: 42
+    failure_injection: 1337
+
+# Evaluation settings
+evaluation:
+  baselines: ["static_nesy", "llm_reflect", "verify_only"]
+  ablations: ["no_governance", "no_verify", "no_arbitration"]
+
+# Experiment Control
+# This section allows you to specify which agent to run for an evaluation.
+experiment:
+  # Options: "selfevolve", "static_ns", "llm_reflect", "verify_only"
+  agent_to_run: "selfevolve"
+
+# Output settings
+output:
+  results_dir: "data/results"
+  plots_dir: "data/results/plots"
+
+# Logging
+logging:
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR
+  log_file: "data/logs/selfevolve.log"
