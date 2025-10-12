@@ -35,7 +35,7 @@ fdka:
     risk: 0.10
   threshold: 0.48
   propose_edit:
-    llm_provider: "transformers" # Options: "mock", "transformers"
+    llm_provider: "mock" # Options: "mock", "transformers"
 
     # UPDATED: Define multiple offline models and select one to be active.
     # To switch models, simply change the 'active_model' value below.
@@ -49,6 +49,9 @@ fdka:
     model: "gpt-4" # Fallback or metadata identifier
     temperature: 0.3
     num_examples: 3
+    max_new_tokens: 300  # Limit output tokens to prevent excessive generation during inference
+    repetition_penalty: 1.1  # Prevent repetitive loops in LLM output
+    no_repeat_ngram_size: 3  # Avoid n-gram repetition in generated text
   consistency:
     use_z3: false # Set to true to enable Z3 solver for consistency checks
   utility:

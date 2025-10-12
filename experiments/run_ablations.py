@@ -13,8 +13,8 @@ import copy
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ..src.core.system import SelfEvolveSystem
-from ..src.utils.config_loader import load_config
+from src.core.system import SelfEvolveSystem
+from src.utils.config_loader import load_config
 
 
 class AblationStudy:
