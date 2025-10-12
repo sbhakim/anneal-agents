@@ -242,11 +242,23 @@ class FullEvaluationRunner:
             # Import and run directly
             from src.core.system import SelfEvolveSystem
 
-            # Load config
-            config = load_config("config.yaml")
+            # ✅ FIX: Resolve config path relative to project root
+            project_root = Path(__file__).parent.parent
+            config_path = project_root / "config.yaml"
+
+            print(f"📄 Loading config from: {config_path}")
+
+            if not config_path.exists():
+                print(f"❌ Config file not found at: {config_path}")
+                print(f"   Current directory: {Path.cwd()}")
+                print(f"   Looking in: {config_path.absolute()}")
+                raise FileNotFoundError(f"Config not found: {config_path}")
+
+            # Load config with absolute path
+            config = load_config(str(config_path))
 
             # Override for demo mode
-            config['logging']['level'] = 'INFO'
+            config['logging']['level'] = 'WARNING'  # ✅ Changed to WARNING to reduce output
 
             if self.quick_mode:
                 config['scenario']['num_tasks'] = 10
