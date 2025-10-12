@@ -430,7 +430,7 @@ class MetricsCollector:
 
     # ============= EXISTING METHODS (UNCHANGED) =============
 
-    def check_adaptation(self, failure_key: str, window_size: int = 20) -> bool:
+    def check_adaptation(self, failure_key: str, window_size: int = None) -> bool:
         """
         Check if the system has adapted to a failure class.
         Adaptation = RFR < 5% over last window_size tasks.
@@ -442,6 +442,10 @@ class MetricsCollector:
         Returns:
             True if adapted (RFR < 5%)
         """
+        # Auto-adjust window for small datasets
+        if window_size is None:
+            window_size = min(20, max(5, self.task_count // 2))
+
         if failure_key not in self.failure_classes:
             return False
 

@@ -197,6 +197,7 @@ class FailureInjector:
                 self.patched_operators.add(operator_name)
                 print(
                     f"INJECTOR: 🎓 {operator_name} marked as permanently patched after {self._patch_successes[operator_name]} successes.")
+                print(f"         ✓ Future tasks will not inject failures for this operator.")  # NEW
             else:
                 print(
                     f"INJECTOR: 📊 {operator_name} success count: {self._patch_successes[operator_name]}/3 before permanent patching.")

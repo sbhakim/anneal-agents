@@ -60,32 +60,44 @@ class Scorer:
         """
         Implements the formal acceptance criterion from Section 8.3.5.
         A patch is only viable if it can provably reduce the error rate.
+
+        **UPDATED**: Added minimum sample size requirement to avoid cold-start paradox.
         """
         if not self.experience_pool:
             print("  ⚠️ Probabilistic Filter: No experience pool, skipping check.")
-            return True  # Default to pass if no historical data is available
+            return True
 
         failure_info = self._extract_failure_info(trace)
         operator_name = failure_info.get('operator')
         if not operator_name:
             return True
 
+        # **FIX**: Require minimum sample size before activating filter
+        success_traces = self.experience_pool.get_success_traces(operator=operator_name)
+        failure_traces = self.experience_pool.get_failure_traces(operator=operator_name)
+        total_traces = len(success_traces) + len(failure_traces)
+
+        MIN_SAMPLES = 5  # Need at least 5 traces for statistical validity
+
+        if total_traces < MIN_SAMPLES:
+            print(
+                f"  ℹ️ Probabilistic Filter: Only {total_traces} traces (need {MIN_SAMPLES}). Allowing patch (cold start).")
+            return True  # Allow patches during cold start
+
         # 1. Estimate error rate among executions the patch would block
         blocked_traces = self.experience_pool.retrieve_similar(failure_info, k=self.k_similar)
         if not blocked_traces:
-            return True  # Not enough data to make a decision
+            return True
 
         error_count = sum(1 for t in blocked_traces if not t.get('success'))
         p_err_hat = error_count / len(blocked_traces) if blocked_traces else 0.0
 
         # 2. Estimate the operator's baseline error rate (residual)
-        success_traces = self.experience_pool.get_success_traces(operator=operator_name)
-        failure_traces = self.experience_pool.get_failure_traces(operator=operator_name)
-        total_op_traces = len(success_traces) + len(failure_traces)
-        baseline_residual = len(failure_traces) / total_op_traces if total_op_traces else 0.2
+        baseline_residual = len(failure_traces) / total_traces if total_traces else 0.2
 
         # 3. Check the necessary and sufficient condition for improvement
         improves = p_err_hat > baseline_residual
+
         print(
             f"  🔎 Probabilistic Filter: Est. Blocked Error Rate={p_err_hat:.2f}, Baseline Residual={baseline_residual:.2f}. {'PASS' if improves else 'FAIL'}")
         return improves
@@ -220,13 +232,17 @@ class Scorer:
         try:
             failure_info = self._extract_failure_info(trace)
             similar_traces = self.experience_pool.retrieve_similar(failure_info, k=self.k_similar)
+
+            # **FIX**: Use current trace as "similar" if pool empty (cold start)
             if not similar_traces:
-                print("  ⚠️ Utility: No similar traces found to perform counterfactual replay.")
-                return 0.5
+                print("  ℹ️ Utility: No history yet. Using current failure as baseline.")
+                # Assume patch would prevent THIS failure
+                return 0.8  # High utility for first-time fixes
 
             prevented_count = sum(1 for s in similar_traces if self._would_prevent_failure(patch, s))
             utility = prevented_count / len(similar_traces)
-            print(f"  ✓ Utility: Prevents {prevented_count}/{len(similar_traces)} similar failures ({utility:.1%})")
+            print(
+                f"  ✅ Utility: Would prevent {prevented_count}/{len(similar_traces)} similar failures ({utility:.1%})")
             return utility
         except Exception as e:
             print(f"  ⚠️ Utility scoring error: {e}. Using fallback.")

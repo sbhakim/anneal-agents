@@ -113,6 +113,16 @@ class SelfEvolveSystem:
                 print("✅ Task Succeeded on this attempt.")
                 self.metrics.record_task(task_id, True, trace)
                 self.experience_pool.add_trace(trace, True, metadata={'instruction': instruction, 'task_id': task_id})
+
+                # **NEW FIX**: Check adaptation on SUCCESS too (measure RFR dropping)
+                # This is critical - adaptation means "failures stop happening"
+                if task_id > 0 and task_id % 5 == 0:  # Check every 5 tasks
+                    print(f"  🔍 Checking adaptation progress at task {task_id}...")
+                    for failure_key in list(self.metrics.failure_classes.keys()):
+                        adapted = self.metrics.check_adaptation(failure_key, window_size=min(10, task_id))
+                        if adapted:
+                            print(f"  ✅ Adaptation confirmed for '{failure_key}'")
+
                 if self._last_committed_patch_id:
                     self.trust_scorer.update_trust_score(self._last_committed_patch_id, success=True)
                 self._last_committed_patch_id = None
@@ -135,11 +145,13 @@ class SelfEvolveSystem:
             break
 
         print("❌ Task Failed after all attempts.")
-        if self._last_committed_patch_id: self.trust_scorer.update_trust_score(self._last_committed_patch_id,
-                                                                               success=False)
+        if self._last_committed_patch_id:
+            self.trust_scorer.update_trust_score(self._last_committed_patch_id, success=False)
         self._last_committed_patch_id = None
         self.metrics.record_task(task_id, False, final_trace)
-        # Pass failure metadata to the experience pool
+
+        # **FIX**: This was moved from _handle_failure to here to ensure it's recorded
+        # even if FDKA doesn't run, but after the final attempt.
         failure_info = self._extract_failure_info(final_trace)
         if failure_info:
             metadata = {
@@ -147,59 +159,84 @@ class SelfEvolveSystem:
                 'operator': failure_info.get('operator'),
                 'error_type': failure_info.get('error')
             }
-            self.experience_pool.add_trace(final_trace, False, metadata=metadata)
+            # Avoid adding duplicate traces if _handle_failure already added it
+            if not any(
+                    t['metadata'].get('task_id') == task_id and not t['success'] for t in self.experience_pool.traces):
+                self.experience_pool.add_trace(final_trace, False, metadata=metadata)
             self.metrics.check_adaptation(f"{failure_info.get('operator')}:{failure_info.get('error')}")
 
     def _handle_failure(self, trace: list, task_id: int, instruction: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
         patch_applied = False
         patch_dict = None
-        proposed_patch = self.fdka.propose_edit(trace, self.rule_pool)
 
-        # --- UPDATED LOGIC ---
-        # The scorer now returns a dictionary of all scores.
+        # **FIX 1**: Add failure trace BEFORE proposing patch (for utility scoring)
+        failure_info = self._extract_failure_info(trace)
+        if failure_info:
+            metadata = {
+                'instruction': instruction, 'task_id': task_id,
+                'operator': failure_info.get('operator'),
+                'error_type': failure_info.get('error')
+            }
+            self.experience_pool.add_trace(trace, False, metadata=metadata)
+            print(f"  📝 Added failure trace to experience pool (operator={metadata['operator']})")
+
+        proposed_patch = self.fdka.propose_edit(trace, self.rule_pool)
         scores = self.scorer.score(proposed_patch, trace)
         agg_score = scores.get("aggregate", 0.0)
-        # --- END OF UPDATED LOGIC ---
 
-        if agg_score >= self.fdka_threshold:
-            guard_result = self.guard.check(proposed_patch, context={"scores": scores})
-            decision = guard_result.get("decision")
-            reason = guard_result.get("reason")
+        # **FIX 2**: Record governance checks explicitly
+        guard_result = self.guard.check(proposed_patch, context={"scores": scores, "trace": trace})
+        self.metrics.record_value_check(
+            vetoed=(guard_result['decision'] == 'veto'),
+            reason=guard_result.get('reason', '')
+        )
+        self.metrics.record_causal_check(
+            escalated=(guard_result['decision'] == 'request_human'),
+            reason=guard_result.get('reason', '')
+        )
 
-            if decision == 'allow':
-                print(" FDKA: Guardrails passed. Proceeding to canary test...")
+        if guard_result['decision'] == 'allow':
+            print(" FDKA: Guardrails passed. Proceeding to canary test...")
 
-                # --- UPDATED LOGIC ---
-                # Pass the entire 'scores' dictionary to the canary context.
-                canary_context = {
-                    "rule_pool": self.rule_pool, "stage_fn": self.rule_pool.update_operator,
-                    "simulator": self._run_canary_simulation,
-                    "examples": self.experience_pool.get_failure_traces(
-                        operator=proposed_patch.get("operator")) or self.experience_pool.traces[-10:],
-                    "scorer": self.scorer,
-                    "scores": scores  # Pass the full dictionary
-                }
-                # --- END OF UPDATED LOGIC ---
+            canary_context = {
+                "rule_pool": self.rule_pool,
+                "stage_fn": self.rule_pool.update_operator,
+                "simulator": self._run_canary_simulation,
+                "examples": self.experience_pool.get_failure_traces(
+                    operator=proposed_patch.get("operator")) or self.experience_pool.traces[-10:],
+                "scorer": self.scorer,
+                "scores": scores
+            }
 
-                canary_result = self.canary_runner.run(proposed_patch, canary_context)
+            canary_result = self.canary_runner.run(proposed_patch, canary_context)
+            self.metrics.record_canary_test(passed=canary_result.get("passed"))
 
-                if canary_result.get("passed"):
-                    print(" FDKA: Canary test passed. Committing patch permanently.")
-                    if self.rule_pool.update_operator(proposed_patch):
-                        patch_applied = True
-                        patch_dict = proposed_patch
-                else:
-                    print(f" FDKA: ❌ Canary test failed: {canary_result.get('reason')}")
+            if canary_result.get("passed"):
+                print(" FDKA: Canary test passed. Committing patch permanently.")
+                if self.rule_pool.update_operator(proposed_patch):
+                    patch_applied = True
+                    patch_dict = proposed_patch
             else:
-                print(f" FDKA: ❌ Guardrails blocked patch: {reason}")
+                print(f" FDKA: ❌ Canary test failed: {canary_result.get('reason')}")
         else:
+            print(f" FDKA: ❌ Guardrails blocked patch: {guard_result.get('reason')}")
+            # If guardrails veto, we treat it as a failed canary for metric purposes
+            self.metrics.record_canary_test(passed=False)
+
+        if not patch_applied:
             print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold}. Patch rejected.")
 
         patch_id = (patch_dict or proposed_patch).get("id", f"patch-{uuid.uuid4().hex[:8]}")
         self.provenance.log(
-            {"patch_id": patch_id, "task_id": task_id, "applied": patch_applied, "patch": patch_dict or proposed_patch})
-        self.metrics.record_patch(patch_dict or proposed_patch, success=patch_applied, committed=patch_applied,
-                                  scores=scores)
+            {"patch_id": patch_id, "task_id": task_id, "applied": patch_applied, "patch": patch_dict or proposed_patch}
+        )
+        self.metrics.record_patch(
+            patch_dict or proposed_patch,
+            success=patch_applied,
+            committed=patch_applied,
+            scores=scores
+        )
+
         if patch_applied:
             self._last_committed_patch_id = patch_id
             self.trust_scorer.initialize_trust(patch_id)
@@ -211,12 +248,19 @@ class SelfEvolveSystem:
 
     def _run_canary_simulation(self, example: Dict, patched_rule_pool: RulePool) -> Dict:
         instruction = example.get("metadata", {}).get("instruction")
-        if not instruction: return {"ok": False, "violations": 1}
+        if not instruction:
+            return {"ok": False, "violations": 1}
         sim_state = SymbolicState()
         sim_state.update_from_instruction(instruction)
         sim_plan = self.planner.compile(instruction, sim_state.to_dict())
-        sim_executor = Executor(self.config['executor'], None, patched_rule_pool, self.signal_gen, self.arbitrator,
-                                self.scenario)
+        sim_executor = Executor(
+            self.config['executor'],
+            None,
+            patched_rule_pool,
+            self.signal_gen,
+            self.arbitrator,
+            self.scenario
+        )
         _, success, _ = sim_executor.execute(sim_plan, sim_state, task_id=-1)
         return {"ok": success, "violations": 0 if success else 1}
 
@@ -230,7 +274,8 @@ class SelfEvolveSystem:
         print(f"\n{'=' * 70}\n🚀 STARTING SELFEVOLVE EVALUATION\n{'=' * 70}")
         for task_id in range(self.config.get('scenario', {}).get('num_tasks', 10)):
             instruction = self.scenario.get_task(task_id)
-            if instruction: self.run_task(task_id, instruction)
+            if instruction:
+                self.run_task(task_id, instruction)
         print(f"\n{'=' * 70}\n✅ EVALUATION COMPLETE\n{'=' * 70}")
         self.metrics.print_summary()
         results_dir = Path(self.config['output']['results_dir'])

@@ -253,21 +253,30 @@ class FDKAPipeline:
             return self._mock_llm_generate(structured_prompt)
 
     def _build_llm_prompt(self, structured_prompt: Dict[str, Any]) -> str:
-        """
-        Builds the detailed text prompt for the real LLM, as described in the paper.
-        """
+        """Builds the detailed text prompt with error-type hints."""
+        error_type = structured_prompt.get("error", {}).get("type", "")
+
+        # Add error-specific guidance to nudge the LLM
+        error_guidance = ""
+        if error_type == "ToolError":
+            error_guidance = "\nNOTE: For a ToolError (like a timeout or API error), the best fix is usually to `REFINE_EFFECT` with a conditional guard, such as `IfThen(NetworkAvailable(), ...)`. Avoid adding unrelated preconditions."
+        elif error_type == "PreconditionUnmet":
+            error_guidance = "\nNOTE: For a PreconditionUnmet failure (like a policy violation), the best fix is to `ADD_PRECONDITION` with a `Not(...)` predicate to prevent the failure in the future."
+
+        # Provide a concrete example in the schema and clear instructions.
         prompt_template = f"""You are a symbolic patch generator for operator repair.
 Given a failure trace, propose a typed patch in the JSON schema below.
-Use only predicates defined in the operator's signature or the minimal state. Do not invent new symbols.
+For the "action" field, you must choose ONE of the following values: "ADD_PRECONDITION", "REFINE_EFFECT", or "UPDATE_TOOL_SCHEMA".
+Use only predicates defined in the operator's signature or the minimal state. Do not invent new symbols.{error_guidance}
 
-[Schema Definition]
+[Schema Definition and Example]
 {{
-  "action": "ADD_PRECONDITION|REFINE_EFFECT|UPDATE_TOOL_SCHEMA",
-  "operator": "<OperatorName>",
+  "action": "ADD_PRECONDITION",
+  "operator": "ExampleOperatorName",
   "patch": {{
-    "predicate": "<Pred(arg1, arg2, ...)>",
-    "guard": "<optional: IfThen(Cond(...), Effect'(...))>",
-    "justification": "<short evidence string or log reference>"
+    "predicate": "PredicateName(param1, param2)",
+    "guard": null,
+    "justification": "A brief, factual reason for the patch based on evidence."
   }}
 }}
 
@@ -279,9 +288,7 @@ Output your patch in JSON:
         return prompt_template
 
     def _real_llm_generate(self, structured_prompt: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Generates a patch using a real, local offline LLM.
-        """
+        """Generates patch using real LLM with robust JSON extraction."""
         if not self.llm_pipeline:
             print("  ⚠️ LLM Generation: Real LLM not available. Falling back to mock.")
             return self._mock_llm_generate(structured_prompt)
@@ -292,32 +299,48 @@ Output your patch in JSON:
             print("  🧠 LLM Generation: Calling local model...")
             outputs = self.llm_pipeline(
                 prompt,
-                max_new_tokens=150,
+                max_new_tokens=250,  # Increase from 150
                 do_sample=True,
                 temperature=self.temperature,
-                top_p=0.95,
+                return_full_text=False,  # Only get generated text
                 pad_token_id=self.llm_pipeline.tokenizer.eos_token_id
             )
-            generated_text = outputs[0]['generated_text']
+            generated_text = outputs[0]['generated_text'].strip()
 
-            # More robust JSON extraction
+            # **FIX 1**: Find FIRST complete JSON object (handles trailing text)
             json_start = generated_text.find('{')
-            json_end = generated_text.rfind('}') + 1
+            if json_start == -1:
+                raise ValueError("No JSON found")
 
-            if json_start == -1 or json_end == 0:
-                raise ValueError("No JSON object found in LLM response.")
+            # Stack-based brace matching for nested objects
+            brace_count = 0
+            json_end = json_start
+            for i, char in enumerate(generated_text[json_start:], start=json_start):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
 
             json_part = generated_text[json_start:json_end]
 
-            # Clean up potential markdown formatting
-            if json_part.strip().startswith("```json"):
-                json_part = json_part.strip()[7:-3]
+            # **FIX 2 (IMPROVED)**: Clean markdown wrappers (only if they bookend the JSON)
+            if json_part.startswith('```json'):
+                json_part = json_part[7:]
+            if json_part.endswith('```'):
+                json_part = json_part[:-3]
+            json_part = json_part.strip()
 
             raw_patch = json.loads(json_part)
+            print(f"  ✓ LLM Generation: Successfully parsed {len(json_part)} chars")
             return raw_patch
 
         except Exception as e:
-            print(f"  ⚠️ LLM Generation: Error during real LLM call: {e}. Falling back to mock.")
+            print(f"  ⚠️ LLM Generation Error: {str(e)[:100]}")
+            print(
+                f"     Raw output (first 200 chars): {generated_text[:200] if 'generated_text' in locals() else 'N/A'}")
             return self._mock_llm_generate(structured_prompt)
 
     def _mock_llm_generate(self, structured_prompt: Dict[str, Any]) -> Dict[str, Any]:

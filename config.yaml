@@ -83,6 +83,8 @@ scenario:
   num_tasks: 50
   failure_rate: 0.3
   policy_flip_at: 25
+  min_failures_in_prefix: 3  # NEW: Force failures early
+  prefix_len: 10             # NEW: Within first 10 tasks
   seeds:
     task_generation: 42
     failure_injection: 1337
@@ -97,6 +99,13 @@ evaluation:
 experiment:
   # Options: "selfevolve", "static_ns", "llm_reflect", "verify_only"
   agent_to_run: "selfevolve"
+
+# NEW SECTION: Demo-specific overrides (activated in main.py)
+demo:
+  num_tasks: 20
+  failure_rate: 0.4
+  min_failures_in_prefix: 5
+  metrics_window_size: 10
 
 # Output settings
 output:

@@ -54,10 +54,16 @@ def main():
         config = load_config(args.config)
         print(f"✅ Configuration loaded from: {args.config}\n")
 
-        # For a demo run, override the number of tasks
+        # For a demo run, override settings for better visibility
         if args.mode == 'demo':
-            print("🎯 Running DEMO mode (10 tasks)...\n")
-            config['scenario']['num_tasks'] = 10
+            print("🎯 Running DEMO mode (20 tasks)...\n")
+            demo_overrides = config.get('demo', {})
+            config['scenario']['num_tasks'] = demo_overrides.get('num_tasks', 20)
+            config['scenario']['failure_rate'] = demo_overrides.get('failure_rate', 0.4)
+            config['scenario']['min_failures_in_prefix'] = demo_overrides.get('min_failures_in_prefix', 5)
+            # Override metrics window for faster adaptation detection
+            if 'metacognition' not in config: config['metacognition'] = {}
+            config['metacognition']['adaptation_window'] = demo_overrides.get('metrics_window_size', 10)
         else:
             print("📈 Running FULL EVALUATION...\n")
 
