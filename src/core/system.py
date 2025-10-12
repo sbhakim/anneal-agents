@@ -5,6 +5,7 @@ This final version integrates all architectural components from the manuscript:
 - The Metacognitive loop is now fully dynamic.
 - The FDKA pipeline now includes the crucial "Canary Deployment" stage
   before any patch is permanently committed, ensuring a final safety check.
+- **UPDATED**: Added Table 3-4 export and Reflection integration for manuscript data.
 """
 
 from pathlib import Path
@@ -29,6 +30,7 @@ from ..governance.canary import CanaryRunner
 # Metacognition
 from ..metacognition.signals import SignalGenerator
 from ..metacognition.arbitrator import Arbitrator
+from ..metacognition.reflection import Reflection  # ✅ ADDED for Algorithm 1 completeness
 
 # Knowledge
 from ..knowledge.rule_pool import RulePool
@@ -75,6 +77,15 @@ class SelfEvolveSystem:
         self.fdka_threshold = config.get('fdka', {}).get('threshold', 0.5)
         self.metrics = MetricsCollector()
         self._last_committed_patch_id: Optional[str] = None
+
+        # ✅ ADDED: Initialize Reflection component (Algorithm 1, Section VI-C)
+        self.reflection = Reflection(
+            config['metacognition'],
+            self.arbitrator,
+            self.metrics,
+            self.experience_pool
+        )
+
         self.logger.info("✅ SELFEVOLVE system ready")
         self.logger.info("=" * 70)
 
@@ -114,14 +125,24 @@ class SelfEvolveSystem:
                 self.metrics.record_task(task_id, True, trace)
                 self.experience_pool.add_trace(trace, True, metadata={'instruction': instruction, 'task_id': task_id})
 
-                # **NEW FIX**: Check adaptation on SUCCESS too (measure RFR dropping)
-                # This is critical - adaptation means "failures stop happening"
+                # Check adaptation on SUCCESS (measure RFR dropping)
                 if task_id > 0 and task_id % 5 == 0:  # Check every 5 tasks
                     print(f"  🔍 Checking adaptation progress at task {task_id}...")
                     for failure_key in list(self.metrics.failure_classes.keys()):
                         adapted = self.metrics.check_adaptation(failure_key, window_size=min(10, task_id))
                         if adapted:
                             print(f"  ✅ Adaptation confirmed for '{failure_key}'")
+
+                # ✅ ADDED: Reflection after successful task (Algorithm 1, line 18)
+                # Integrate post-execution reflection for threshold tuning
+                if task_id > 0 and task_id % 5 == 0:
+                    print(f"  💭 Running reflection (task {task_id})...")
+                    try:
+                        self.reflection.reflect(trace, success, task_id)
+                        print(
+                            f"     Updated thresholds: τ_u={self.arbitrator.tau_u:.2f}, τ_p={self.arbitrator.tau_p:.2f}")
+                    except Exception as e:
+                        print(f"     ⚠️ Reflection failed: {e}")
 
                 if self._last_committed_patch_id:
                     self.trust_scorer.update_trust_score(self._last_committed_patch_id, success=True)
@@ -150,8 +171,7 @@ class SelfEvolveSystem:
         self._last_committed_patch_id = None
         self.metrics.record_task(task_id, False, final_trace)
 
-        # **FIX**: This was moved from _handle_failure to here to ensure it's recorded
-        # even if FDKA doesn't run, but after the final attempt.
+        # Record failure trace if not already added
         failure_info = self._extract_failure_info(final_trace)
         if failure_info:
             metadata = {
@@ -169,7 +189,7 @@ class SelfEvolveSystem:
         patch_applied = False
         patch_dict = None
 
-        # **FIX 1**: Add failure trace BEFORE proposing patch (for utility scoring)
+        # Add failure trace BEFORE proposing patch (for utility scoring)
         failure_info = self._extract_failure_info(trace)
         if failure_info:
             metadata = {
@@ -184,7 +204,7 @@ class SelfEvolveSystem:
         scores = self.scorer.score(proposed_patch, trace)
         agg_score = scores.get("aggregate", 0.0)
 
-        # **FIX 2**: Record governance checks explicitly
+        # Record governance checks explicitly
         guard_result = self.guard.check(proposed_patch, context={"scores": scores, "trace": trace})
         self.metrics.record_value_check(
             vetoed=(guard_result['decision'] == 'veto'),
@@ -272,14 +292,40 @@ class SelfEvolveSystem:
 
     def run_evaluation(self) -> MetricsCollector:
         print(f"\n{'=' * 70}\n🚀 STARTING SELFEVOLVE EVALUATION\n{'=' * 70}")
+
+        # Run all tasks
         for task_id in range(self.config.get('scenario', {}).get('num_tasks', 10)):
             instruction = self.scenario.get_task(task_id)
             if instruction:
                 self.run_task(task_id, instruction)
+
         print(f"\n{'=' * 70}\n✅ EVALUATION COMPLETE\n{'=' * 70}")
+
+        # Print summary
         self.metrics.print_summary()
+
+        # Save results
         results_dir = Path(self.config['output']['results_dir'])
+        results_dir.mkdir(parents=True, exist_ok=True)
+
         self.metrics.save(results_dir / "metrics.json")
         self.experience_pool.save(results_dir / "experience_pool.json")
+
+        # ✅ ADDED: Export manuscript data tables (Tables 3-4)
+        # Generate CSV files for per-failure-class analysis and governance statistics
+        print(f"\n📊 Generating manuscript data tables...")
+        try:
+            self.metrics.export_failure_analysis_csv(results_dir / "table3_per_failure.csv")
+            print(f"   ✅ Table 3: {results_dir / 'table3_per_failure.csv'}")
+        except Exception as e:
+            print(f"   ⚠️ Table 3 export failed: {e}")
+
+        try:
+            self.metrics.export_governance_csv(results_dir / "table4_governance.csv")
+            print(f"   ✅ Table 4: {results_dir / 'table4_governance.csv'}")
+        except Exception as e:
+            print(f"   ⚠️ Table 4 export failed: {e}")
+
         print(f"\n💾 Results saved to: {results_dir}")
+
         return self.metrics
