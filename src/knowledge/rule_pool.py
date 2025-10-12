@@ -2,10 +2,11 @@
 """
 Manages the collection of all available operators (R_rules).
 UPDATED:
-- Added the missing `list_preconditions` method, which is required by the
-  FDKA pipeline's serialization stage to construct the LLM prompt.
-- Fixed idempotency bug: Effects are now checked by function name to prevent duplicates.
-- CRITICAL FIX: Added ValidPayment predicate handler to support payment validation patches.
+- Added the missing `list_preconditions` method for FDKA serialization.
+- Fixed idempotency bug: Effects are now checked by function name.
+- Added ValidPayment predicate handler to support payment validation patches.
+- CRITICAL FIX: Resolved bug where attaching an attribute to a boolean return value
+  caused an AttributeError. Methods now return a (success, skipped) tuple.
 """
 from typing import Dict, Any, Callable, List, Tuple, Optional, Set
 import re
@@ -304,17 +305,19 @@ class RulePool:
         print(f"\n  🔧 RULE_POOL: Applying patch {patch_id} to {op_name}")
         print(f"     Action: {action}, Details: {details}")
 
-        success = False
+        success, skipped = False, False
         if action == "ADD_PRECONDITION":
-            success = self._add_precondition(op, details, just)
+            success, skipped = self._add_precondition(op, details, just)
         elif action == "REFINE_EFFECT":
-            success = self._refine_effect(op, details, just)
+            success, skipped = self._refine_effect(op, details, just)
         elif action == "UPDATE_TOOL_SCHEMA":
+            # This action doesn't have a duplicate check, so it's never skipped
             success = self._update_schema(op, details, just)
+            skipped = False
 
         if success:
-            # Only update metadata if a change was actually made or confirmed
-            if not getattr(success, "__skipped__", False):
+            # Only update metadata if a change was actually made (not skipped)
+            if not skipped:
                 self._update_metadata(op, patch_id)
                 self.stats['total_patches_applied'] += 1
                 self.stats['patches_by_type'][action] = self.stats['patches_by_type'].get(action, 0) + 1
@@ -325,30 +328,28 @@ class RulePool:
             print(f"  ❌ RULE_POOL: Patch {patch_id} failed to apply.")
             return False
 
-    def _add_precondition(self, op: Operator, details: str, just: str) -> bool:
+    def _add_precondition(self, op: Operator, details: str, just: str) -> Tuple[bool, bool]:
         new_pre = self.predicate_factory.create_precondition(details, op.name)
         if not new_pre:
-            return False
+            return False, False
 
         pred_name = getattr(new_pre, "__name__", "anon")
 
         # Check for duplicates
         if pred_name in {getattr(fn, "__name__", "") for fn in op.preconditions}:
             print(f"  ℹ️ Precondition '{pred_name}' already exists. Skipping duplicate.")
-            success = True
-            setattr(success, "__skipped__", True)
-            return success
+            return True, True
 
         op.preconditions.append(new_pre)
         self.learned_predicates.add(pred_name)
         print(f"  ✅ Added precondition '{pred_name}' to {op.name}.")
-        return True
+        return True, False
 
-    def _refine_effect(self, op: Operator, details: str, just: str) -> bool:
+    def _refine_effect(self, op: Operator, details: str, just: str) -> Tuple[bool, bool]:
         new_eff = self.effect_factory.create_effect(details, op.name)
         if not new_eff:
             print(f"  ⚠️ Failed to create effect from: {details[:60]}")
-            return False
+            return False, False
 
         effect_name = getattr(new_eff, "__name__", "anon_eff")
 
@@ -359,9 +360,7 @@ class RulePool:
             existing_details = [getattr(fn, "__details__", "") for fn in op.effects]
             if any(details in ed or ed in details for ed in existing_details if ed):
                 print(f"  ℹ️ Effect '{effect_name}' with similar details already exists. Skipping duplicate.")
-                success = True
-                setattr(success, "__skipped__", True)
-                return success
+                return True, True
 
         # Attach details for future comparison
         setattr(new_eff, "__details__", details)
@@ -369,7 +368,7 @@ class RulePool:
         op.effects.append(new_eff)
         self.learned_effects.add(effect_name)
         print(f"  ✅ Added effect '{effect_name}' to {op.name}.")
-        return True
+        return True, False
 
     def _update_schema(self, op: Operator, details: str, just: str) -> bool:
         op.metadata['schema_update'] = details

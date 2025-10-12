@@ -35,11 +35,11 @@ fdka:
     risk: 0.10
   threshold: 0.48
   propose_edit:
-    llm_provider: "mock" # Options: "mock", "transformers"
+    llm_provider: "transformers" # Options: "mock", "transformers"
 
     # UPDATED: Define multiple offline models and select one to be active.
     # To switch models, simply change the 'active_model' value below.
-    active_model: "llama3" # Options: "gemma", "llama3", "mistral", or add your own
+    active_model: "mistral" # Options: "gemma", "llama3", "mistral", or add your own
 
     local_models:
       gemma: "google/gemma-1.1-7b-it"
