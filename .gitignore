@@ -24,3 +24,6 @@ experiments/data/
 experiments/experiments/
 experiments/
 
+
+# specific .py files
+test_canary.py

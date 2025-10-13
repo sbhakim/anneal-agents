@@ -34,30 +34,41 @@ fdka:
     utility: 0.20
     risk: 0.10
   threshold: 0.48
+
+  # ✅ MAIN PROVIDER SELECTION
+  # Options: "openai", "deepseek", "transformers", "mock"
   propose_edit:
-    llm_provider: "transformers" # Options: "mock", "transformers"
+    llm_provider: "deepseek"  # ✅ Change this to switch providers
 
-    # UPDATED: Define multiple offline models and select one to be active.
-    # To switch models, simply change the 'active_model' value below.
-    active_model: "mistral" # Options: "gemma", "llama3", "mistral", or add your own
-
-    local_models:
-      gemma: "google/gemma-1.1-7b-it"
-      llama3: "meta-llama/Llama-3.1-8B"
-      mistral: "mistralai/Mistral-7B-Instruct-v0.3"
-
-    model: "gpt-4" # Fallback or metadata identifier
+    # ✅ FLAT STRUCTURE: Model settings at same level
+    model: "deepseek-chat"    # Used if llm_provider="openai"
     temperature: 0.3
-    num_examples: 3
-    max_new_tokens: 300  # Limit output tokens to prevent excessive generation during inference
-    repetition_penalty: 1.1  # Prevent repetitive loops in LLM output
-    no_repeat_ngram_size: 3  # Avoid n-gram repetition in generated text
+    max_tokens: 2000
+    timeout_sec: 60.0
+    max_retries: 4
+
+    # ✅ Optional: Override base_url for custom endpoints
+    # base_url: "https://api.openai.com/v1"  # Uncomment if needed
+
+  # ✅ Alternative provider configs (activate by changing llm_provider above)
+  # When using DeepSeek, change llm_provider to "deepseek" and set:
+  # model: "deepseek-chat"
+  # base_url: "https://api.deepseek.com"
+
+  # When using local Transformers, change llm_provider to "transformers" and set:
+  # model: "mistralai/Mistral-7B-Instruct-v0.3"
+  # Or use one of: google/gemma-2-9b, meta-llama/Llama-3.1-8B, Qwen/Qwen2.5-7B-Instruct
+
   consistency:
-    use_z3: false # Set to true to enable Z3 solver for consistency checks
+    use_z3: false
   utility:
     k_similar_traces: 20
   risk:
-    eta: 0.2 # blast radius weight
+    eta: 0.2
+  budget:
+    beta_edge: 5
+    beta_step: 10
+    beta_tok: 1000
 
 # Governance (Section IX)
 governance:
@@ -65,13 +76,15 @@ governance:
     enable: true
     log_path: "data/logs/provenance.jsonl"
   trust:
-    alpha: 2 # success prior
-    beta: 1  # failure prior
+    alpha: 2
+    beta: 1
   gates:
     tau_impact: 0.6
     tau_conf: 0.5
   canary:
-    num_tests: 5
+    num_tests: 8
+    statistical_max_fail_rate: 0.1
+    heuristic_risk_threshold: 0.6
   rollback:
     enable: true
 
@@ -83,32 +96,28 @@ knowledge:
 # Scenarios
 scenario:
   name: "travel_planning"
+  difficulty: "normal"  # Options: easy, normal, hard, adversarial
   num_tasks: 50
-  failure_rate: 0.3
-  policy_flip_at: 25
-  min_failures_in_prefix: 3  # NEW: Force failures early
-  prefix_len: 10             # NEW: Within first 10 tasks
-  seeds:
-    task_generation: 42
-    failure_injection: 1337
+  failure_rate: 0.4
+  min_failures_in_prefix: 5
+  prefix_len: 10
+  failure_injector_seed: 42
+  task_generation_seed: 7
 
 # Evaluation settings
 evaluation:
   baselines: ["static_nesy", "llm_reflect", "verify_only"]
-  ablations: ["no_governance", "no_verify", "no_arbitration"]
+  ablations: ["no_governance", "no_verify", "no_arbitration", "no_fdka"]
 
 # Experiment Control
-# This section allows you to specify which agent to run for an evaluation.
 experiment:
-  # Options: "selfevolve", "static_ns", "llm_reflect", "verify_only"
   agent_to_run: "selfevolve"
 
-# NEW SECTION: Demo-specific overrides (activated in main.py)
+# Demo-specific overrides
 demo:
   num_tasks: 20
   failure_rate: 0.4
   min_failures_in_prefix: 5
-  metrics_window_size: 10
 
 # Output settings
 output:
@@ -117,5 +126,5 @@ output:
 
 # Logging
 logging:
-  level: "INFO" # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
   log_file: "data/logs/selfevolve.log"

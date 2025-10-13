@@ -8,7 +8,8 @@ UPDATED:
 - Enhanced debugging and error handling
 - Improved progress tracking and statistics
 - Added validation for ablation configurations
-- Fixed seed parameter naming for consistency with baseline comparison
+- CRITICAL FIX: Integrated difficulty levels to enable component stress testing
+- ADDED: print_summary method for evaluation orchestrator compatibility
 """
 
 import sys
@@ -45,7 +46,6 @@ class AblationStudy:
         Args:
             base_config_path: Path to base configuration file (relative to project root)
         """
-        # FIXED: Resolve config path relative to project root
         config_path = Path(__file__).parent.parent / base_config_path
 
         if not config_path.exists():
@@ -56,14 +56,17 @@ class AblationStudy:
         self.results_dir = Path("experiments/results/ablations")
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-        self.num_tasks = 50
         self.num_seeds = 3  # Ablations need fewer seeds (internal comparison)
         self.seeds = [42, 123, 456]
 
+        # ✅ Define difficulty levels for the stress test
+        self.difficulty_levels = ['easy', 'normal', 'hard']
+        self.task_counts = {'easy': 30, 'normal': 50, 'hard': 20}
+
         print("=" * 70)
-        print("ABLATION STUDY EXPERIMENT")
+        print("ABLATION STUDY EXPERIMENT (COMPONENT STRESS TEST)")
         print("=" * 70)
-        print(f"Configuration: {self.num_tasks} tasks × {self.num_seeds} seeds")
+        print(f"Configuration: {len(self.difficulty_levels)} difficulties × {self.num_seeds} seeds")
         print(f"Results directory: {self.results_dir}")
         print(f"Base config loaded from: {config_path}")
         print()
@@ -131,52 +134,44 @@ class AblationStudy:
 
         return configs
 
-    def run_single_ablation(self, ablation_name: str, config: Dict, seed: int) -> Dict:
+    def run_single_ablation(self, ablation_name: str, config: Dict, seed: int, difficulty: str) -> Dict:
         """
-        Run one ablation configuration with a specific seed.
+        Run one ablation configuration with a specific seed and difficulty.
 
         Args:
             ablation_name: Name of the ablation variant
             config: Ablation configuration with overrides
             seed: Random seed for reproducibility
+            difficulty: The scenario difficulty ('easy', 'normal', 'hard')
 
         Returns:
             Dictionary with results and metrics
         """
         print(f"\n{'─' * 70}")
-        print(f"Running: {ablation_name} (seed={seed})")
+        print(f"Running: {ablation_name} (seed={seed}, difficulty={difficulty})")
         print(f"{'─' * 70}")
 
-        # Deep copy base config
         experiment_config = copy.deepcopy(self.base_config)
 
-        # Apply ablation-specific overrides
         for key, value in config.get("config_overrides", {}).items():
             if isinstance(value, dict) and key in experiment_config:
-                # Deep merge for nested configs
                 experiment_config[key].update(value)
             else:
                 experiment_config[key] = value
 
-        # Set experiment parameters
-        experiment_config['scenario']['num_tasks'] = self.num_tasks
-
-        # FIXED: Use correct seed parameter name (matches baseline_comparison.py)
+        # ✅ Set experiment parameters based on difficulty
+        experiment_config['scenario']['difficulty'] = difficulty
+        experiment_config['scenario']['num_tasks'] = self.task_counts[difficulty]
         experiment_config['scenario']['failure_injector_seed'] = seed
-
-        # Reduce logging verbosity for batch runs
         experiment_config['logging']['level'] = 'WARNING'
 
         start_time = time.time()
 
         try:
-            # Initialize and run system
             system = SelfEvolveSystem(experiment_config)
             metrics = system.run_evaluation()
-
             elapsed = time.time() - start_time
 
-            # Extract metrics summary
             if hasattr(metrics, 'get_summary'):
                 summary = metrics.get_summary()
             elif isinstance(metrics, dict):
@@ -187,19 +182,17 @@ class AblationStudy:
             result = {
                 "ablation": ablation_name,
                 "seed": seed,
+                "difficulty": difficulty,
                 "elapsed_time": elapsed,
                 "metrics": summary,
                 "config": config,
                 "timestamp": time.time()
             }
 
-            # Print run summary
             print(f"\n✓ Completed in {elapsed:.1f}s")
             print(f"  Success Rate: {summary['success_rate']:.1%}")
             print(f"  RFR: {summary['repeat_failure_rate']:.1%}")
             print(f"  TTA: {self._format_tta(summary['time_to_adapt'])}")
-            print(f"  Patches: {summary['patches_accepted']}/{summary['patches_proposed']}")
-            print(f"  Rollbacks: {summary.get('rollback_frequency', 0):.1f}")
 
             return result
 
@@ -211,6 +204,7 @@ class AblationStudy:
             return {
                 "ablation": ablation_name,
                 "seed": seed,
+                "difficulty": difficulty,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
                 "timestamp": time.time()
@@ -218,15 +212,12 @@ class AblationStudy:
 
     def run_all_ablations(self) -> Dict[str, List[Dict]]:
         """
-        Run complete ablation matrix with enhanced debugging and error handling.
-
-        Returns:
-            Dictionary mapping ablation name to list of results (one per seed)
+        Run complete ablation matrix across all difficulties and seeds.
         """
         configs = self.get_ablation_configs()
         all_results = {}
 
-        total_runs = len(configs) * len(self.seeds)
+        total_runs = len(configs) * len(self.seeds) * len(self.difficulty_levels)
         current_run = 0
 
         print(f"\n{'=' * 70}")
@@ -234,6 +225,7 @@ class AblationStudy:
         print(f"{'=' * 70}")
         print(f"Total configurations: {len(configs)}")
         print(f"Seeds per config: {len(self.seeds)}")
+        print(f"Difficulty levels: {self.difficulty_levels}")
         print(f"Total runs: {total_runs}")
         print(f"\nAblations to run:")
         for i, (name, cfg) in enumerate(configs.items(), 1):
@@ -241,99 +233,49 @@ class AblationStudy:
         print(f"\nSeeds: {self.seeds}")
         print(f"{'=' * 70}\n")
 
-        # Track successful and failed runs
-        successful_runs = 0
-        failed_runs = 0
         start_time = time.time()
 
         for ablation_idx, (ablation_name, config) in enumerate(configs.items(), 1):
-            print(f"\n{'─' * 70}")
-            print(f"ABLATION {ablation_idx}/{len(configs)}: {ablation_name}")
-            print(f"Description: {config.get('description', 'N/A')}")
-            print(f"{'─' * 70}")
-
             ablation_results = []
 
-            for seed_idx, seed in enumerate(self.seeds, 1):
-                current_run += 1
-                print(f"\n[Run {current_run}/{total_runs}] {ablation_name} × seed={seed}")
-                print(f"  (Ablation {ablation_idx}/{len(configs)}, Seed {seed_idx}/{len(self.seeds)})")
+            # ✅ Loop through difficulty levels
+            for difficulty_idx, difficulty in enumerate(self.difficulty_levels, 1):
+                for seed_idx, seed in enumerate(self.seeds, 1):
+                    current_run += 1
+                    print(f"\n[Run {current_run}/{total_runs}] {ablation_name} × seed={seed} × difficulty={difficulty}")
 
-                try:
-                    result = self.run_single_ablation(ablation_name, config, seed)
+                    try:
+                        result = self.run_single_ablation(ablation_name, config, seed, difficulty)
+                        ablation_results.append(result)
+                        self._save_single_result(result, ablation_name, seed, difficulty)
+                    except KeyboardInterrupt:
+                        print(f"\n⚠️  Ablation study interrupted by user")
+                        raise
+                    except Exception as e:
+                        print(f"  ❌ EXCEPTION during run: {e}")
+                        error_result = {
+                            "ablation": ablation_name, "seed": seed, "difficulty": difficulty,
+                            "error": str(e), "timestamp": time.time()
+                        }
+                        ablation_results.append(error_result)
+                        self._save_single_result(error_result, ablation_name, seed, difficulty)
 
-                    # Check if result indicates success or error
-                    if "error" in result:
-                        print(f"  ❌ Run failed with error: {result['error'][:100]}")
-                        failed_runs += 1
-                    else:
-                        print(f"  ✅ Run completed successfully")
-                        successful_runs += 1
-
-                    ablation_results.append(result)
-
-                    # Checkpoint save
-                    self._save_single_result(result, ablation_name, seed)
-
-                except KeyboardInterrupt:
-                    print(f"\n⚠️  Ablation study interrupted by user")
-                    print(f"   Completed: {successful_runs}/{current_run} runs")
-                    print(f"   Elapsed time: {time.time() - start_time:.1f}s")
-                    raise
-
-                except Exception as e:
-                    print(f"  ❌ EXCEPTION during run: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-                    # Record the error but continue
-                    error_result = {
-                        "ablation": ablation_name,
-                        "seed": seed,
-                        "error": str(e),
-                        "traceback": traceback.format_exc(),
-                        "timestamp": time.time()
-                    }
-                    ablation_results.append(error_result)
-                    failed_runs += 1
-
-                    # Still save the error result for debugging
-                    self._save_single_result(error_result, ablation_name, seed)
-
-            # Save aggregated results for this ablation
             all_results[ablation_name] = ablation_results
             self._save_ablation_results(ablation_name, ablation_results)
 
-            # Print summary for this ablation
-            valid_results = [r for r in ablation_results if "error" not in r]
-            print(f"\n{'─' * 70}")
-            print(f"ABLATION COMPLETE: {ablation_name}")
-            print(f"  Successful runs: {len(valid_results)}/{len(ablation_results)}")
-
-            if valid_results:
-                success_rates = [r["metrics"]["success_rate"] for r in valid_results]
-                rfr_rates = [r["metrics"]["repeat_failure_rate"] for r in valid_results]
-
-                if HAS_NUMPY:
-                    print(f"  Mean success rate: {np.mean(success_rates):.1%} ± {np.std(success_rates):.1%}")
-                    print(f"  Mean RFR: {np.mean(rfr_rates):.1%}")
-                else:
-                    mean_sr = sum(success_rates) / len(success_rates)
-                    print(f"  Mean success rate: {mean_sr:.1%}")
-            print(f"{'─' * 70}")
-
-        # Save complete results
         elapsed_total = time.time() - start_time
 
         print(f"\n{'=' * 70}")
         print(f"ABLATION MATRIX COMPLETE")
         print(f"{'=' * 70}")
-        print(f"Total runs executed: {current_run}")
+        print(f"Total runs executed: {total_runs}")
+        successful_runs = sum(1 for results in all_results.values()
+                            for r in results if "error" not in r)
         print(f"  Successful: {successful_runs}")
-        print(f"  Failed: {failed_runs}")
-        print(f"  Success rate: {successful_runs/current_run:.1%}")
+        print(f"  Failed: {total_runs - successful_runs}")
+        print(f"  Success rate: {successful_runs / total_runs * 100:.1f}%")
         print(f"Total elapsed time: {elapsed_total:.1f}s ({elapsed_total/60:.1f} min)")
-        print(f"Average time per run: {elapsed_total/current_run:.1f}s")
+        print(f"Average time per run: {elapsed_total/total_runs:.1f}s")
         print(f"{'=' * 70}\n")
 
         self._save_all_results(all_results)
@@ -341,10 +283,94 @@ class AblationStudy:
 
         return all_results
 
-    def _save_single_result(self, result: Dict, ablation: str, seed: int):
-        """Save individual run result to JSON file."""
-        filepath = self.results_dir / f"{ablation}_seed{seed}.json"
+    def print_summary(self, all_results: Dict[str, List[Dict]]):
+        """
+        Print formatted summary of ablation study results.
 
+        ✅ ADDED: This method is called by run_full_evaluation.py orchestrator.
+
+        Args:
+            all_results: Dictionary mapping ablation names to their result lists
+        """
+        print("\n" + "=" * 70)
+        print("ABLATION STUDY SUMMARY")
+        print("=" * 70)
+
+        # Extract baseline (full system) metrics
+        full_system_results = all_results.get('SelfEvolve-Full', [])
+
+        if not full_system_results:
+            print("⚠️  No baseline results found")
+            return
+
+        # Get valid baseline runs (no errors)
+        valid_baseline = [r for r in full_system_results if "error" not in r]
+
+        if not valid_baseline:
+            print("⚠️  No valid baseline runs")
+            return
+
+        # Compute baseline averages across all difficulties
+        baseline_sr = self._safe_mean([r['metrics']['success_rate'] for r in valid_baseline])
+        baseline_rfr = self._safe_mean([r['metrics']['repeat_failure_rate'] for r in valid_baseline])
+        baseline_tta = self._compute_mean_tta(valid_baseline)
+
+        print(f"\nBaseline (Full System):")
+        print(f"  Success Rate: {baseline_sr:.1%}")
+        print(f"  RFR: {baseline_rfr:.1%}")
+        print(f"  TTA: {baseline_tta:.1f} tasks")
+
+        print(f"\nComponent Contributions (Δ vs Full System):")
+        print("-" * 70)
+        print(f"{'Component':<25} {'Δ Success Rate':>15} {'Δ RFR':>10} {'Δ TTA':>10} {'Status':>8}")
+        print("-" * 70)
+
+        for ablation_name, results in all_results.items():
+            if ablation_name == 'SelfEvolve-Full':
+                continue  # Skip baseline
+
+            component = ablation_name.replace('No-', '')
+            valid_runs = [r for r in results if "error" not in r]
+
+            if not valid_runs:
+                print(f"{component:<25} {'N/A':>15} {'N/A':>10} {'N/A':>10} {'❌':>8}")
+                continue
+
+            sr = self._safe_mean([r['metrics']['success_rate'] for r in valid_runs])
+            rfr = self._safe_mean([r['metrics']['repeat_failure_rate'] for r in valid_runs])
+            tta = self._compute_mean_tta(valid_runs)
+
+            delta_sr = (sr - baseline_sr) * 100  # percentage points
+            delta_rfr = (rfr - baseline_rfr) * 100
+            delta_tta = tta - baseline_tta if tta != float('inf') and baseline_tta != float('inf') else float('inf')
+
+            # Status indicator
+            if abs(delta_sr) < 1 and abs(delta_rfr) < 1 and abs(delta_tta) < 2:
+                status = "✅"  # No significant impact
+            elif delta_sr < -5 or delta_rfr > 5 or delta_tta > 5:
+                status = "❌"  # Significant degradation
+            else:
+                status = "⚠️"  # Moderate impact
+
+            tta_str = f"+{delta_tta:.1f}" if delta_tta != float('inf') else "∞"
+
+            print(f"{component:<25} {delta_sr:>+14.1f}% {delta_rfr:>+9.1f}% {tta_str:>10} {status:>8}")
+
+        print("-" * 70)
+        print("\n💡 Interpretation:")
+        print("   • Negative Δ Success Rate = Component removal hurts performance")
+        print("   • Positive Δ RFR = Component removal increases repeat failures")
+        print("   • Positive Δ TTA = Component removal slows adaptation")
+        print("   • ∞ TTA = No adaptation occurred (system cannot learn)")
+
+        print("\n" + "=" * 70)
+        print(f"✓ All results saved to: {self.results_dir}")
+        print(f"✓ CSV data for Table 2: {self.results_dir / 'table2_data.csv'}")
+        print("=" * 70)
+
+    def _save_single_result(self, result: Dict, ablation: str, seed: int, difficulty: str):
+        """Save individual run result to JSON file."""
+        filepath = self.results_dir / f"{ablation}_{difficulty}_seed{seed}.json"
         try:
             with open(filepath, 'w') as f:
                 json.dump(result, f, indent=2)
@@ -352,17 +378,14 @@ class AblationStudy:
             print(f"  ⚠️  Failed to save result: {e}")
 
     def _save_ablation_results(self, ablation: str, results: List[Dict]):
-        """Save aggregated results for one ablation across all seeds."""
+        """Save aggregated results for one ablation across all seeds and difficulties."""
         filepath = self.results_dir / f"{ablation}_aggregated.json"
 
         aggregated = {
             "ablation": ablation,
-            "num_seeds": len(results),
-            "num_successful": len([r for r in results if "error" not in r]),
-            "num_failed": len([r for r in results if "error" in r]),
-            "mean_metrics": self._compute_mean_metrics(results),
-            "std_metrics": self._compute_std_metrics(results),
-            "individual_runs": results
+            "num_runs": len(results),
+            "runs": results,
+            "timestamp": time.time()
         }
 
         try:
@@ -377,11 +400,12 @@ class AblationStudy:
         filepath = self.results_dir / "complete_ablations.json"
 
         summary = {
-            "experiment": "ablation_study",
-            "num_tasks": self.num_tasks,
-            "num_seeds": self.num_seeds,
+            "experiment": "ablation_study_stress_test",
             "seeds": self.seeds,
-            "ablations": list(all_results.keys()),
+            "difficulties": self.difficulty_levels,
+            "task_counts": self.task_counts,
+            "num_configurations": len(all_results),
+            "total_runs": sum(len(results) for results in all_results.values()),
             "results": all_results,
             "timestamp": time.time()
         }
@@ -394,232 +418,109 @@ class AblationStudy:
             print(f"\n⚠️  Failed to save complete results: {e}")
 
     def _export_to_csv(self, all_results: Dict):
-        """Export results to CSV for Table 2 in manuscript."""
+        """Export results to CSV for Table 2 in manuscript, including difficulty breakdown."""
         import csv
-
         csv_path = self.results_dir / "table2_data.csv"
-
-        # Compute deltas relative to Full system
-        full_results = all_results.get("SelfEvolve-Full", [])
-        full_tta = self._compute_mean_tta([r for r in full_results if "error" not in r])
-
-        if not full_results or full_tta == float('inf'):
-            print("\n⚠️  Warning: No valid baseline results for comparison")
 
         try:
             with open(csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-
-                # Write header
                 writer.writerow([
-                    "Configuration", "Success_Rate_Mean", "Success_Rate_Std",
-                    "RFR_Mean", "RFR_Std",
-                    "TTA_Mean", "TTA_Std", "Delta_TTA_vs_Full",
+                    "Configuration", "Difficulty", "Success_Rate_Mean", "Success_Rate_Std",
+                    "RFR_Mean", "RFR_Std", "TTA_Mean", "TTA_Std",
                     "Patches_Accepted", "Rollbacks", "Component_Removed"
                 ])
 
-                # Write data rows
                 for ablation_name, results in all_results.items():
-                    valid_results = [r for r in results if "error" not in r]
-                    if not valid_results:
-                        continue
+                    for difficulty in self.difficulty_levels:
+                        valid_runs = [r for r in results
+                                    if "error" not in r and r.get('difficulty') == difficulty]
 
-                    # Compute statistics
-                    success_rates = [r["metrics"]["success_rate"] for r in valid_results]
-                    rfr_rates = [r["metrics"]["repeat_failure_rate"] for r in valid_results]
-                    tta_mean = self._compute_mean_tta(valid_results)
-                    tta_std = self._compute_std_tta(valid_results)
+                        if not valid_runs:
+                            continue
 
-                    if HAS_NUMPY:
-                        sr_mean = np.mean(success_rates)
-                        sr_std = np.std(success_rates)
-                        rfr_mean = np.mean(rfr_rates)
-                        rfr_std = np.std(rfr_rates)
-                        patches = np.mean([r["metrics"]["patches_accepted"] for r in valid_results])
-                        rollbacks = np.mean([r["metrics"].get("rollback_frequency", 0) for r in valid_results])
-                    else:
-                        sr_mean = sum(success_rates) / len(success_rates)
-                        sr_std = 0.0
-                        rfr_mean = sum(rfr_rates) / len(rfr_rates)
-                        rfr_std = 0.0
-                        patches = sum(r["metrics"]["patches_accepted"] for r in valid_results) / len(valid_results)
-                        rollbacks = sum(r["metrics"].get("rollback_frequency", 0) for r in valid_results) / len(valid_results)
+                        sr_mean = self._safe_mean([r['metrics']['success_rate'] for r in valid_runs])
+                        sr_std = self._safe_std([r['metrics']['success_rate'] for r in valid_runs])
+                        rfr_mean = self._safe_mean([r['metrics']['repeat_failure_rate'] for r in valid_runs])
+                        rfr_std = self._safe_std([r['metrics']['repeat_failure_rate'] for r in valid_runs])
+                        tta_mean = self._compute_mean_tta(valid_runs)
+                        tta_std = self._compute_std_tta(valid_runs)
 
-                    # Compute delta TTA
-                    delta_tta = tta_mean - full_tta if full_tta != float('inf') and tta_mean != float('inf') else None
+                        patches = self._safe_mean([
+                            r['metrics'].get('patches_accepted', 0) for r in valid_runs
+                        ])
+                        rollbacks = self._safe_mean([
+                            r['metrics'].get('rollback_frequency', 0) for r in valid_runs
+                        ])
 
-                    # Extract component name
-                    component_removed = ablation_name.replace("No-", "").replace("SelfEvolve-Full", "None")
+                        component = ablation_name.replace("No-", "").replace("SelfEvolve-Full", "None")
 
-                    writer.writerow([
-                        ablation_name,
-                        f"{sr_mean:.3f}",
-                        f"{sr_std:.3f}",
-                        f"{rfr_mean:.3f}",
-                        f"{rfr_std:.3f}",
-                        f"{tta_mean:.1f}" if tta_mean != float('inf') else "∞",
-                        f"{tta_std:.1f}" if tta_std != float('inf') else "N/A",
-                        f"{delta_tta:+.1f}" if delta_tta is not None else "N/A",
-                        f"{patches:.1f}",
-                        f"{rollbacks:.1f}",
-                        component_removed
-                    ])
+                        writer.writerow([
+                            ablation_name,
+                            difficulty,
+                            f"{sr_mean:.3f}",
+                            f"{sr_std:.3f}",
+                            f"{rfr_mean:.3f}",
+                            f"{rfr_std:.3f}",
+                            f"{tta_mean:.1f}" if tta_mean != float('inf') else "∞",
+                            f"{tta_std:.1f}" if tta_std != float('inf') else "∞",
+                            f"{patches:.1f}",
+                            f"{rollbacks:.1f}",
+                            component
+                        ])
 
             print(f"💾 Exported CSV: {csv_path}")
 
         except Exception as e:
             print(f"\n⚠️  Failed to export CSV: {e}")
-
-    def _compute_mean_metrics(self, results: List[Dict]) -> Dict:
-        """Compute mean metrics across seeds."""
-        valid = [r for r in results if "error" not in r]
-        if not valid:
-            return {}
-
-        metrics = {
-            "success_rate": self._safe_mean([r["metrics"]["success_rate"] for r in valid]),
-            "repeat_failure_rate": self._safe_mean([r["metrics"]["repeat_failure_rate"] for r in valid]),
-            "tta_mean": self._compute_mean_tta(valid),
-            "patches_accepted": self._safe_mean([r["metrics"]["patches_accepted"] for r in valid]),
-            "patches_proposed": self._safe_mean([r["metrics"]["patches_proposed"] for r in valid]),
-        }
-
-        return metrics
-
-    def _compute_std_metrics(self, results: List[Dict]) -> Dict:
-        """Compute standard deviation of metrics across seeds."""
-        valid = [r for r in results if "error" not in r]
-        if not valid or len(valid) < 2:
-            return {}
-
-        metrics = {
-            "success_rate": self._safe_std([r["metrics"]["success_rate"] for r in valid]),
-            "repeat_failure_rate": self._safe_std([r["metrics"]["repeat_failure_rate"] for r in valid]),
-        }
-
-        return metrics
+            import traceback
+            traceback.print_exc()
 
     def _compute_mean_tta(self, results: List[Dict]) -> float:
         """Compute mean Time-to-Adapt across results."""
         tta_values = []
-
         for r in results:
             if "error" not in r:
                 for v in r["metrics"]["time_to_adapt"].values():
                     if v is not None:
                         tta_values.append(v)
-
         return self._safe_mean(tta_values) if tta_values else float('inf')
 
     def _compute_std_tta(self, results: List[Dict]) -> float:
-        """Compute standard deviation of TTA."""
+        """Compute standard deviation of Time-to-Adapt across results."""
         tta_values = []
-
         for r in results:
             if "error" not in r:
                 for v in r["metrics"]["time_to_adapt"].values():
                     if v is not None:
                         tta_values.append(v)
-
-        return self._safe_std(tta_values) if len(tta_values) > 1 else float('inf')
+        return self._safe_std(tta_values) if len(tta_values) >= 2 else float('inf')
 
     def _safe_mean(self, values: List[float]) -> float:
-        """Safely compute mean with fallback."""
+        """Compute mean, handling empty lists."""
         if not values:
             return 0.0
-
         if HAS_NUMPY:
             return float(np.mean(values))
-        else:
-            return sum(values) / len(values)
+        return sum(values) / len(values)
 
     def _safe_std(self, values: List[float]) -> float:
-        """Safely compute standard deviation with fallback."""
+        """Compute standard deviation, handling small samples."""
         if not values or len(values) < 2:
             return 0.0
-
         if HAS_NUMPY:
             return float(np.std(values))
-        else:
-            mean = sum(values) / len(values)
-            variance = sum((x - mean) ** 2 for x in values) / len(values)
-            return variance ** 0.5
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
+        return variance ** 0.5
 
     def _format_tta(self, tta_dict: Dict) -> str:
         """Format TTA dictionary for display."""
         if not tta_dict:
             return "N/A"
-
-        values = []
-        for k, v in tta_dict.items():
-            if v is not None:
-                values.append(f"{k}={v}")
-            else:
-                values.append(f"{k}=∞")
-
+        values = [f"{k}={v}" if v is not None else f"{k}=∞"
+                 for k, v in tta_dict.items()]
         return ", ".join(values) if values else "N/A"
-
-    def print_summary(self, all_results: Dict):
-        """Print comprehensive ablation study summary."""
-        print("\n" + "=" * 70)
-        print("ABLATION STUDY SUMMARY")
-        print("=" * 70)
-
-        # Get baseline results
-        full_results = all_results.get("SelfEvolve-Full", [])
-        full_valid = [r for r in full_results if "error" not in r]
-
-        if not full_valid:
-            print("\n⚠️  ERROR: No valid baseline results!")
-            return
-
-        full_tta = self._compute_mean_tta(full_valid)
-        full_sr = self._safe_mean([r["metrics"]["success_rate"] for r in full_valid])
-
-        print(f"\nBaseline (Full System):")
-        print(f"  Success Rate: {full_sr:.1%}")
-        print(f"  TTA: {full_tta:.1f} tasks" if full_tta != float('inf') else "  TTA: ∞")
-
-        print(f"\nComponent Contributions (Δ vs Full System):")
-        print(f"{'─' * 70}")
-        print(f"{'Component':<25} {'Δ Success Rate':<20} {'Δ TTA':<15} {'Status'}")
-        print(f"{'─' * 70}")
-
-        for ablation_name, results in all_results.items():
-            if ablation_name == "SelfEvolve-Full":
-                continue
-
-            valid = [r for r in results if "error" not in r]
-            if not valid:
-                component = ablation_name.replace("No-", "")
-                print(f"{component:<25} {'N/A':<20} {'N/A':<15} ❌ Failed")
-                continue
-
-            # Compute deltas
-            abl_sr = self._safe_mean([r["metrics"]["success_rate"] for r in valid])
-            abl_tta = self._compute_mean_tta(valid)
-
-            delta_sr = abl_sr - full_sr
-            delta_tta = abl_tta - full_tta if abl_tta != float('inf') and full_tta != float('inf') else None
-
-            component = ablation_name.replace("No-", "")
-
-            sr_str = f"{delta_sr:+.1%}"
-            tta_str = f"{delta_tta:+.1f} tasks" if delta_tta is not None else "N/A"
-            status = "✅" if len(valid) == len(results) else "⚠️"
-
-            print(f"{component:<25} {sr_str:<20} {tta_str:<15} {status}")
-
-        print(f"{'─' * 70}")
-        print(f"\nInterpretation:")
-        print(f"  Negative Δ Success Rate = Component removal hurts performance")
-        print(f"  Positive Δ TTA = Component removal slows adaptation")
-        print(f"  ∞ TTA = No adaptation occurred (system cannot learn)")
-
-        print("\n" + "=" * 70)
-        print(f"✓ All results saved to: {self.results_dir}")
-        print(f"✓ CSV data for Table 2: {self.results_dir}/table2_data.csv")
-        print("=" * 70)
 
 
 def main():
@@ -627,22 +528,24 @@ def main():
     try:
         experiment = AblationStudy()
         all_results = experiment.run_all_ablations()
+
+        # ✅ Print summary
         experiment.print_summary(all_results)
 
         print("\n✓ Ablation study complete!")
         print(f"   Check {experiment.results_dir}/table2_data.csv for table data")
 
+        return 0
+
     except KeyboardInterrupt:
         print("\n\n⚠️  Experiment interrupted by user")
-        print("   Partial results may be saved in experiments/results/ablations/")
+        return 130
 
     except Exception as e:
         print(f"\n\n❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
         return 1
-
-    return 0
 
 
 if __name__ == "__main__":
