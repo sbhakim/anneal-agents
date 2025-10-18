@@ -7,7 +7,7 @@ Based on Section X walkthrough and Section XII evaluation protocol.
 from typing import List, Dict, Any, Optional, Set
 import random
 
-# ✅ ADDED: Difficulty level configurations for Component Stress Test
+# Difficulty level configurations for Component Stress Test
 DIFFICULTY_CONFIGS = {
     'easy': {
         'failure_rate': 0.2,
@@ -40,7 +40,6 @@ class TravelPlanningScenario:
     """
     Generates travel planning tasks and manages failure injection.
     Corresponds to the evaluation scenario from Section XII-D.
-
     UPDATED: Now supports configurable seeds and multiple difficulty levels.
     """
 
@@ -48,12 +47,10 @@ class TravelPlanningScenario:
         """
         Initializes the scenario, including difficulty settings and failure injection.
         """
-        # ✅ UPDATED: Set difficulty from config, default to 'normal'
         self.difficulty = config.get('difficulty', 'normal')
         self.difficulty_config = DIFFICULTY_CONFIGS.get(self.difficulty, DIFFICULTY_CONFIGS['normal'])
 
         self.num_tasks = config.get('num_tasks', 50)
-        # Use the failure rate defined by the selected difficulty level
         self.failure_rate = self.difficulty_config['failure_rate']
 
         self.min_failures_in_prefix = config.get('min_failures_in_prefix', 3)
@@ -70,8 +67,6 @@ class TravelPlanningScenario:
 
         self.tasks = self._generate_tasks(seed=self.task_seed)
 
-        # ✅ UPDATED: Removed redundant 'policy_flip_at' from the injector call.
-        # The difficulty_config now manages the number and timing of such events.
         self.failure_injector = FailureInjector(
             failure_rate=self.failure_rate,
             horizon=self.num_tasks,
@@ -79,7 +74,7 @@ class TravelPlanningScenario:
             min_failures_in_prefix=self.min_failures_in_prefix,
             prefix_len=self.prefix_len,
             seed=self.failure_seed,
-            difficulty_config=self.difficulty_config  # Pass the entire difficulty config
+            difficulty_config=self.difficulty_config
         )
 
         print(f"SCENARIO: Initialized with difficulty '{self.difficulty}'.")
@@ -94,7 +89,7 @@ class TravelPlanningScenario:
             "hotel_status": "available", "flight_status": "available",
             "corporate_card_policy": self.corporate_card_policy,
             "blackout_dates": list(self.blackout_dates),
-            "api_version": "v1"  # Initial API version
+            "api_version": "v1"
         }
 
     def _generate_tasks(self, seed: int = 7) -> List[str]:
@@ -111,13 +106,10 @@ class TravelPlanningScenario:
             month, start_day = random.choice(["April", "May", "June"]), random.randint(1, 25)
             end_day = start_day + random.randint(1, 5)
 
-            # ✅ ADDED: Introduce harder tasks that require more complex reasoning
             if self.difficulty in ['hard', 'adversarial'] and i % 5 == 0:
                 task_templates = [
                     f"Book a hotel in {dest} but avoid corporate card if dates {month} {start_day}-{end_day} are blocked.",
-                    # Tests Verify
                     f"Find a flight from {origin} to {dest}, but if the API (v1) fails, try the new endpoint (v2)."
-                    # Tests FDKA
                 ]
                 task = random.choice(task_templates)
             else:
@@ -158,7 +150,6 @@ class FailureInjector:
                  seed: int = 42, difficulty_config: Optional[Dict] = None):
         """
         Initializes the FailureInjector.
-        UPDATED: Removed the redundant 'policy_flip_at' parameter.
         """
         self.failure_rate = failure_rate
         self.horizon = max(1, int(horizon))
@@ -167,12 +158,10 @@ class FailureInjector:
         self.min_failures_in_prefix = max(0, int(min_failures_in_prefix))
         self.seed = seed
         self.difficulty_config = difficulty_config or DIFFICULTY_CONFIGS['normal']
-        self.difficulty = next((key for key, value in DIFFICULTY_CONFIGS.items() if value == self.difficulty_config),
-                               'normal')
+        self.difficulty = next((key for key, value in DIFFICULTY_CONFIGS.items() if value == self.difficulty_config), 'normal')
         self.patched_operators: Set[str] = set()
         self._patch_successes: Dict[str, int] = {}
 
-        # Use the difficulty config to determine event points
         self.policy_flip_points = self._get_event_points('policy_flips')
         self.schema_change_points = self._get_event_points('schema_changes')
 
@@ -205,12 +194,12 @@ class FailureInjector:
                                   "policy_ref": "API-V2", "category": "environmental"},
         }
         print(f"FAILURE_INJECTOR: Initialized with seed={self.seed}. {len(self.failing_tasks)} tasks will fail.")
+
     def _get_event_points(self, event_type: str) -> List[int]:
         """Distributes events like policy flips or schema changes throughout the run."""
         count = self.difficulty_config.get(event_type, 0)
         if count == 0:
             return []
-        # Evenly space the events across the 50 tasks
         return [int(i * self.horizon / (count + 1)) for i in range(1, count + 1)]
 
     def _is_corporate_card(self, params: Optional[Dict], state: Optional[Any]) -> bool:
@@ -222,52 +211,62 @@ class FailureInjector:
         if not (state and hasattr(state, "get")): return False
         return any(b in str(state.get("travel_dates", "")) for b in self.blackout_dates)
 
-    def should_fail(self, task_id: int, operator_name: str, params: Optional[Dict] = None,
+    def should_fail(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                     state: Optional[Any] = None) -> bool:
-        if operator_name in self.patched_operators:
-            self.mark_operator_patched(operator_name)
+        """
+        ✅ CRITICAL FIX: This logic is updated to be consistent and reliable.
+        It now directly checks if the current operator is the one designated to fail for this task.
+        """
+        # 1. Never fail an operator that has already been successfully patched.
+        if op_name in self.patched_operators:
             return False
 
+        # 2. If the task is not in the pre-selected list of failing tasks, it must succeed.
         if task_id not in self.failing_tasks:
-            if operator_name in self._patch_successes:
-                self.mark_operator_patched(operator_name)
             return False
 
-        # ✅ ADDED: Logic to trigger more complex failures on 'hard' or 'adversarial'
-        if self.difficulty in ['hard', 'adversarial']:
-            if task_id in self.schema_change_points and operator_name == "BookFlight":
-                return True  # Trigger schema change failure
-            if task_id in self.policy_flip_points and operator_name == "BookHotel":
-                return True  # Trigger policy flip failure
+        # 3. Determine which failure *should* happen on this task and who is responsible.
+        # This makes `get_failure_details` the single source of truth.
+        intended_failure = self.get_failure_details(task_id, op_name, params, state)
+        failing_operator = intended_failure.get("operator")
 
-        # Original failure logic
-        if operator_name == "BookHotel":
-            return self._is_corporate_card(params, state) and self._in_blackout(state)
-        if operator_name == "BookFlight":
-            return (task_id % 7 == 0)  # Make it slightly less frequent
+        # 4. Only inject a failure if the current operator is the one designated to fail.
+        if op_name == failing_operator:
+            # For `blocked_card`, we add a final check to ensure the conditions are met,
+            # making the failure more realistic.
+            if intended_failure.get("policy_ref") == "H-23":
+                return self._is_corporate_card(params, state) and self._in_blackout(state)
+            return True
 
         return False
 
     def get_failure_details(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                             state: Optional[Any] = None) -> Dict:
-        # ✅ ADDED: Return complex failures if the task ID matches an event point
+        """
+        Determines the precise failure details for a given task, acting as the source of truth.
+        """
+        # First, check for special, difficulty-based events
         if task_id in self.schema_change_points and op_name == "BookFlight":
             failure_class = "api_schema_change"
         elif task_id in self.policy_flip_points and op_name == "BookHotel":
-            # Simulate policy flip by blocking a previously valid card
             failure_class = "blocked_card"
+        # Then, assign a generic failure based on the operator for other failing tasks
         elif op_name == "BookHotel":
             failure_class = "invalid_payment"
         elif op_name == "BookFlight":
             failure_class = "api_timeout"
         else:
+            # Fallback for any other operator, ensuring a failure can always be assigned
             failure_class = "blocked_card"
 
         failure_info = self.failure_classes[failure_class].copy()
-        return {**failure_info, "error": failure_info["error_type"], "operator": op_name, "task_id": task_id,
+        # Ensure the operator name in the details matches the one being executed
+        failure_info["operator"] = op_name
+        return {**failure_info, "error": failure_info["error_type"], "task_id": task_id,
                 "trace_id": f"T-{task_id:04d}"}
 
     def mark_operator_patched(self, operator_name: str) -> None:
+        """After 3 successful uses of a patch, mark the operator as fixed to stop injecting failures."""
         if operator_name not in self.patched_operators:
             self._patch_successes[operator_name] = self._patch_successes.get(operator_name, 0) + 1
             if self._patch_successes[operator_name] >= 3:

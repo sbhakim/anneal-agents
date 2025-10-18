@@ -30,7 +30,7 @@ from ..governance.canary import CanaryRunner
 # Metacognition
 from ..metacognition.signals import SignalGenerator
 from ..metacognition.arbitrator import Arbitrator
-from ..metacognition.reflection import Reflection  # ✅ ADDED for Algorithm 1 completeness
+from ..metacognition.reflection import Reflection
 
 # Knowledge
 from ..knowledge.rule_pool import RulePool
@@ -78,7 +78,6 @@ class SelfEvolveSystem:
         self.metrics = MetricsCollector()
         self._last_committed_patch_id: Optional[str] = None
 
-        # ✅ ADDED: Initialize Reflection component (Algorithm 1, Section VI-C)
         self.reflection = Reflection(
             config['metacognition'],
             self.arbitrator,
@@ -125,16 +124,12 @@ class SelfEvolveSystem:
                 self.metrics.record_task(task_id, True, trace)
                 self.experience_pool.add_trace(trace, True, metadata={'instruction': instruction, 'task_id': task_id})
 
-                # Check adaptation on SUCCESS (measure RFR dropping)
-                if task_id > 0 and task_id % 5 == 0:  # Check every 5 tasks
+                if task_id > 0 and task_id % 5 == 0:
                     print(f"  🔍 Checking adaptation progress at task {task_id}...")
                     for failure_key in list(self.metrics.failure_classes.keys()):
-                        adapted = self.metrics.check_adaptation(failure_key, window_size=min(10, task_id))
-                        if adapted:
+                        if self.metrics.check_adaptation(failure_key, window_size=min(10, task_id)):
                             print(f"  ✅ Adaptation confirmed for '{failure_key}'")
 
-                # ✅ ADDED: Reflection after successful task (Algorithm 1, line 18)
-                # Integrate post-execution reflection for threshold tuning
                 if task_id > 0 and task_id % 5 == 0:
                     print(f"  💭 Running reflection (task {task_id})...")
                     try:
@@ -156,7 +151,6 @@ class SelfEvolveSystem:
                 if patch_applied and committed_patch:
                     operator_name = committed_patch.get("operator")
                     if operator_name: self.scenario.mark_operator_patched(operator_name)
-                    # Re-compile the plan to ensure the new patch is used
                     print("🔁 Re-compiling plan and retrying execution with the patched operator...")
                     plan = self.planner.compile(instruction, self.state.to_dict())
                     continue
@@ -171,66 +165,69 @@ class SelfEvolveSystem:
         self._last_committed_patch_id = None
         self.metrics.record_task(task_id, False, final_trace)
 
-        # Record failure trace if not already added
         failure_info = self._extract_failure_info(final_trace)
         if failure_info:
             metadata = {
                 'instruction': instruction, 'task_id': task_id,
-                'operator': failure_info.get('operator'),
-                'error_type': failure_info.get('error')
+                'operator': failure_info.get('operator'), 'error_type': failure_info.get('error')
             }
-            # Avoid adding duplicate traces if _handle_failure already added it
             if not any(
                     t['metadata'].get('task_id') == task_id and not t['success'] for t in self.experience_pool.traces):
                 self.experience_pool.add_trace(final_trace, False, metadata=metadata)
             self.metrics.check_adaptation(f"{failure_info.get('operator')}:{failure_info.get('error')}")
 
     def _handle_failure(self, trace: list, task_id: int, instruction: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        # ✅ CRITICAL FIX: Add this guard clause to properly disable FDKA for the ablation study.
+        # It checks if the threshold is set to an impossibly high value and skips the entire process.
+        if self.fdka_threshold > 1.0:
+            print("  DEBUG_FDKA: FDKA is disabled by high threshold. Skipping self-edit.")
+            return False, None
+
         patch_applied = False
         patch_dict = None
 
-        # Add failure trace BEFORE proposing patch (for utility scoring)
         failure_info = self._extract_failure_info(trace)
         if failure_info:
             metadata = {
                 'instruction': instruction, 'task_id': task_id,
-                'operator': failure_info.get('operator'),
-                'error_type': failure_info.get('error')
+                'operator': failure_info.get('operator'), 'error_type': failure_info.get('error')
             }
             self.experience_pool.add_trace(trace, False, metadata=metadata)
             print(f"  📝 Added failure trace to experience pool (operator={metadata['operator']})")
 
         proposed_patch = self.fdka.propose_edit(trace, self.rule_pool)
+
+        # Check if patch was rejected during validation (e.g., by pre-scoring checks)
+        if proposed_patch.get("action") == "REJECTED":
+            print(f" FDKA: ❌ Patch rejected during validation: {proposed_patch.get('details')}")
+            return False, None
+
         scores = self.scorer.score(proposed_patch, trace)
         agg_score = scores.get("aggregate", 0.0)
 
-        # Record governance checks explicitly
+        # The logic now checks the score against the threshold *before* canary tests
+        if agg_score < self.fdka_threshold:
+            print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold}. Patch rejected.")
+            self.metrics.record_patch(proposed_patch, success=False, committed=False, scores=scores)
+            return False, None
+
         guard_result = self.guard.check(proposed_patch, context={"scores": scores, "trace": trace})
-        self.metrics.record_value_check(
-            vetoed=(guard_result['decision'] == 'veto'),
-            reason=guard_result.get('reason', '')
-        )
-        self.metrics.record_causal_check(
-            escalated=(guard_result['decision'] == 'request_human'),
-            reason=guard_result.get('reason', '')
-        )
+        self.metrics.record_value_check(vetoed=(guard_result['decision'] == 'veto'),
+                                        reason=guard_result.get('reason', ''))
+        self.metrics.record_causal_check(escalated=(guard_result['decision'] == 'request_human'),
+                                         reason=guard_result.get('reason', ''))
 
         if guard_result['decision'] == 'allow':
             print(" FDKA: Guardrails passed. Proceeding to canary test...")
-
             canary_context = {
-                "rule_pool": self.rule_pool,
-                "stage_fn": self.rule_pool.update_operator,
+                "rule_pool": self.rule_pool, "stage_fn": self.rule_pool.update_operator,
                 "simulator": self._run_canary_simulation,
                 "examples": self.experience_pool.get_failure_traces(
                     operator=proposed_patch.get("operator")) or self.experience_pool.traces[-10:],
-                "scorer": self.scorer,
-                "scores": scores
+                "scorer": self.scorer, "scores": scores
             }
-
             canary_result = self.canary_runner.run(proposed_patch, canary_context)
             self.metrics.record_canary_test(passed=canary_result.get("passed"))
-
             if canary_result.get("passed"):
                 print(" FDKA: Canary test passed. Committing patch permanently.")
                 if self.rule_pool.update_operator(proposed_patch):
@@ -240,22 +237,13 @@ class SelfEvolveSystem:
                 print(f" FDKA: ❌ Canary test failed: {canary_result.get('reason')}")
         else:
             print(f" FDKA: ❌ Guardrails blocked patch: {guard_result.get('reason')}")
-            # If guardrails veto, we treat it as a failed canary for metric purposes
             self.metrics.record_canary_test(passed=False)
-
-        if not patch_applied:
-            print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold}. Patch rejected.")
 
         patch_id = (patch_dict or proposed_patch).get("id", f"patch-{uuid.uuid4().hex[:8]}")
         self.provenance.log(
-            {"patch_id": patch_id, "task_id": task_id, "applied": patch_applied, "patch": patch_dict or proposed_patch}
-        )
-        self.metrics.record_patch(
-            patch_dict or proposed_patch,
-            success=patch_applied,
-            committed=patch_applied,
-            scores=scores
-        )
+            {"patch_id": patch_id, "task_id": task_id, "applied": patch_applied, "patch": patch_dict or proposed_patch})
+        self.metrics.record_patch(patch_dict or proposed_patch, success=patch_applied, committed=patch_applied,
+                                  scores=scores)
 
         if patch_applied:
             self._last_committed_patch_id = patch_id
@@ -274,12 +262,8 @@ class SelfEvolveSystem:
         sim_state.update_from_instruction(instruction)
         sim_plan = self.planner.compile(instruction, sim_state.to_dict())
         sim_executor = Executor(
-            self.config['executor'],
-            None,
-            patched_rule_pool,
-            self.signal_gen,
-            self.arbitrator,
-            self.scenario
+            self.config['executor'], None, patched_rule_pool,
+            self.signal_gen, self.arbitrator, self.scenario
         )
         _, success, _ = sim_executor.execute(sim_plan, sim_state, task_id=-1)
         return {"ok": success, "violations": 0 if success else 1}
@@ -293,26 +277,19 @@ class SelfEvolveSystem:
     def run_evaluation(self) -> MetricsCollector:
         print(f"\n{'=' * 70}\n🚀 STARTING SELFEVOLVE EVALUATION\n{'=' * 70}")
 
-        # Run all tasks
         for task_id in range(self.config.get('scenario', {}).get('num_tasks', 10)):
             instruction = self.scenario.get_task(task_id)
             if instruction:
                 self.run_task(task_id, instruction)
 
         print(f"\n{'=' * 70}\n✅ EVALUATION COMPLETE\n{'=' * 70}")
-
-        # Print summary
         self.metrics.print_summary()
 
-        # Save results
         results_dir = Path(self.config['output']['results_dir'])
         results_dir.mkdir(parents=True, exist_ok=True)
-
         self.metrics.save(results_dir / "metrics.json")
         self.experience_pool.save(results_dir / "experience_pool.json")
 
-        # ✅ ADDED: Export manuscript data tables (Tables 3-4)
-        # Generate CSV files for per-failure-class analysis and governance statistics
         print(f"\n📊 Generating manuscript data tables...")
         try:
             self.metrics.export_failure_analysis_csv(results_dir / "table3_per_failure.csv")
@@ -327,5 +304,4 @@ class SelfEvolveSystem:
             print(f"   ⚠️ Table 4 export failed: {e}")
 
         print(f"\n💾 Results saved to: {results_dir}")
-
         return self.metrics
