@@ -1,7 +1,7 @@
 # src/fdka/llm_providers/deepseek_provider.py
 
 import os, time, logging, random
-from typing import Dict, Any, List, TypedDict, Union
+from typing import Dict, Any, List, TypedDict, Union, Optional
 from dataclasses import dataclass, field
 from openai import OpenAI
 from openai import APIError, RateLimitError, BadRequestError, APITimeoutError, AuthenticationError
@@ -55,13 +55,17 @@ class DeepSeekProvider:
 
     def _format_ok(self, resp, start: float) -> GenResult:
         latency = time.time() - start
-        usage = resp.usage
-        prompt_tokens = usage.prompt_tokens if usage else 0
-        completion_tokens = usage.completion_tokens if usage else 0
-        total_tokens = usage.total_tokens if usage else (prompt_tokens + completion_tokens)
-        finish_reason = resp.choices[0].finish_reason if resp.choices else ""
-        text = resp.choices[0].message.content if resp.choices else ""
-        request_id = resp.id if hasattr(resp, 'id') else ""
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) if usage else (prompt_tokens + completion_tokens)
+
+        choices = getattr(resp, "choices", None) or []
+        first = choices[0] if choices else None
+        finish_reason = getattr(first, "finish_reason", "") if first else ""
+        message = getattr(first, "message", None) if first else None
+        text = getattr(message, "content", "") if message else ""
+        request_id = getattr(resp, "id", "") if hasattr(resp, "id") else ""
 
         logger.info(
             "DEEPSEEK_CALL",
@@ -92,7 +96,7 @@ class DeepSeekProvider:
         request_id = getattr(e, "request_id", "")
         error_msg = str(getattr(e, "message", None) or e)
 
-        # ✅ ADDED: Print to console for visibility
+        # Console visibility for debugging runs
         print(f"\n❌ DeepSeek API Error:")
         print(f"   Type: {err_type}")
         print(f"   Code: {code}")
@@ -123,10 +127,10 @@ class DeepSeekProvider:
         }
 
     def generate(
-            self,
-            prompt: str = None,
-            messages: List[Dict[str, str]] = None,
-            **kwargs: Any,
+        self,
+        prompt: Optional[str] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+        **kwargs: Any,
     ) -> GenResult:
         if (prompt is None) == (messages is None):
             raise ValueError("Provide exactly one of `prompt` or `messages`")
@@ -136,12 +140,21 @@ class DeepSeekProvider:
             messages_payload = messages
         else:
             messages_payload = [
-                {"role": "system",
-                 "content": "You are an expert system that generates formal rule patches for autonomous agents."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "You are an expert system that generates formal rule patches for autonomous agents."
+                },
+                {"role": "user", "content": prompt or ""}  # prompt is not None here by contract
             ]
 
-        max_out = int(kwargs.pop("max_tokens", self.max_tokens))
+        # Accept both max_output_tokens and max_tokens (mirror OpenAI provider behavior)
+        max_out = kwargs.pop("max_output_tokens", None)
+        if max_out is None:
+            max_out = kwargs.pop("max_tokens", self.max_tokens)
+        try:
+            max_out = int(max_out)
+        except Exception:
+            max_out = self.max_tokens
         if max_out <= 0:
             max_out = self.max_tokens
 
@@ -152,11 +165,12 @@ class DeepSeekProvider:
             "max_tokens": max_out,
         }
 
-        for k in ("stop", "stream", "top_p", "frequency_penalty", "presence_penalty", "n"):
+        for k in ("stop", "stream", "top_p", "frequency_penalty", "presence_penalty", "n", "user"):
             if k in kwargs:
                 call_args[k] = kwargs.pop(k)
 
         if kwargs:
+            # ✅ FIXED: removed stray bracket
             logger.debug(f"Ignored unsupported kwargs: {list(kwargs.keys())}")
 
         start = time.time()
@@ -168,14 +182,14 @@ class DeepSeekProvider:
                 return self._format_ok(resp, start)
 
             except AuthenticationError as e:
-                # ✅ ADDED: Don't retry auth errors
+                # Do not retry auth errors
                 return self._format_err(e, start)
 
             except (RateLimitError, APITimeoutError) as e:
                 if attempt >= self.max_retries:
                     return self._format_err(e, start)
                 attempt += 1
-                logger.warning(f"Retry {attempt}/{self.max_retries} after {e.__class__.__name__}")
+                logger.warning(f"DeepSeek retry {attempt}/{self.max_retries} after {e.__class__.__name__}")
                 self._sleep_backoff(attempt)
 
             except BadRequestError as e:
@@ -185,7 +199,7 @@ class DeepSeekProvider:
                 status = getattr(e, "status", 0) or 0
                 if 500 <= int(status) < 600 and attempt < self.max_retries:
                     attempt += 1
-                    logger.warning(f"Retry {attempt}/{self.max_retries} after 5xx error")
+                    logger.warning(f"DeepSeek retry {attempt}/{self.max_retries} after 5xx error")
                     self._sleep_backoff(attempt)
                     continue
                 return self._format_err(e, start)

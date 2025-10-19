@@ -11,7 +11,7 @@ system:
 planner:
   type: "HTN"
   max_depth: 5
-  timeout_ms: 100
+  timeout_ms: 300  # increased from 100 to reduce flaky PlanningFailed
 
 # Executor settings
 executor:
@@ -21,43 +21,65 @@ executor:
 
 # Metacognitive control (Section VII)
 metacognition:
-  tau_u: 0.5  # Uncertainty threshold for S1/S2 arbitration
-  tau_p: 0.3  # Violation probability threshold
-  budget_ms: 2000 # Budget for regulation
+  tau_u: 0.25  # Uncertainty threshold for S1/S2 arbitration
+  tau_p: 0.20  # Violation probability threshold
+  budget_ms: 2000
   enable_reflection: true
 
 # FDKA Pipeline (Section VIII)
 fdka:
+  enabled: true
+
   scoring_weights:
     plausibility: 0.35
     consistency: 0.35
     utility: 0.20
     risk: 0.10
+
+  # Acceptance gate (not a kill switch)
   threshold: 0.48
 
   # ✅ MAIN PROVIDER SELECTION
   # Options: "openai", "deepseek", "transformers", "mock"
   propose_edit:
-    llm_provider: "deepseek"  # ✅ Change this to switch providers
+    # Offline/local by default
+    llm_provider: "openai"
 
-    # ✅ FLAT STRUCTURE: Model settings at same level
-    model: "deepseek-chat"    # Used if llm_provider="openai"
+    # Local model options (use one you have installed):
+    # - mistralai/Mistral-7B-Instruct-v0.3
+    # - meta-llama/Llama-3.1-8B
+    # - google/gemma-2-9b-it
+    # - Qwen/Qwen2.5-7B-Instruct
+    model: "gpt-4o-mini"
+
+    # Generation/runtime knobs
     temperature: 0.3
     max_tokens: 2000
     timeout_sec: 60.0
     max_retries: 4
 
-    # ✅ Optional: Override base_url for custom endpoints
-    # base_url: "https://api.openai.com/v1"  # Uncomment if needed
+    # Transformers runtime hints (ignored safely if unsupported)
+    device_map: "auto"         # "auto", "cuda:0", or "cpu"
+    dtype: "auto"              # lets runtime pick fp16/bf16/fp32
+    use_flash_attention: false # set true only if stack supports it
+    trust_remote_code: true
+    max_input_tokens: 6000
+
+    # Prompt formatting aligned with Mistral instruct models
+    #prompt_template: "mistral-instruct"  # previously "chatml"
+    prompt_template: "deepseek-chat"
+
+    # Optional: for custom text-generation servers (not used for HF local)
+    # base_url: "http://localhost:8000/v1"
 
   # ✅ Alternative provider configs (activate by changing llm_provider above)
-  # When using DeepSeek, change llm_provider to "deepseek" and set:
-  # model: "deepseek-chat"
-  # base_url: "https://api.deepseek.com"
-
-  # When using local Transformers, change llm_provider to "transformers" and set:
-  # model: "mistralai/Mistral-7B-Instruct-v0.3"
-  # Or use one of: google/gemma-2-9b, meta-llama/Llama-3.1-8B, Qwen/Qwen2.5-7B-Instruct
+  # OpenAI:
+  #   llm_provider: "openai"
+  #   model: "gpt-4o-mini"
+  # DeepSeek:
+  #   llm_provider: "deepseek"
+  #   model: "deepseek-chat"
+  #   base_url: "https://api.deepseek.com"
 
   consistency:
     use_z3: false
@@ -96,8 +118,8 @@ knowledge:
 # Scenarios
 scenario:
   name: "travel_planning"
-  difficulty: "normal"  # Options: easy, normal, hard, adversarial
-  num_tasks: 50
+  difficulty: "hard"  # align with ablation stress tests
+  num_tasks: 20       # matches manuscript-style demo runs
   failure_rate: 0.4
   min_failures_in_prefix: 5
   prefix_len: 10

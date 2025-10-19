@@ -20,7 +20,12 @@ FEATURES:
 - Conflict resolution strategy (Section VIII-E.3)
 - Comprehensive testing and statistics
 
-UPDATED: Merged best features from both guard implementations.
+UPDATED:
+- Merged best features from both guard implementations.
+- Read ambiguity threshold from governance.gates.tau_conf (consistent with config.yaml),
+  with fallback to legacy 'ambiguity_threshold'.
+- Added derived statistics fields `value_checks` and `causal_checks` in `get_statistics()`
+  to align with downstream analysis code expecting those keys.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ class GuardConfig:
     enable_value_guard: bool = True
     enable_causal_guard: bool = True
     tau_impact: float = 0.6  # Veto if value impact >= tau_impact
-    tau_ambiguity: float = 0.5  # Escalate if ambiguity >= tau_ambiguity
+    tau_ambiguity: float = 0.5  # Escalate if ambiguity >= tau_ambiguity (aka tau_conf)
 
 
 class Guard:
@@ -59,11 +64,13 @@ class Guard:
         """
         cfg = config or {}
 
+        # NOTE: We read tau_ambiguity from governance.gates.tau_conf to match config.yaml.
+        gates = cfg.get("gates", {}) if isinstance(cfg.get("gates", {}), dict) else {}
         self.cfg = GuardConfig(
             enable_value_guard=cfg.get("value_guard", True),
             enable_causal_guard=cfg.get("causal_guard", True),
-            tau_impact=cfg.get("gates", {}).get("tau_impact", 0.6),
-            tau_ambiguity=cfg.get("ambiguity_threshold", 0.5),
+            tau_impact=gates.get("tau_impact", 0.6),
+            tau_ambiguity=gates.get("tau_conf", cfg.get("ambiguity_threshold", 0.5)),
         )
 
         # Knowledge graph integration (optional)
@@ -91,7 +98,7 @@ class Guard:
         print(f"  - Value guard: {'ENABLED' if self.cfg.enable_value_guard else 'DISABLED'}")
         print(f"  - Causal guard: {'ENABLED' if self.cfg.enable_causal_guard else 'DISABLED'}")
         print(f"  - Impact threshold (tau_impact): {self.cfg.tau_impact}")
-        print(f"  - Ambiguity threshold (tau_ambiguity): {self.cfg.tau_ambiguity}")
+        print(f"  - Ambiguity threshold (tau_conf): {self.cfg.tau_ambiguity}")
         print(f"  - ValueKG: {'Available' if self.value_kg else 'Unavailable (using heuristics)'}")
         print(f"  - CausalKG: {'Available' if self.causal_kg else 'Unavailable (using heuristics)'}")
 
@@ -105,14 +112,14 @@ class Guard:
                 'corporate_card_policy': config.get('corporate_card_policy', 'blocked_on_blackout_dates')
             }
             self.value_kg = ValueKG(kg_config)
-        except (ImportError, Exception) as e:
+        except (ImportError, Exception):
             self.value_kg = None
 
         # Try to load CausalKG
         try:
             from ..knowledge.causal_kg import CausalKG
             self.causal_kg = CausalKG(config)
-        except (ImportError, Exception) as e:
+        except (ImportError, Exception):
             self.causal_kg = None
 
     # ========================================================================
@@ -623,7 +630,7 @@ class Guard:
             hazard_free = causal_kg.check_hazards(state or {})
             if not hazard_free:
                 return True, "Known hazard condition in state"
-        except Exception as e:
+        except Exception:
             pass
 
         return False, ""
@@ -708,14 +715,21 @@ class Guard:
             Dictionary with counts and rates
         """
         total = self.stats['total_checks']
+        # Derived counts matching downstream analysis expectations:
+        # - Value guard is evaluated for every check
+        # - Causal guard is skipped when a value veto fires
+        value_checks = total
+        causal_checks = max(0, total - self.stats['value_vetoes'])
 
         return {
             'total_checks': total,
+            'value_checks': value_checks,
             'value_vetoes': self.stats['value_vetoes'],
+            'causal_checks': causal_checks,
             'causal_escalations': self.stats['causal_escalations'],
             'allows': self.stats['allows'],
-            'veto_rate': self.stats['value_vetoes'] / total if total > 0 else 0.0,
-            'escalation_rate': self.stats['causal_escalations'] / total if total > 0 else 0.0,
+            'veto_rate': (self.stats['value_vetoes'] / total) if total > 0 else 0.0,
+            'escalation_rate': (self.stats['causal_escalations'] / causal_checks) if causal_checks > 0 else 0.0,
             'kg_checks': self.stats['kg_checks'],
             'heuristic_checks': self.stats['heuristic_checks'],
             'has_value_kg': self.value_kg is not None,
@@ -813,8 +827,7 @@ if __name__ == "__main__":
     config = {
         'value_guard': True,
         'causal_guard': True,
-        'gates': {'tau_impact': 0.6},
-        'ambiguity_threshold': 0.5,
+        'gates': {'tau_impact': 0.6, 'tau_conf': 0.5},
         'blackout_dates': ['April 10', 'April 11', 'April 12'],
         'corporate_card_policy': 'blocked_on_blackout_dates'
     }

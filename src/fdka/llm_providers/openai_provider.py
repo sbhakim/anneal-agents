@@ -46,13 +46,43 @@ class OpenAIProvider:
         self.timeout_sec = float(config.get("timeout_sec", self.timeout_sec))
         self.base_url = config.get("base_url", None)
         self.max_retries = int(config.get("max_retries", self.max_retries))
+
+        # Respect optional base_url (Azure / proxy / self-hosted)
         self._client = OpenAI(base_url=self.base_url, timeout=self.timeout_sec) if self.base_url else OpenAI(
-            timeout=self.timeout_sec)
+            timeout=self.timeout_sec
+        )
         logger.info(f"OpenAIProvider ready (model={self.model}, timeout={self.timeout_sec}s)")
 
     def _sleep_backoff(self, attempt: int) -> None:
         delay = min(2 ** attempt, 16) + random.random() * 0.5
         time.sleep(delay)
+
+    def _extract_text(self, resp) -> str:
+        """
+        Robustly extract text from a Responses API object.
+        - Prefer resp.output_text when available.
+        - Fallback to the first text block in resp.output.
+        """
+        try:
+            txt = getattr(resp, "output_text", None)
+            if txt:
+                return txt
+        except Exception:
+            pass
+
+        try:
+            out = getattr(resp, "output", None) or []
+            if out and isinstance(out, list):
+                # Newer Responses API: output[0].content[*].text
+                first = out[0]
+                content = getattr(first, "content", None) or []
+                for part in content:
+                    t = getattr(part, "text", None)
+                    if t:
+                        return t
+        except Exception:
+            pass
+        return ""
 
     def _format_ok(self, resp, start: float, model: str) -> GenResult:
         latency = time.time() - start
@@ -67,7 +97,7 @@ class OpenAIProvider:
         except Exception:
             finish_reason = ""
 
-        text = getattr(resp, "output_text", "") or ""
+        text = self._extract_text(resp) or ""
         logger.info(
             "OPENAI_CALL",
             extra={
@@ -120,22 +150,37 @@ class OpenAIProvider:
         }
 
     def generate(
-            self,
-            prompt: Optional[str] = None,
-            messages: Optional[List[Dict[str, str]]] = None,
-            **kwargs: Any,
+        self,
+        prompt: Optional[str] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+        **kwargs: Any,
     ) -> GenResult:
+        """
+        Unified generation via the OpenAI Responses API.
+
+        Args:
+            prompt: Plain text prompt (mutually exclusive with messages)
+            messages: Chat-style messages list: [{"role":"system"|"user"|"assistant","content":"..."}]
+            **kwargs: Optional passthrough settings (seed, top_p, stop, response_format, tools, etc.)
+
+        Returns:
+            GenResult dict with text, usage stats, and metadata (or error fields).
+        """
         if (prompt is None) == (messages is None):
             raise ValueError("Provide exactly one of `prompt` or `messages`")
 
+        # Build the "input" payload for Responses API
+        input_payload: Union[str, List[Dict[str, str]]]
         if messages is not None:
             input_payload = messages
         else:
-            input_payload = prompt
+            input_payload = prompt  # type: ignore[assignment]
 
-        max_out = int(kwargs.pop("max_output_tokens", self.max_tokens))
-        if max_out <= 0:
-            max_out = self.max_tokens
+        # Accept both max_output_tokens and max_tokens (prefer explicit kwarg first)
+        max_out = kwargs.pop("max_output_tokens", None)
+        if max_out is None:
+            max_out = kwargs.pop("max_tokens", self.max_tokens)
+        max_out = int(max_out) if int(max_out) > 0 else self.max_tokens
 
         call_args: Dict[str, Any] = {
             "model": kwargs.pop("model", self.model),
@@ -143,8 +188,19 @@ class OpenAIProvider:
             "temperature": kwargs.pop("temperature", self.temperature),
             "max_output_tokens": max_out,
         }
-        for k in ("seed", "top_p", "stop", "response_format", "tools", "tool_choice",
-                  "user", "reasoning", "logprobs", "top_logprobs"):
+        # Pass through a few useful/allowed extras
+        for k in (
+            "seed",
+            "top_p",
+            "stop",
+            "response_format",
+            "tools",
+            "tool_choice",
+            "user",
+            "reasoning",
+            "logprobs",
+            "top_logprobs",
+        ):
             if k in kwargs:
                 call_args[k] = kwargs.pop(k)
         if kwargs:
@@ -159,7 +215,7 @@ class OpenAIProvider:
                 return self._format_ok(resp, start, call_args["model"])
 
             except AuthenticationError as e:
-                # ✅ ADDED: Don't retry auth errors
+                # ✅ Do not retry auth errors
                 return self._format_err(e, start, call_args["model"])
 
             except (RateLimitError, APITimeoutError) as e:
@@ -169,6 +225,7 @@ class OpenAIProvider:
                 self._sleep_backoff(attempt)
 
             except BadRequestError as e:
+                # Most formatting/contract issues land here—surface and stop
                 return self._format_err(e, start, call_args["model"])
 
             except APIError as e:

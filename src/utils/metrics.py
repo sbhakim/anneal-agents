@@ -9,6 +9,9 @@ UPDATED:
 - Efficiency tracking (Table 5)
 - Fixed duplicate method definitions
 - Consolidated governance statistics methods
+- NEW: to_governance_dict() helper for compact governance export
+- NEW: to_patches_frame() helper for tidy patch-score analysis
+- CHANGE: export_efficiency_csv() writes an empty CSV with headers when no data
 """
 import json
 from typing import Dict, Any, List, Optional
@@ -74,6 +77,8 @@ class MetricsCollector:
             "causal_checks": 0,
             "causal_escalations": 0,
             "causal_escalation_reasons": [],
+            # NOTE: 'canary_tests' must reflect ONLY actually executed canaries.
+            # Ensure callers invoke record_canary_test() only when a canary runs.
             "canary_tests": 0,
             "canary_passes": 0,
             "canary_fails": 0
@@ -191,7 +196,12 @@ class MetricsCollector:
                 self.governance_stats["causal_escalation_reasons"].append(reason)
 
     def record_canary_test(self, passed: bool) -> None:
-        """Record a canary test result."""
+        """
+        Record a canary test result.
+
+        IMPORTANT: Call this ONLY when the canary actually executes.
+        (Do not call on early exits like 'no patch proposed' or 'below threshold'.)
+        """
         self.governance_stats["canary_tests"] += 1
         if passed:
             self.governance_stats["canary_passes"] += 1
@@ -258,6 +268,25 @@ class MetricsCollector:
         )
 
         return stats
+
+    def to_governance_dict(self) -> Dict[str, Any]:
+        """
+        Compact governance view suitable for JSON sidecars or quick CSVs.
+        """
+        s = self.get_governance_stats()
+        return {
+            "value_checks": s["value_checks"],
+            "value_vetoes": s["value_vetoes"],
+            "value_veto_rate": s["value_veto_rate"],
+            "causal_checks": s["causal_checks"],
+            "causal_escalations": s["causal_escalations"],
+            "causal_escalation_rate": s["causal_escalation_rate"],
+            "canary_tests": s["canary_tests"],
+            "canary_passes": s["canary_passes"],
+            "canary_fails": s["canary_fails"],
+            "canary_pass_rate": s["canary_pass_rate"],
+            "canary_fail_rate": s["canary_fail_rate"],
+        }
 
     # ============= METRIC CALCULATION METHODS =============
 
@@ -575,8 +604,14 @@ class MetricsCollector:
 
     def export_efficiency_csv(self, filepath: Path) -> None:
         """Export efficiency data to CSV (Table 5)."""
+        # Always write a CSV with headers, even if empty, to keep pipelines simple.
+        headers = [
+            'System', 'Total_LLM_Calls', 'Total_Tokens', 'Avg_Tokens_Per_Call',
+            'Total_Latency_Sec', 'Avg_Latency_Sec', 'Total_Cost_USD', 'Cost_Per_Task'
+        ]
         if self.efficiency['total_llm_calls'] == 0:
-            print(f"   ⚠️ Table 5: No LLM call data")
+            pd.DataFrame(columns=headers).to_csv(filepath, index=False)
+            print(f"   ⚠️ Table 5: No LLM call data (wrote empty CSV)")
             return
 
         rows = [{
@@ -595,6 +630,40 @@ class MetricsCollector:
         print(f"   ✅ Table 5: {filepath.name}")
 
     # ============= HELPER METHODS =============
+
+    def to_patches_frame(self) -> pd.DataFrame:
+        """
+        Return a tidy DataFrame of recorded patches (with score columns when present).
+        Useful in notebooks and for generating model-specific CSVs.
+        """
+        if not self.patches:
+            return pd.DataFrame(columns=[
+                'patch_id', 'operator', 'action', 'details', 'accepted', 'committed',
+                'plausibility', 'consistency', 'utility', 'risk', 'aggregate', 'timestamp'
+            ])
+        rows: List[Dict[str, Any]] = []
+        for p in self.patches:
+            row = {
+                'patch_id': p.get('patch_id'),
+                'operator': p.get('operator'),
+                'action': p.get('action'),
+                'details': p.get('details'),
+                'accepted': p.get('accepted'),
+                'committed': p.get('committed'),
+                'timestamp': p.get('timestamp'),
+                'plausibility': None, 'consistency': None, 'utility': None, 'risk': None, 'aggregate': None
+            }
+            if isinstance(p.get('scores'), dict):
+                sc = p['scores']
+                row.update({
+                    'plausibility': sc.get('plausibility'),
+                    'consistency' : sc.get('consistency'),
+                    'utility'     : sc.get('utility'),
+                    'risk'        : sc.get('risk'),
+                    'aggregate'   : sc.get('aggregate'),
+                })
+            rows.append(row)
+        return pd.DataFrame(rows)
 
     def _extract_failure_info(self, trace: List[Dict]) -> Optional[Dict]:
         """Extract failure information from execution trace."""

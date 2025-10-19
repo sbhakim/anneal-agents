@@ -56,18 +56,21 @@ class FullEvaluationRunner:
             "demo_run": {"status": "not_run", "duration": 0, "error": None}
         }
 
-        # ✅ BEST PRACTICE: Initialize all experiment objects once
+        # ✅ Initialize experiment objects once
         self.baseline_runner = BaselineComparison()
         self.ablation_runner = AblationStudy()
 
         if self.quick_mode:
             print("⚡ QUICK MODE: Modifying experiment settings for a fast run.")
+            # Baselines
             self.baseline_runner.num_tasks = 10
             self.baseline_runner.num_seeds = 2
             self.baseline_runner.seeds = [42, 123]
+            # Ablations
             self.ablation_runner.num_seeds = 2
             self.ablation_runner.seeds = [42, 123]
             self.ablation_runner.task_counts = {'easy': 10, 'normal': 10, 'hard': 10}
+            # Keep ablation difficulty list as defined by the runner; task_counts above will apply.
 
         self.results_root.mkdir(parents=True, exist_ok=True)
         self.data_root.mkdir(parents=True, exist_ok=True)
@@ -176,7 +179,13 @@ class FullEvaluationRunner:
         for name, result in self.experiment_results.items():
             status = result["status"]
             duration = result["duration"]
-            icon = {"success": "✅", "failed": "❌", "skipped": "⏭️", "interrupted": "⏸️"}.get(status, "⚪")
+            icon = {
+                "success": "✅",
+                "failed": "❌",
+                "skipped": "⏭️",
+                "interrupted": "⏸️",
+                "not_run": "⚪"
+            }.get(status, "⚪")
             print(f"{icon} {name.replace('_', ' ').title():<27} {status.upper():<12} {duration:<15.1f}")
             if result.get("error"):
                 print(f"   Error: {result['error'][:70]}...")
@@ -192,20 +201,27 @@ class FullEvaluationRunner:
                 print("\n📌 Running in DEMO-ONLY mode")
                 self.run_demo()
             else:
+                # Baseline
                 if not skip_baseline:
                     self.run_baseline_comparison()
                 else:
                     print("\n⏭️ Skipping baseline comparison (--skip-baseline)")
                     self.experiment_results["baseline_comparison"]["status"] = "skipped"
 
+                # Ablations
                 if not skip_ablations:
                     self.run_ablation_study()
                 else:
                     print("\n⏭️ Skipping ablation study (--skip-ablations)")
                     self.experiment_results["ablation_study"]["status"] = "skipped"
 
+                # Demo is optional in non-demo-only mode → mark as skipped for clean exit code
+                if self.experiment_results["demo_run"]["status"] == "not_run":
+                    self.experiment_results["demo_run"]["status"] = "skipped"
+
             self.generate_summary()
 
+            # Success if every tracked experiment either succeeded or was intentionally skipped
             if all(r["status"] in ["success", "skipped"] for r in self.experiment_results.values()):
                 return 0  # Success
             else:

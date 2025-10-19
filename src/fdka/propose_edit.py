@@ -2,7 +2,14 @@
 """
 Implements the 3-stage ProposeEdit pipeline from Section VIII-B of the paper.
 
-✅ UPDATED: Fixed provider initialization to work with flat config structure.
+UPDATED:
+- Integrated fixes for local Transformers models (device mapping, dtype, tokenizer pad id).
+- Robust prompt & JSON parsing for all providers (OpenAI/DeepSeek/Transformers/Mock).
+- Action token normalization + aliasing (e.g., "ADD_PRE CONDITION" → "ADD_PRECONDITION").
+- Fail-soft behavior: schema/type errors return {action:"REJECTED", details:...} instead of raising.
+- Deterministic validation after normalization; helpful warnings on unknown predicates.
+- Timeouts for LLM calls; graceful fallbacks to mock generation.
+- NEW: Return and preserve a top-level `usage` dict (tokens, latency, model).
 """
 
 from typing import List, Dict, Any, Optional
@@ -13,18 +20,17 @@ import signal
 import functools
 import re
 import os
+import time
 
 # API providers
 try:
     from .llm_providers.openai_provider import OpenAIProvider
-
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
 
 try:
     from .llm_providers.deepseek_provider import DeepSeekProvider
-
     DEEPSEEK_AVAILABLE = True
 except ImportError:
     DEEPSEEK_AVAILABLE = False
@@ -33,11 +39,17 @@ except ImportError:
 try:
     import torch
     from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-
     TRANSFORMERS_AVAILABLE = True
+    # Keep TorchDynamo quiet on odd graphs
+    import torch._dynamo  # type: ignore
+    torch._dynamo.config.suppress_errors = True  # type: ignore[attr-defined]
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
+
+# ---------------------------
+# Templates for mock fallback
+# ---------------------------
 PATCH_TEMPLATES = {
     ("PreconditionUnmet", ("blackout", "policy", "blocked", "h-23")): {
         "action": "ADD_PRECONDITION",
@@ -70,6 +82,40 @@ PATCH_TEMPLATES = {
 }
 
 
+# ---------------------------
+# Action normalization helpers
+# ---------------------------
+ALLOWED_ACTIONS = {"ADD_PRECONDITION", "REFINE_EFFECT", "UPDATE_TOOL_SCHEMA"}
+ACTION_ALIASES = {
+    "ADD_PRE CONDITION": "ADD_PRECONDITION",
+    "ADD_PRE-CONDITION": "ADD_PRECONDITION",
+    "ADD PRECONDITION": "ADD_PRECONDITION",
+    "ADD_PRECONDITIONS": "ADD_PRECONDITION",
+    "REFINE EFFECT": "REFINE_EFFECT",
+    "UPDATE_TOOL-SCHEMA": "UPDATE_TOOL_SCHEMA",
+    "UPDATE TOOL SCHEMA": "UPDATE_TOOL_SCHEMA",
+}
+
+
+def _normalize_action(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    # fast alias on raw
+    if s in ACTION_ALIASES:
+        return ACTION_ALIASES[s]
+    t = s.replace("-", "_").replace(" ", "_").upper()
+    # collapse multiple underscores
+    while "__" in t:
+        t = t.replace("__", "_")
+    # alias after normalization
+    if t in ACTION_ALIASES:
+        return ACTION_ALIASES[t]
+    return t
+
+
+# ---------------------------
+# Timeout decorator
+# ---------------------------
 class TimeoutException(Exception):
     pass
 
@@ -105,32 +151,23 @@ class FDKAPipeline:
     def __init__(self, config: Dict[str, Any], metrics_collector: Optional[Any] = None):
         """
         Initialize FDKA pipeline with dynamic LLM provider selection.
-
-        ✅ FIXED: Now correctly passes flat config structure to providers.
         """
-        # Extract the 'propose_edit' section from fdka config
-        self.config = config.get("propose_edit", {})
+        self.root_config = config or {}
+        self.config = self.root_config.get("propose_edit", self.root_config) or {}
         self.metrics_collector = metrics_collector
-
         self.llm_provider_type = self.config.get("llm_provider", "mock")
         self.llm = None
-
         print(f"FDKA: Initializing with provider='{self.llm_provider_type}'")
 
-        # ✅ FIXED: Pass the entire config (flat structure) to providers
         if self.llm_provider_type == 'openai':
             if not OPENAI_AVAILABLE:
                 raise ImportError("OpenAI provider selected but not available. Run: pip install openai>=1.0.0")
-
-            # ✅ Pass self.config directly (contains model, temperature, etc.)
             self.llm = OpenAIProvider(self.config)
             print(f"FDKA: ✅ OpenAI provider initialized (model={self.config.get('model', 'gpt-4o-mini')})")
 
         elif self.llm_provider_type == 'deepseek':
             if not DEEPSEEK_AVAILABLE:
                 raise ImportError("DeepSeek provider not available. Ensure deepseek_provider.py exists.")
-
-            # ✅ Pass self.config directly
             self.llm = DeepSeekProvider(self.config)
             print(f"FDKA: ✅ DeepSeek provider initialized (model={self.config.get('model', 'deepseek-chat')})")
 
@@ -145,61 +182,96 @@ class FDKAPipeline:
             print("FDKA: Using mock LLM (rule-based fallback, no API calls).")
 
         self.accepted_patch_cache: List[Dict[str, Any]] = []
-        self.ALLOWED_ACTIONS = ["ADD_PRECONDITION", "REFINE_EFFECT", "UPDATE_TOOL_SCHEMA"]
         self.KNOWN_PREDICATES = {
             "is_card_valid", "is_hotel_available", "is_flight_available",
             "check_not_blocked_card", "Not", "BlockedCard", "IfThen",
-            "NetworkAvailable", "Sent", "ValidState", "ValidPayment"
+            "NetworkAvailable", "Sent", "ValidState", "ValidPayment", "ExecuteTool"
         }
 
+    # ---------------------------
+    # Local Transformers bootstrap
+    # ---------------------------
     def _initialize_local_llm(self):
-        """Initializes a local Hugging Face transformers pipeline."""
-        # ✅ For transformers, look for nested config (backwards compatibility)
-        transformers_cfg = self.config.get('transformers_config', {})
-
-        # If no nested config, use flat config values
-        if not transformers_cfg:
-            transformers_cfg = self.config
-
-        active_model_key = transformers_cfg.get('active_model')
-        local_models_map = transformers_cfg.get('local_models', {})
-
-        # Fallback: If no active_model specified, use 'model' field directly
-        if not active_model_key and 'model' in transformers_cfg:
-            self.local_model_id = transformers_cfg['model']
-        else:
-            self.local_model_id = local_models_map.get(active_model_key)
-
+        """Initializes a local Hugging Face transformers pipeline with config hints."""
+        transformers_cfg = self.config.get('transformers_config', self.config) or {}
+        self.local_model_id = transformers_cfg.get('model') or self.config.get('model')
         if not self.local_model_id:
-            raise ValueError(f"Config error: Could not determine model ID from config: {transformers_cfg}")
+            raise ValueError(f"Config error: 'model' not specified for transformers provider.")
 
         try:
             print(f"FDKA: 🚧 Loading local LLM: {self.local_model_id}...")
+
+            # Device selection: explicit device_map or auto CUDA/CPU
+            device_map = transformers_cfg.get("device_map", self.config.get("device_map", "auto"))
+            dtype_pref = (transformers_cfg.get("dtype") or self.config.get("dtype") or "auto")
+            trust_remote = bool(transformers_cfg.get("trust_remote_code", self.config.get("trust_remote_code", True)))
+
+            # Resolve torch dtype
+            if dtype_pref == "auto":
+                torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            elif str(dtype_pref).lower() in ("bf16", "bfloat16"):
+                torch_dtype = torch.bfloat16
+            elif str(dtype_pref).lower() in ("fp16", "float16", "half"):
+                torch_dtype = torch.float16
+            else:
+                torch_dtype = torch.float32
+
+            # Pipeline device: -1 for CPU, 0 for first GPU
+            device = 0 if torch.cuda.is_available() else -1
+            print(f"FDKA: ⚙️  Setting device for local model pipeline to: {'cuda:0' if device == 0 else 'cpu'}")
+
+            # Tokenizer & model (explicit so we can set pad token safely)
+            tokenizer = AutoTokenizer.from_pretrained(self.local_model_id, trust_remote_code=trust_remote)
+            if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            # Let HF pick the best loader strategy; pipeline handles weights loading.
             self.llm_pipeline = pipeline(
-                "text-generation",
+                task="text-generation",
                 model=self.local_model_id,
-                torch_dtype=torch.bfloat16,
-                device_map="auto"
+                tokenizer=tokenizer,
+                torch_dtype=torch_dtype,
+                device=device
             )
             print("FDKA: ✅ Local LLM loaded.")
         except Exception as e:
             print(f"FDKA: ❌ Failed to load local LLM: {e}")
             self.llm_pipeline = None
 
+    # ---------------------------
+    # Public entrypoint
+    # ---------------------------
     def propose_edit(self, trace: List[Dict[str, Any]], rule_pool) -> Dict[str, Any]:
         print("\n--- FDKA PROPOSAL INITIATED ---")
-        fi = self._extract_failure_info(trace)
-        op_name = self._localize(fi)
-        print(f"FDKA: [1/3] Fault localized -> '{op_name}'")
-        patch = self._propose_edit_three_stage(fi, trace, rule_pool)
-        patch.setdefault("operator", op_name)
-        patch.setdefault("id", f"patch-{uuid.uuid4().hex[:8]}")
-        patch.setdefault("source", "fdka.v1.2")
-        print(
-            f"FDKA: [3/3] Patch proposed -> {patch.get('action', 'N/A')}: {patch.get('details', 'N/A')} (id={patch.get('id')})")
-        print("--- FDKA PROPOSAL COMPLETED ---")
-        return patch
+        try:
+            fi = self._extract_failure_info(trace)
+            op_name = self._localize(fi)
+            print(f"FDKA: [1/3] Fault localized -> '{op_name}'")
+            patch = self._propose_edit_three_stage(fi, trace, rule_pool)
+            patch.setdefault("operator", op_name)
+            patch.setdefault("id", f"patch-{uuid.uuid4().hex[:8]}")
+            patch.setdefault("source", "fdka.v1.3")
+            # ensure usage dict always present for downstream simplicity
+            patch.setdefault("usage", {"tokens_used": 0, "latency_sec": 0.0, "model": self.llm_provider_type})
+            print(
+                f"FDKA: [3/3] Patch proposed -> {patch.get('action', 'N/A')}: {patch.get('details', 'N/A')} (id={patch.get('id')})")
+            print("--- FDKA PROPOSAL COMPLETED ---")
+            return patch
+        except Exception as e:
+            # Fail-soft: never crash the evaluation loop due to a malformed patch
+            msg = f"propose_edit_error: {e.__class__.__name__}: {e}"
+            print(f"FDKA: ❌ {msg}")
+            return {
+                "action": "REJECTED",
+                "details": msg,
+                "id": f"patch-{uuid.uuid4().hex[:8]}",
+                "source": "fdka.v1.3",
+                "usage": {"tokens_used": 0, "latency_sec": 0.0, "model": self.llm_provider_type}
+            }
 
+    # ---------------------------
+    # Stage 1: Serialize context
+    # ---------------------------
     def _extract_failure_info(self, trace):
         for entry in reversed(trace or []):
             if isinstance(entry, dict) and "error" in entry:
@@ -214,7 +286,10 @@ class FDKAPipeline:
         prompt = self._stage1_serialize(fi, trace, rule_pool)
         print("  📝 Stage 1: Serialized trace.")
         raw_patch_json = self._stage2_generate(prompt)
-        print(f"  🤖 Stage 2: LLM generated -> {raw_patch_json.get('action', 'N/A')}")
+        if isinstance(raw_patch_json, dict) and raw_patch_json.get("action") == "REJECTED":
+            return raw_patch_json
+        action_seen = (raw_patch_json or {}).get("action", "N/A")
+        print(f"  🤖 Stage 2: LLM generated -> {action_seen}")
         valid_patch = self._stage3_validate(raw_patch_json, rule_pool)
         print("  ✅ Stage 3: Validated patch.")
         return valid_patch
@@ -232,7 +307,7 @@ class FDKAPipeline:
         return {
             "operator": sig, "state_minimal": minimal,
             "error": {"type": fi.get("error"), "site": fi.get("operator"),
-                      "evidence": (fi.get("policy_ref", "") + fi.get("message", "")[:50])},
+                      "evidence": (fi.get("policy_ref", "") + (fi.get("message", "") or "")[:50])},
             "state_delta": delta
         }
 
@@ -243,169 +318,260 @@ class FDKAPipeline:
                 fs = e["state_before"]
                 for p in sig.get("params", []):
                     for k, v in fs.items():
-                        if p.lower() in k.lower(): ms[k] = v
+                        if isinstance(p, str) and p.lower() in str(k).lower():
+                            ms[k] = v
                 for k in ["payment_method", "travel_dates", "blackout_dates", "corporate_card_policy"]:
-                    if k in fs: ms[k] = fs[k]
+                    if k in fs:
+                        ms[k] = fs[k]
                 break
         return ms
 
     def _compute_state_delta(self, fi):
         name, et = fi.get("operator", "Unknown"), fi.get("error", "Unknown")
         exp = []
-        if "Hotel" in name: exp.append("Booked(location, dates)")
-        if "Flight" in name: exp.append("Booked(origin, destination, date)")
+        if "Hotel" in name:
+            exp.append("Booked(location, dates)")
+        if "Flight" in name:
+            exp.append("Booked(origin, destination, date)")
         return {"expected": exp, "observed": [f"Error({et})"]}
 
+    # ---------------------------
+    # Stage 2: Generate candidate
+    # ---------------------------
     def _stage2_generate(self, serialized_prompt):
-        prompt_str = self._build_llm_prompt(serialized_prompt)
-
+        prompt_dict = self._build_llm_prompt(serialized_prompt)
         if self.llm_provider_type in ['openai', 'deepseek']:
-            return self._generate_with_api(prompt_str)
+            return self._generate_with_api(prompt_dict)
         elif self.llm_provider_type == 'transformers':
-            return self._generate_with_transformers(prompt_str)
-        else:  # mock
+            return self._generate_with_transformers(prompt_dict)
+        else:
+            # mock path expects the same structure as serialized_prompt
             return self._mock_llm_generate(serialized_prompt)
 
     @timeout(seconds=60)
-    def _generate_with_api(self, prompt: str) -> Dict:
+    def _generate_with_api(self, prompt_dict: Dict) -> Dict:
         if not self.llm:
             print("  ⚠️ API provider not initialized. Falling back to mock.")
-            return self._mock_llm_generate({"prompt": prompt})
+            return self._mock_llm_generate(prompt_dict.get("serialized_prompt", {}))
 
-        print(f"  🧠 Calling {self.llm_provider_type} API with enhanced prompt...")
-        result = self.llm.generate(prompt)
+        print(f"  🧠 Calling {self.llm_provider_type} API...")
+        messages = [
+            {"role": "system", "content": prompt_dict["system"]},
+            {"role": "user", "content": prompt_dict["user"]}
+        ]
 
-        # ✅ Track efficiency metrics
-        if self.metrics_collector:
-            self.metrics_collector.record_llm_call(
-                tokens=result.get('tokens_used', 0),
-                latency_sec=result.get('latency_sec', 0),
-                model=result.get('model', self.llm_provider_type)
-            )
+        for attempt in range(2):  # Try up to 2 times
+            t0 = time.time()
+            result = self.llm.generate(messages=messages)
+            latency = max(0.0, time.time() - t0)
+            usage = {
+                "tokens_used": result.get('tokens_used', 0),
+                "latency_sec": result.get('latency_sec', latency),
+                "model": result.get('model', self.llm_provider_type)
+            }
 
-        if 'error' in result or not result['text']:
-            print(f"  ⚠️ API call failed. Reason: {result.get('error', 'Empty response')}. Falling back.")
-            return self._mock_llm_generate({"prompt": prompt})
+            if self.metrics_collector:
+                self.metrics_collector.record_llm_call(
+                    tokens=usage["tokens_used"],
+                    latency_sec=usage["latency_sec"],
+                    model=usage["model"]
+                )
 
-        raw_text = result['text']
-        try:
-            json_start = raw_text.find('{')
-            json_end = raw_text.rfind('}') + 1
-            if json_start != -1:
-                json_str = raw_text[json_start:json_end]
-                return json.loads(json_str)
-            raise ValueError("No JSON object found in API response")
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"  ⚠️ Could not parse JSON from API response: {e}. Falling back.")
-            return self._mock_llm_generate({"prompt": prompt})
+            if 'error' in result or not result.get('text'):
+                continue
 
-    @timeout(seconds=60)
-    def _generate_with_transformers(self, prompt: str) -> Dict:
+            raw_text = result['text']
+            parsed = self._extract_json_from_text(raw_text)
+            if parsed is not None:
+                # attach usage so caller can also log/aggregate if desired
+                parsed["usage"] = usage
+                return parsed
+
+            # retry prompt to fix JSON
+            print(f"  ⚠️ Attempt {attempt + 1}: Could not parse JSON. Retrying with correction prompt...")
+            messages = [
+                {"role": "system",
+                 "content": "You are a JSON generator. Respond ONLY with the corrected JSON object (no markdown)."},
+                {"role": "user",
+                 "content": f"Fix the malformed JSON below and output ONLY valid JSON (no prose, no fences):\n\n{raw_text}"}
+            ]
+            time.sleep(1)
+
+        print(f"  ❌ All attempts to parse JSON failed. Falling back to mock.")
+        return self._mock_llm_generate(prompt_dict.get("serialized_prompt", {}))
+
+    @timeout(seconds=120)
+    def _generate_with_transformers(self, prompt_dict: Dict) -> Dict:
         if not self.llm_pipeline:
             print("  ⚠️ No local LLM; falling back to mock.")
-            return self._mock_llm_generate({"prompt": prompt})
-
+            return self._mock_llm_generate(prompt_dict.get("serialized_prompt", {}))
         try:
-            print("  🧠 Calling local model with enhanced prompt...")
-            # Use flat config or nested transformers_config
-            cfg = self.config.get('transformers_config', self.config)
+            print("  🧠 Calling local model...")
+            full_prompt = f"{prompt_dict['system']}\n\n{prompt_dict['user']}"
+            cfg = self.config.get('transformers_config', self.config) or {}
 
+            # time the call for latency
+            t0 = time.time()
             out = self.llm_pipeline(
-                prompt, max_new_tokens=cfg.get('max_tokens', 300), do_sample=True,
-                temperature=cfg.get('temperature', 0.3), return_full_text=False,
-                pad_token_id=self.llm_pipeline.tokenizer.eos_token_id, top_p=0.95,
-                repetition_penalty=cfg.get('repetition_penalty', 1.1)
+                full_prompt,
+                max_new_tokens=int(cfg.get('max_tokens', 300)),
+                do_sample=True,
+                temperature=float(cfg.get('temperature', 0.3)),
+                return_full_text=False,
+                pad_token_id=self.llm_pipeline.tokenizer.eos_token_id,
+                top_p=float(cfg.get('top_p', 0.95)),
+                repetition_penalty=float(cfg.get('repetition_penalty', 1.1)),
             )
-            txt = out[0]["generated_text"].strip()
+            latency = max(0.0, time.time() - t0)
+            txt = (out[0]["generated_text"] if out and isinstance(out, list) and "generated_text" in out[0] else "").strip()
+            parsed = self._extract_json_from_text(txt)
 
-            jsstart = txt.find("{")
-            if jsstart < 0: raise ValueError("No JSON in LLM output")
+            # estimate tokens (best-effort) using tokenizer
+            try:
+                tokens_used = len(self.llm_pipeline.tokenizer.encode(full_prompt)) + \
+                              len(self.llm_pipeline.tokenizer.encode(txt))
+            except Exception:
+                tokens_used = 0
 
-            bc, jsend = 0, jsstart
-            for i, c in enumerate(txt[jsstart:], start=jsstart):
-                if c == "{":
-                    bc += 1
-                elif c == "}":
-                    bc -= 1
-                if bc == 0: jsend = i + 1; break
+            usage = {
+                "tokens_used": tokens_used,
+                "latency_sec": latency,
+                "model": getattr(self, "local_model_id", "transformers")
+            }
 
-            jp = txt[jsstart:jsend].strip("`")
-            return json.loads(jp)
+            if self.metrics_collector:
+                self.metrics_collector.record_llm_call(
+                    tokens=usage["tokens_used"],
+                    latency_sec=usage["latency_sec"],
+                    model=usage["model"]
+                )
 
+            if parsed is not None:
+                parsed["usage"] = usage
+                return parsed
+            raise ValueError("No valid JSON found in local LLM output")
         except (TimeoutException, json.JSONDecodeError, Exception) as e:
             print(f"  ⚠️ Local LLM generation error: {e}. Falling back.")
-            return self._mock_llm_generate({"prompt": prompt})
+            return self._mock_llm_generate(prompt_dict.get("serialized_prompt", {}))
 
-    def _build_llm_prompt(self, sp):
-        state = sp.get("state_minimal", {})
-        payment = state.get("payment_method", "payment")
-        dates = state.get("travel_dates", "dates")
+    def _extract_json_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract a single JSON object from free text or fenced blocks."""
+        if not text:
+            return None
+        # try fenced ```json ... ```
+        m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+        # try any single top-level {...}
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            # attempt bracket balancing
+            bal = 0
+            last = start
+            for i, ch in enumerate(text[start:end + 1], start=start):
+                if ch == '{':
+                    bal += 1
+                elif ch == '}':
+                    bal -= 1
+                    if bal == 0:
+                        last = i
+                        break
+            try:
+                return json.loads(text[start:last + 1])
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def _build_llm_prompt(self, sp: Dict) -> Dict:
+        """
+        Builds the prompt for the LLM, now explicitly asking for the 'operator' key.
+        Also returns the serialized_prompt for mock fallback.
+        """
         error_type = sp.get("error", {}).get("type", "Unknown")
         error_evidence = sp.get("error", {}).get("evidence", "")
         operator_name = sp.get("operator", {}).get("name", "Unknown")
 
-        guidance, recommended_predicate = "", ""
-        if error_type == "PreconditionUnmet":
-            if any(k in error_evidence.lower() for k in ["blackout", "blocked"]):
-                guidance = "This is a blackout date violation. Use Not(BlockedCard(payment, dates))."
-                recommended_predicate = f'Not(BlockedCard({payment}, {dates}))'
-            elif any(k in error_evidence.lower() for k in ["invalid", "payment"]):
-                guidance = "This is a payment validation failure. Use ValidPayment(payment)."
-                recommended_predicate = f'ValidPayment({payment})'
-        elif error_type == "ToolError" and any(k in error_evidence.lower() for k in ["timeout", "network"]):
-            guidance = "This is a network/API timeout. Use REFINE_EFFECT with IfThen(NetworkAvailable(), ...)."
-            recommended_predicate = 'IfThen(NetworkAvailable(), ExecuteTool())'
+        system_prompt = (
+            "You are an expert system that outputs exactly one valid JSON object for a symbolic patch.\n"
+            "Do not add explanations or markdown. Output ONLY the JSON object."
+        )
 
-        return f"""You are a symbolic patch generator for a travel booking system.
+        user_prompt = f"""
+A failure occurred. Generate a JSON patch to fix it.
 
-=== DOMAIN VOCABULARY (USE ONLY THESE) ===
-Predicates: Not(BlockedCard(payment, dates)), ValidPayment(payment), NetworkAvailable(), IfThen(Condition, Effect)
+FAILURE CONTEXT:
+- Operator: {operator_name}
+- Error Type: {error_type}
+- Evidence: {error_evidence}
 
-=== CURRENT FAILURE CONTEXT ===
-Operator: {operator_name}
-Error Type: {error_type}
-Evidence: {error_evidence}
-{guidance}
+RULES:
+- Keys required: "action", "operator", "patch".
+- "action" must be one of: {sorted(list(ALLOWED_ACTIONS))}
+- "operator" must equal "{operator_name}"
+- For invalid/expired payment: {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "ValidPayment(payment)"}}}}
+- For blocked card/blackout: {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "Not(BlockedCard(payment, dates))"}}}}
+- For network/timeout: {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())"}}}}
 
-=== FEW-SHOT EXAMPLES ===
-1. {{"action": "ADD_PRECONDITION", "operator": "BookHotel", "patch": {{"predicate": "Not(BlockedCard(CorporateCard:CC-5512, April 21-24))", "justification": "API policy blocks corporate cards during blackout periods"}}}}
-2. {{"action": "ADD_PRECONDITION", "operator": "BookHotel", "patch": {{"predicate": "ValidPayment(CorporateCard:CC-5512)", "justification": "Ensure payment method is valid before booking"}}}}
-3. {{"action": "REFINE_EFFECT", "operator": "BookFlight", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())", "justification": "Prevent tool execution on network failure"}}}}
-
-=== STRICT OUTPUT REQUIREMENTS ===
-1. Use ONLY predicates from the Domain Vocabulary.
-2. Use actual parameter values (e.g., "{payment}").
-3. Output ONLY valid JSON.
-
-=== RECOMMENDED SOLUTION ===
-Recommended Predicate: {recommended_predicate}
-
-Generate the patch JSON for the current failure:
-"""
+Return only the JSON object, no prose."""
+        return {"system": system_prompt, "user": user_prompt, "serialized_prompt": sp}
 
     def _mock_llm_generate(self, sp):
         error = sp.get("error", {}).get("type", "")
-        ev = sp.get("error", {}).get("evidence", "").lower()
+        ev = (sp.get("error", {}).get("evidence", "") or "").lower()
         operator_name = sp.get("operator", {}).get("name", "Unknown")
         print(f"  🎯 Mock template matching: error={error}, evidence='{ev[:50]}...'")
         for k, t in PATCH_TEMPLATES.items():
             if isinstance(k, tuple):
                 ft, kws = k
                 if ft == error and any(kw in ev for kw in kws):
-                    return {**t, "operator": operator_name}
-        return {**PATCH_TEMPLATES["default"], "operator": operator_name}
+                    out = {**t, "operator": operator_name}
+                    out["usage"] = {"tokens_used": 0, "latency_sec": 0.0, "model": "mock"}
+                    return out
+        out = {**PATCH_TEMPLATES["default"], "operator": operator_name}
+        out["usage"] = {"tokens_used": 0, "latency_sec": 0.0, "model": "mock"}
+        return out
 
+    # ---------------------------
+    # Stage 3: Validate + Normalize
+    # ---------------------------
     def _stage3_validate(self, raw, rp):
-        """Stage 3: Deterministic validation."""
-        self._validate_schema(raw)
-        self._validate_typing_and_semantics(raw, rp)
-        return self._normalize_patch(raw)
+        """Stage 3: Deterministic validation + normalization."""
+        try:
+            # Defensive: ensure dict
+            if not isinstance(raw, dict):
+                raw = {"action": "REJECTED", "details": "non_dict_patch"}
+                return raw
+            # Normalize action before validation
+            act = _normalize_action(raw.get("action", ""))
+            raw["action"] = act
+            # If operator missing, attempt to infer from serialized prompt (no-op here)
+            if not raw.get("operator"):
+                raw["operator"] = (rp and getattr(rp, "last_operator", None)) or "Unknown"
+            # Schema checks
+            self._validate_schema(raw)
+            # Typing/semantic hints (non-fatal)
+            self._validate_typing_and_semantics(raw, rp)
+            # Normalize final patch (preserve optional usage)
+            return self._normalize_patch(raw)
+        except Exception as e:
+            # Fail-soft
+            return {"action": "REJECTED", "details": f"validation_error: {e}", "usage": raw.get("usage") if isinstance(raw, dict) else None}
 
     def _validate_schema(self, p):
         if not isinstance(p, dict) or not all(k in p for k in ["action", "operator", "patch"]):
             raise ValueError(f"Invalid patch structure: {p}")
-        if p["action"] not in self.ALLOWED_ACTIONS:
-            raise ValueError(f"Invalid action '{p['action']}', must be one of {self.ALLOWED_ACTIONS}")
+        if p["action"] not in ALLOWED_ACTIONS:
+            raise ValueError(f"Invalid action '{p['action']}', must be one of {sorted(ALLOWED_ACTIONS)}")
+        # basic patch content presence
+        if not isinstance(p["patch"], dict):
+            raise ValueError("Patch 'patch' must be a JSON object")
+        if not any(k in p["patch"] for k in ("predicate", "guard")):
+            raise ValueError("Patch must include either 'predicate' or 'guard'")
         print("  ✓ Schema OK")
 
     def _validate_typing_and_semantics(self, p, rp):
@@ -415,12 +581,16 @@ Generate the patch JSON for the current failure:
         print("  ✓ Type OK")
 
     def _normalize_patch(self, p):
-        """Normalize patch to a standard internal format."""
+        """Normalize patch to a standard internal format for downstream scoring/governance."""
         norm = {
-            "action": p["action"], "operator": p["operator"],
+            "action": p["action"],
+            "operator": p["operator"],
             "details": p["patch"].get("predicate") or p["patch"].get("guard", ""),
             "justification": p["patch"].get("justification", "Generated by FDKA")
         }
         content_str = f"{norm['operator']}:{norm['action']}:{norm['details']}"
         norm["content_hash"] = hashlib.sha256(content_str.encode()).hexdigest()[:12]
+        # preserve optional usage payload for external logging/CSV
+        if isinstance(p, dict) and "usage" in p:
+            norm["usage"] = p["usage"]
         return norm

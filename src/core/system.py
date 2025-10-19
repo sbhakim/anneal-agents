@@ -6,11 +6,26 @@ This final version integrates all architectural components from the manuscript:
 - The FDKA pipeline now includes the crucial "Canary Deployment" stage
   before any patch is permanently committed, ensuring a final safety check.
 - **UPDATED**: Added Table 3-4 export and Reflection integration for manuscript data.
+- **CRITICAL UPDATE**: Introduced explicit 'fdka.enabled' gate (no more threshold-as-off).
+- **CRITICAL UPDATE**: PlanningFailed now routes through FDKA with a synthetic trace.
+- **CRITICAL UPDATE**: Governance counters (value/causal/canary) are incremented at decision points.
+
+Small updates in this revision:
+- Record a minimal, standardized list of committed patches (operator, action, scores) and
+  write it to results_dir/patches_committed.json for downstream analysis.
+- Only count a canary test when it actually runs (no canary increments for
+  "no patch proposed", "validation reject", or "below threshold" paths).
+- Export a lightweight governance summary (guardrail stats) to
+  results_dir/governance_summary.json to aid notebooks that summarize runs.
+
+Minor changes in this edit:
+- Initialize MetricsCollector before FDKA and pass it to FDKAPipeline so efficiency stats are captured.
 """
 
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import uuid
+import json  # ⬅️ for small auxiliary artifacts
 
 # Core components
 from .state import SymbolicState
@@ -56,6 +71,9 @@ class SelfEvolveSystem:
         self.logger.info("Initializing SELFEVOLVE system...")
         self.logger.info("=" * 70)
 
+        # Metrics first so we can wire it into dependent subsystems (FDKA)
+        self.metrics = MetricsCollector()
+
         self.state = SymbolicState()
         self.rule_pool = RulePool(config['knowledge']['rule_pool_path'])
         self.experience_pool = ExperiencePool(max_size=1000)
@@ -68,15 +86,23 @@ class SelfEvolveSystem:
             rule_pool=self.rule_pool, signal_gen=self.signal_gen,
             arbitrator=self.arbitrator, scenario=self.scenario,
         )
-        self.fdka = FDKAPipeline(config['fdka'])
+
+        # Pass metrics collector to FDKA to capture efficiency stats from LLM calls
+        self.fdka = FDKAPipeline(config['fdka'], metrics_collector=self.metrics)
         self.scorer = Scorer(config['fdka'], experience_pool=self.experience_pool)
         self.guard = Guard(config.get('governance', {}))
         self.provenance = ProvenanceTracker(config['governance']['provenance'])
         self.trust_scorer = TrustScorer(config['governance']['trust'])
         self.canary_runner = CanaryRunner(config.get('governance', {}).get('canary', {}))
-        self.fdka_threshold = config.get('fdka', {}).get('threshold', 0.5)
-        self.metrics = MetricsCollector()
+
+        # --- CRITICAL: explicit enable flag; threshold is for accept gating only ---
+        self.fdka_enabled: bool = bool(config.get('fdka', {}).get('enabled', True))
+        self.fdka_threshold: float = float(config.get('fdka', {}).get('threshold', 0.5))
+
         self._last_committed_patch_id: Optional[str] = None
+
+        # Simple in-memory record of committed patches for downstream analysis
+        self._committed_patches: list[Dict[str, Any]] = []
 
         self.reflection = Reflection(
             config['metacognition'],
@@ -85,6 +111,10 @@ class SelfEvolveSystem:
             self.experience_pool
         )
 
+        # Log effective runtime switches for diagnosability
+        pe = (config.get('fdka', {}) or {}).get('propose_edit', {}) or {}
+        self.logger.info(f"FDKA enabled: {self.fdka_enabled}  | threshold: {self.fdka_threshold:.3f}")
+        self.logger.info(f"FDKA provider/model: {pe.get('llm_provider', 'N/A')} / {pe.get('model', 'N/A')}")
         self.logger.info("✅ SELFEVOLVE system ready")
         self.logger.info("=" * 70)
 
@@ -107,9 +137,29 @@ class SelfEvolveSystem:
         self.state.update_from_instruction(instruction)
         self._reset_world_for_task()
         plan = self.planner.compile(instruction, self.state.to_dict())
+
+        # --- CRITICAL: treat planning failure as learnable and route through FDKA ---
         if not plan:
-            self.metrics.record_task(task_id, False, [{"error": "PlanningFailed"}])
-            return
+            print("PLANNER: ❌ Plan compilation failed.")
+            planning_trace = [{"error": "PlanningFailed", "operator": "UNKNOWN", "instruction": instruction}]
+            # Record failure and attempt adaptation
+            self.metrics.record_task(task_id, False, planning_trace)
+            print("🧠 Escalating to FDKA for governed self-edit (PlanningFailed)...")
+            patch_applied, committed_patch = self._handle_failure(planning_trace, task_id, instruction)
+            # If an operator was patched during planning, mark it
+            if patch_applied and committed_patch:
+                op = committed_patch.get("operator")
+                if op:
+                    self.scenario.mark_operator_patched(op)
+            if patch_applied:
+                print("🔁 Re-compiling plan after FDKA patch...")
+                plan = self.planner.compile(instruction, self.state.to_dict())
+                if not plan:
+                    print("PLANNER: ❌ Still failed after patch; aborting task.")
+                    return
+            else:
+                print("❌ No patch committed; aborting task.")
+                return
 
         max_attempts = 3
         final_trace = []
@@ -177,10 +227,9 @@ class SelfEvolveSystem:
             self.metrics.check_adaptation(f"{failure_info.get('operator')}:{failure_info.get('error')}")
 
     def _handle_failure(self, trace: list, task_id: int, instruction: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        # ✅ CRITICAL FIX: Add this guard clause to properly disable FDKA for the ablation study.
-        # It checks if the threshold is set to an impossibly high value and skips the entire process.
-        if self.fdka_threshold > 1.0:
-            print("  DEBUG_FDKA: FDKA is disabled by high threshold. Skipping self-edit.")
+        # ✅ CRITICAL FIX: explicit boolean gate, not threshold-as-off.
+        if not self.fdka_enabled:
+            print("  DEBUG_FDKA: disabled by config. Skipping self-edit.")
             return False, None
 
         patch_applied = False
@@ -192,26 +241,49 @@ class SelfEvolveSystem:
                 'instruction': instruction, 'task_id': task_id,
                 'operator': failure_info.get('operator'), 'error_type': failure_info.get('error')
             }
+            # Always add the failure trace so utility/pre-filter can query it
             self.experience_pool.add_trace(trace, False, metadata=metadata)
             print(f"  📝 Added failure trace to experience pool (operator={metadata['operator']})")
 
-        proposed_patch = self.fdka.propose_edit(trace, self.rule_pool)
+        # Propose a candidate patch (Stage 2)
+        proposed_patch = self.fdka.propose_edit(trace, self.rule_pool) or {}
 
-        # Check if patch was rejected during validation (e.g., by pre-scoring checks)
+        # Guard against provider/LLM failures returning non-dict/empty payloads
+        if not isinstance(proposed_patch, dict) or not proposed_patch:
+            print(" FDKA: ❌ No patch proposed (provider error or empty response).")
+            # Governance counters: value/causal checks not triggered; canary not run
+            self.metrics.record_value_check(vetoed=False, reason="no_patch_proposed")
+            self.metrics.record_causal_check(escalated=False, reason="no_patch_proposed")
+            # ⛔ do not record a canary test here (none was executed)
+            return False, None
+
+        # Check if patch was rejected during validation (e.g., by schema/typing)
         if proposed_patch.get("action") == "REJECTED":
             print(f" FDKA: ❌ Patch rejected during validation: {proposed_patch.get('details')}")
+            # Governance counters as a blocked attempt; no canary executed
+            self.metrics.record_value_check(vetoed=False, reason="validation_reject")
+            self.metrics.record_causal_check(escalated=False, reason="validation_reject")
+            # ⛔ do not record a canary test here (none was executed)
             return False, None
 
-        scores = self.scorer.score(proposed_patch, trace)
+        # Score (plausibility/consistency/utility/risk) + budget penalties
+        scores = self.scorer.score(proposed_patch, trace) or {}
         agg_score = scores.get("aggregate", 0.0)
 
-        # The logic now checks the score against the threshold *before* canary tests
+        # Accept score gate before governance/canary
         if agg_score < self.fdka_threshold:
-            print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold}. Patch rejected.")
+            print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold:.2f}. Patch rejected.")
             self.metrics.record_patch(proposed_patch, success=False, committed=False, scores=scores)
+            # record that value/causal checks were conceptually considered; no canary executed
+            self.metrics.record_value_check(vetoed=False, reason="below_threshold")
+            self.metrics.record_causal_check(escalated=False, reason="below_threshold")
+            # ⛔ do not record a canary test here (none was executed)
             return False, None
 
+        # Governance: value + causal + invariants (Verify gate)
         guard_result = self.guard.check(proposed_patch, context={"scores": scores, "trace": trace})
+
+        # Governance metrics
         self.metrics.record_value_check(vetoed=(guard_result['decision'] == 'veto'),
                                         reason=guard_result.get('reason', ''))
         self.metrics.record_causal_check(escalated=(guard_result['decision'] == 'request_human'),
@@ -226,8 +298,9 @@ class SelfEvolveSystem:
                     operator=proposed_patch.get("operator")) or self.experience_pool.traces[-10:],
                 "scorer": self.scorer, "scores": scores
             }
-            canary_result = self.canary_runner.run(proposed_patch, canary_context)
-            self.metrics.record_canary_test(passed=canary_result.get("passed"))
+            canary_result = self.canary_runner.run(proposed_patch, canary_context) or {}
+            # ✅ Only now do we record a canary test (it actually ran)
+            self.metrics.record_canary_test(passed=bool(canary_result.get("passed")))
             if canary_result.get("passed"):
                 print(" FDKA: Canary test passed. Committing patch permanently.")
                 if self.rule_pool.update_operator(proposed_patch):
@@ -235,9 +308,12 @@ class SelfEvolveSystem:
                     patch_dict = proposed_patch
             else:
                 print(f" FDKA: ❌ Canary test failed: {canary_result.get('reason')}")
+        elif guard_result['decision'] == 'request_human':
+            print(" FDKA: ⚠️ Causal guard requests human escalation; not committing.")
+            # ⛔ no canary executed here
         else:
             print(f" FDKA: ❌ Guardrails blocked patch: {guard_result.get('reason')}")
-            self.metrics.record_canary_test(passed=False)
+            # ⛔ no canary executed here
 
         patch_id = (patch_dict or proposed_patch).get("id", f"patch-{uuid.uuid4().hex[:8]}")
         self.provenance.log(
@@ -248,6 +324,23 @@ class SelfEvolveSystem:
         if patch_applied:
             self._last_committed_patch_id = patch_id
             self.trust_scorer.initialize_trust(patch_id)
+            # Persist a compact patch record for downstream tables
+            try:
+                self._committed_patches.append({
+                    "patch_id": patch_id,
+                    "operator": patch_dict.get("operator"),
+                    "action": patch_dict.get("action"),
+                    "scores": {
+                        "plausibility": scores.get("plausibility"),
+                        "consistency": scores.get("consistency"),
+                        "utility": scores.get("utility"),
+                        "risk": scores.get("risk"),
+                        "aggregate": scores.get("aggregate"),
+                    }
+                })
+            except Exception:
+                # best-effort only; never break the run on bookkeeping
+                pass
             print("✅ FDKA: Patch was successfully committed.")
         else:
             print("❌ FDKA: Patch was rejected.")
@@ -261,6 +354,9 @@ class SelfEvolveSystem:
         sim_state = SymbolicState()
         sim_state.update_from_instruction(instruction)
         sim_plan = self.planner.compile(instruction, sim_state.to_dict())
+        if not sim_plan:
+            # If still un-plannable under canary, treat as violation
+            return {"ok": False, "violations": 1}
         sim_executor = Executor(
             self.config['executor'], None, patched_rule_pool,
             self.signal_gen, self.arbitrator, self.scenario
@@ -289,6 +385,25 @@ class SelfEvolveSystem:
         results_dir.mkdir(parents=True, exist_ok=True)
         self.metrics.save(results_dir / "metrics.json")
         self.experience_pool.save(results_dir / "experience_pool.json")
+
+        # write a compact list of committed patches for easy consumption
+        try:
+            (results_dir / "patches_committed.json").write_text(
+                json.dumps(self._committed_patches, indent=2)
+            )
+        except Exception:
+            # best-effort artifact
+            pass
+
+        # write a minimal guardrail summary for downstream tables
+        try:
+            guard_summary = self.guard.get_statistics()
+            (results_dir / "governance_summary.json").write_text(
+                json.dumps(guard_summary, indent=2)
+            )
+        except Exception:
+            # best-effort artifact
+            pass
 
         print(f"\n📊 Generating manuscript data tables...")
         try:

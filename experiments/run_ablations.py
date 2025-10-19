@@ -12,6 +12,10 @@ UPDATED:
 - ADDED: print_summary method for evaluation orchestrator compatibility
 - CRITICAL FIX: Deep merge for proper nested config overrides
 - ADDED: Debug mode to verify config differences
+- CRITICAL FIX (NEW): Stop using 'fdka.threshold=999.0' as a kill-switch; use 'fdka.enabled: false'
+- CRITICAL FIX (NEW): Validation layer auto-normalizes legacy overrides (e.g., converts threshold-kill-switch to boolean)
+- CRITICAL FIX (NEW): Ensure ablation runs have a safe offline provider/model unless explicitly set
+- ADDED (NEW): Provider/model echo in debug to catch misconfig quickly
 """
 
 import sys
@@ -52,6 +56,95 @@ def deep_merge(base: Dict, override: Dict) -> Dict:
             result[key] = copy.deepcopy(value)
 
     return result
+
+
+def _normalize_fdka_overrides(ov: Dict) -> Dict:
+    """
+    Normalize any FDKA-related overrides to avoid 'threshold-as-off' patterns.
+    - If 'fdka.threshold' is set to an extreme value (e.g., >= 900), convert to {'fdka': {'enabled': False}}
+    - Preserve explicit threshold if it's a reasonable numeric (e.g., < 10).
+    """
+    if not isinstance(ov, dict):
+        return ov
+
+    # Work on a deep copy to be safe
+    out = copy.deepcopy(ov)
+
+    fdka_cfg = out.get("fdka", {})
+    if isinstance(fdka_cfg, dict):
+        # If legacy kill-switch is present, normalize it
+        th = fdka_cfg.get("threshold", None)
+        en = fdka_cfg.get("enabled", None)
+        if th is not None and isinstance(th, (int, float)) and th >= 900:
+            # Convert to explicit disable
+            fdka_cfg.pop("threshold", None)
+            fdka_cfg["enabled"] = False
+            out["fdka"] = fdka_cfg
+        elif en is None:
+            # If 'enabled' not provided, leave as-is; runtime will default to True from base config
+            out["fdka"] = fdka_cfg
+
+    return out
+
+
+def _validate_and_normalize_overrides(config_overrides: Dict, ablation_name: str, debug_mode: bool) -> Dict:
+    """
+    Validate and normalize overrides before applying:
+    - Ensure No-FDKA uses boolean 'enabled: false' instead of threshold hacks.
+    - Log warnings when legacy patterns are detected and auto-corrected.
+    """
+    original = copy.deepcopy(config_overrides)
+    normalized = copy.deepcopy(config_overrides)
+
+    # Normalize FDKA overrides across all ablations
+    normalized = _normalize_fdka_overrides(normalized)
+
+    # Special case: enforce boolean disable for No-FDKA
+    if ablation_name == "No-FDKA":
+        fdka = normalized.setdefault("fdka", {})
+        # Force explicit boolean gate; do not rely on threshold hacks
+        fdka["enabled"] = False
+        # Remove any residual threshold-kill-switch remnants
+        if "threshold" in fdka and isinstance(fdka["threshold"], (int, float)) and fdka["threshold"] >= 900:
+            fdka.pop("threshold", None)
+
+    # Debug/Warning output if we changed anything
+    if debug_mode and original != normalized:
+        print("\n⚙️  NORMALIZED OVERRIDES (auto-corrections applied):")
+        print("   Original:", json.dumps(original, indent=2))
+        print("   Normalized:", json.dumps(normalized, indent=2))
+
+    # Lightweight validation: ensure we didn't end up with contradictory settings
+    fdka = normalized.get("fdka", {})
+    if "enabled" in fdka and isinstance(fdka.get("enabled"), bool) and fdka["enabled"] is False:
+        # If explicitly disabled, do not allow a tiny threshold suggesting it's enabled
+        if "threshold" in fdka and isinstance(fdka["threshold"], (int, float)) and fdka["threshold"] < 10:
+            if debug_mode:
+                print("   🛑 Adjusting contradictory FDKA settings: 'enabled: false' with small 'threshold'. Removing threshold.")
+            fdka.pop("threshold", None)
+            normalized["fdka"] = fdka
+
+    return normalized
+
+
+def _ensure_offline_provider(experiment_config: Dict, debug_mode: bool) -> None:
+    """
+    Ensure a safe offline provider/model exists for FDKA propose_edit when enabled.
+    - Uses setdefault so explicit user selections are respected.
+    - Prevents ablation baseline from failing due to missing API keys.
+    """
+    fdka_cfg = experiment_config.setdefault("fdka", {})
+    if fdka_cfg.get("enabled", True):
+        pe = fdka_cfg.setdefault("propose_edit", {})
+        # Only set defaults if not provided by config/overrides
+        provider_before = pe.get("llm_provider")
+        model_before = pe.get("model")
+        pe.setdefault("llm_provider", "transformers")
+        pe.setdefault("model", "mistralai/Mistral-7B-Instruct-v0.3")
+        if debug_mode:
+            print("🔧 Provider defaults applied (setdefault):")
+            print(f"   llm_provider: {provider_before} → {pe.get('llm_provider')}")
+            print(f"   model       : {model_before} → {pe.get('model')}")
 
 
 class AblationStudy:
@@ -137,7 +230,9 @@ class AblationStudy:
                 "name": "Without FDKA",
                 "description": "Verify + Arbitration but no self-evolution (static operators)",
                 "config_overrides": {
-                    "fdka": {"threshold": 999.0}
+                    # ✅ CRITICAL FIX: Do NOT use threshold as a kill-switch.
+                    # Use an explicit boolean gate recognized by the runtime.
+                    "fdka": {"enabled": False}
                 }
             }
         }
@@ -152,25 +247,37 @@ class AblationStudy:
         print(f"{'─' * 70}")
 
         experiment_config = copy.deepcopy(self.base_config)
-        config_overrides = config.get("config_overrides", {})
+        raw_overrides = config.get("config_overrides", {})
+
+        # Validate & normalize overrides (prevents threshold-as-off)
+        config_overrides = _validate_and_normalize_overrides(raw_overrides, ablation_name, self.debug_mode)
 
         if self.debug_mode and config_overrides:
             print(f"\n🔍 BEFORE applying overrides:")
+            print(f"   FDKA enabled: {experiment_config.get('fdka', {}).get('enabled', 'N/A')}")
             print(f"   FDKA threshold: {experiment_config.get('fdka', {}).get('threshold', 'N/A')}")
             print(f"   Governance enabled: {experiment_config.get('governance', {}).get('provenance', {}).get('enable', 'N/A')}")
             print(f"   Verify enabled: {experiment_config.get('executor', {}).get('enable_verification', 'N/A')}")
             print(f"   Metacog tau_u: {experiment_config.get('metacognition', {}).get('tau_u', 'N/A')}")
+            pe0 = experiment_config.get('fdka', {}).get('propose_edit', {})
+            print(f"   Provider/model: {pe0.get('llm_provider')} / {pe0.get('model')}")
 
         if config_overrides:
             experiment_config = deep_merge(experiment_config, config_overrides)
 
-        if self.debug_mode and config_overrides:
-            print(f"\n🔍 AFTER applying overrides:")
+        # ✅ Ensure offline-safe provider/model defaults so baselines don't vanish due to API keys
+        _ensure_offline_provider(experiment_config, self.debug_mode)
+
+        if self.debug_mode:
+            print(f"\n🔍 AFTER applying overrides & defaults:")
+            print(f"   FDKA enabled: {experiment_config.get('fdka', {}).get('enabled', 'N/A')}")
             print(f"   FDKA threshold: {experiment_config.get('fdka', {}).get('threshold', 'N/A')}")
             print(f"   Governance enabled: {experiment_config.get('governance', {}).get('provenance', {}).get('enable', 'N/A')}")
             print(f"   Verify enabled: {experiment_config.get('executor', {}).get('enable_verification', 'N/A')}")
             print(f"   Metacog tau_u: {experiment_config.get('metacognition', {}).get('tau_u', 'N/A')}")
-            print(f"   Overrides applied: {list(config_overrides.keys())}")
+            pe1 = experiment_config.get('fdka', {}).get('propose_edit', {})
+            print(f"   Provider/model: {pe1.get('llm_provider')} / {pe1.get('model')}")
+            print(f"   Overrides applied: {list(config_overrides.keys()) if config_overrides else []}")
 
         experiment_config['scenario']['difficulty'] = difficulty
         experiment_config['scenario']['num_tasks'] = self.task_counts[difficulty]
@@ -429,8 +536,20 @@ def main():
     try:
         experiment = AblationStudy(debug_mode=args.debug)
         if args.quick_test:
-            # ... (quick test logic) ...
+            # Minimal quick test: run Full and No-FDKA on one seed/difficulty for smoke-check
+            cfgs = experiment.get_ablation_configs()
+            subset = {k: cfgs[k] for k in ["SelfEvolve-Full", "No-FDKA"] if k in cfgs}
+            all_results = {}
+            for name, cfg in subset.items():
+                res = []
+                # fixed seed/difficulty
+                res.append(experiment.run_single_ablation(name, cfg, seed=42, difficulty='hard'))
+                all_results[name] = res
+            experiment._save_all_results(all_results)
+            experiment._export_to_csv(all_results)
+            experiment.print_summary(all_results)
             return 0
+
         all_results = experiment.run_all_ablations()
         experiment.print_summary(all_results)
         return 0

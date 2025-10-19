@@ -2,6 +2,14 @@
 Baseline Comparison Experiment
 Corresponds to Section XII.2 evaluation protocol.
 Generates data for TABLE 1: Main Results vs Baselines.
+
+UPDATES (stability + fidelity):
+- Deep copy + deep-merge config overrides (prevents nested key loss and cross-run leakage).
+- Replace legacy "fdka.threshold=999" kill-switch with explicit "fdka.enabled: false".
+- Normalize any legacy overrides that still try to use the threshold hack.
+- Force difficulty='hard' to match manuscript stress setting.
+- Explicitly set FDKA enabled=True for SelfEvolve-Full to avoid leakage from previous runs.
+- Add a short provider/model sanity print per run.
 """
 
 import sys
@@ -30,6 +38,41 @@ except ImportError:
     print("WARNING: numpy not found. Statistical computations will use fallback.")
 
 
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deep merge 'override' into 'base' without mutating inputs.
+    Values from 'override' replace or merge into 'base' recursively.
+    """
+    result = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = deep_merge(result[k], v)
+        else:
+            result[k] = copy.deepcopy(v)
+    return result
+
+
+def normalize_overrides(ov: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize config overrides:
+    - Convert legacy 'fdka.threshold >= 900' to explicit 'fdka.enabled: false'
+    - Remove contradictory settings ('enabled: false' with a small threshold)
+    """
+    out = copy.deepcopy(ov or {})
+    fdka = out.get("fdka", {})
+    if isinstance(fdka, dict):
+        # Legacy kill-switch → boolean gate
+        th = fdka.get("threshold", None)
+        if isinstance(th, (int, float)) and th >= 900:
+            fdka.pop("threshold", None)
+            fdka["enabled"] = False
+        # If explicitly disabled, remove tiny threshold that implies accept gating
+        if fdka.get("enabled") is False and isinstance(fdka.get("threshold"), (int, float)) and fdka["threshold"] < 10:
+            fdka.pop("threshold", None)
+        out["fdka"] = fdka
+    return out
+
+
 class BaselineComparison:
     """
     Orchestrates baseline comparison experiments.
@@ -46,7 +89,7 @@ class BaselineComparison:
 
         # Experiment parameters from manuscript Section XII
         self.num_tasks = 50  # Standard evaluation length
-        self.num_seeds = 5  # Statistical significance (5 runs)
+        self.num_seeds = 5   # Statistical significance (5 runs)
         self.seeds = [42, 123, 456, 789, 1337]
 
         print("=" * 70)
@@ -66,7 +109,7 @@ class BaselineComparison:
                 "name": "SelfEvolve (Full)",
                 "description": "Complete system with FDKA, metacognition, governance",
                 "config_overrides": {
-                    # All features enabled (baseline from config.yaml)
+                    # All features enabled (baseline from config.yaml). We still force-enable below per run.
                 }
             },
 
@@ -74,7 +117,8 @@ class BaselineComparison:
                 "name": "Static Neurosymbolic",
                 "description": "No FDKA, no learning, fixed operators",
                 "config_overrides": {
-                    "fdka": {"threshold": 999.0},  # Effectively disable FDKA
+                    # ✅ Modern, explicit disable
+                    "fdka": {"enabled": False},
                     "metacognition": {"enable_reflection": False},
                     "governance": {"provenance": {"enable": False}},
                 }
@@ -84,7 +128,7 @@ class BaselineComparison:
                 "name": "LLM + Textual Reflection",
                 "description": "ReAct/Reflexion-style with text memory, no symbolic edits",
                 "config_overrides": {
-                    "fdka": {"threshold": 999.0},  # Disable symbolic patches
+                    "fdka": {"enabled": False},  # Disable symbolic patches
                     "metacognition": {"enable_reflection": True},
                     "executor": {"enable_verification": False},  # LLM handles reasoning
                 }
@@ -94,7 +138,7 @@ class BaselineComparison:
                 "name": "Verify-Before-Act Only",
                 "description": "Precondition checking without self-evolution",
                 "config_overrides": {
-                    "fdka": {"threshold": 999.0},  # No FDKA
+                    "fdka": {"enabled": False},  # No FDKA
                     "metacognition": {"enable_reflection": False},
                     "executor": {"enable_verification": True},
                 }
@@ -114,29 +158,37 @@ class BaselineComparison:
         print(f"Running: {system_name} (seed={seed})")
         print(f"{'─' * 70}")
 
-        # Deep copy config and apply overrides
+        # Deep copy base config to avoid cross-run mutation
         experiment_config = copy.deepcopy(self.base_config)
 
-        # Apply system-specific overrides
-        for key, value in config.get("config_overrides", {}).items():
-            if isinstance(value, dict):
-                experiment_config[key].update(value)
-            else:
-                experiment_config[key] = value
+        # Apply normalized system-specific overrides via deep merge
+        overrides = normalize_overrides(config.get("config_overrides", {}))
+        experiment_config = deep_merge(experiment_config, overrides)
 
-        # Set scenario parameters
+        # Force scenario parameters (stress setting to match manuscript)
+        experiment_config.setdefault('scenario', {})
         experiment_config['scenario']['num_tasks'] = self.num_tasks
-
-        # FIXED: Set seed properly (will be used by FailureInjector)
         experiment_config['scenario']['failure_injector_seed'] = seed
+        experiment_config['scenario']['difficulty'] = 'hard'  # manuscript stress setting
 
         # Disable verbose logging for batch runs
+        experiment_config.setdefault('logging', {})
         experiment_config['logging']['level'] = 'WARNING'
+
+        # Ensure the Full system explicitly enables FDKA (defensive against leakage)
+        experiment_config.setdefault('fdka', {})
+        if system_name == "SelfEvolve-Full":
+            experiment_config['fdka']['enabled'] = True
+
+        # Short provider/model sanity print
+        pe = experiment_config.get('fdka', {}).get('propose_edit', {})
+        print(f"CFG → FDKA.enabled={experiment_config.get('fdka', {}).get('enabled', True)} | "
+              f"provider={pe.get('llm_provider')} | model={pe.get('model')}")
 
         start_time = time.time()
 
         try:
-            # Initialize system
+            # Initialize system/agent
             if system_name == "SelfEvolve-Full":
                 system = SelfEvolveSystem(experiment_config)
                 metrics = system.run_evaluation()
@@ -300,21 +352,21 @@ class BaselineComparison:
                         continue
 
                     metrics = result["metrics"]
-                    tta_values = [v for v in metrics["time_to_adapt"].values() if v is not None]
-                    tta_mean = sum(tta_values) / len(tta_values) if tta_values else float('inf')
+                    tta_vals = [v for v in metrics.get("time_to_adapt", {}).values() if v is not None]
+                    tta_mean = (sum(tta_vals) / len(tta_vals)) if tta_vals else float('inf')
 
                     writer.writerow([
                         system_name,
                         result["seed"],
-                        f"{metrics['success_rate']:.3f}",
-                        f"{metrics['repeat_failure_rate']:.3f}",
-                        f"{metrics['constraint_satisfaction_rate']:.3f}",
+                        f"{metrics.get('success_rate', 0.0):.3f}",
+                        f"{metrics.get('repeat_failure_rate', 0.0):.3f}",
+                        f"{metrics.get('constraint_satisfaction_rate', 0.0):.3f}",
                         f"{tta_mean:.1f}" if tta_mean != float('inf') else "∞",
-                        f"{metrics['rollback_frequency']:.1f}",
-                        f"{metrics['rollback_precision']:.3f}",
-                        metrics['human_interventions'],
-                        metrics['patches_proposed'],
-                        metrics['patches_accepted']
+                        f"{metrics.get('rollback_frequency', 0.0):.1f}",
+                        f"{metrics.get('rollback_precision', 0.0):.3f}",
+                        metrics.get('human_interventions', 0),
+                        metrics.get('patches_proposed', 0),
+                        metrics.get('patches_accepted', 0)
                     ])
 
         print(f"💾 Exported CSV: {csv_path}")
@@ -329,7 +381,7 @@ class BaselineComparison:
             return {k: 0.0 for k in keys}
 
         for key in keys:
-            values = [r["metrics"][key] for r in valid_results]
+            values = [r["metrics"].get(key, 0.0) for r in valid_results]
             if HAS_NUMPY:
                 means[key] = float(np.mean(values))
             else:
@@ -338,7 +390,7 @@ class BaselineComparison:
         # TTA: mean of non-None values
         tta_values = []
         for r in valid_results:
-            for v in r["metrics"]["time_to_adapt"].values():
+            for v in r["metrics"].get("time_to_adapt", {}).values():
                 if v is not None:
                     tta_values.append(v)
 
@@ -359,7 +411,7 @@ class BaselineComparison:
             return {k: 0.0 for k in keys}
 
         for key in keys:
-            values = [r["metrics"][key] for r in valid_results]
+            values = [r["metrics"].get(key, 0.0) for r in valid_results]
             if HAS_NUMPY:
                 stds[key] = float(np.std(values))
             else:
@@ -377,7 +429,7 @@ class BaselineComparison:
         """Format TTA dictionary for printing."""
         if not tta_dict:
             return "N/A"
-        values = [f"{k}={v}" if v else f"{k}=∞" for k, v in tta_dict.items()]
+        values = [f"{k}={v}" if v is not None else f"{k}=∞" for k, v in tta_dict.items()]
         return ", ".join(values)
 
     def print_summary(self, all_results: Dict[str, List[Dict]]):
@@ -395,8 +447,8 @@ class BaselineComparison:
                 continue
 
             # Compute statistics
-            success_rates = [r["metrics"]["success_rate"] for r in valid_results]
-            rfr_rates = [r["metrics"]["repeat_failure_rate"] for r in valid_results]
+            success_rates = [r["metrics"].get("success_rate", 0.0) for r in valid_results]
+            rfr_rates = [r["metrics"].get("repeat_failure_rate", 0.0) for r in valid_results]
 
             if HAS_NUMPY:
                 sr_mean, sr_std = np.mean(success_rates), np.std(success_rates)
@@ -404,7 +456,7 @@ class BaselineComparison:
             else:
                 sr_mean = sum(success_rates) / len(success_rates)
                 sr_std = 0.0 if len(success_rates) == 1 else (
-                    sum((x - sr_mean)**2 for x in success_rates) / len(success_rates)
+                    sum((x - sr_mean) ** 2 for x in success_rates) / len(success_rates)
                 ) ** 0.5
                 rfr_mean = sum(rfr_rates) / len(rfr_rates)
                 rfr_std = 0.0
