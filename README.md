@@ -97,5 +97,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## 📧 Contact
 
-**Safayat Bin Hakim** - shakim3@umbc.edu  
+[safayat.b.hakim@gmail.com](mailto:safayat.b.hakim@gmail.com)
 **Project**: https://github.com/sbhakim/selfevolve
