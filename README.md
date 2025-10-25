@@ -97,5 +97,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## 📧 Contact
 
-[safayat.b.hakim@gmail.com](mailto:safayat.b.hakim@gmail.com)
+[Contact](mailto:safayat.b.hakim@gmail.com)
 **Project**: https://github.com/sbhakim/selfevolve
