@@ -24,7 +24,7 @@ Traditional LLM agents fail repeatedly or require expensive fine-tuning. SelfEvo
 
 ## 🏗️ Architecture
 
-![SelfEvolve System Architecture](Figures/SelfEvolve_Architecture.pdf)
+![SelfEvolve System Architecture](Figures/SelfEvolve_Architecture.png)
 
 **Core Components:**
 - **Metacognition**: Budgeted S1/S2 arbitration with verify-before-act
