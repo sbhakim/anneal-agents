@@ -8,6 +8,13 @@ UPDATED:
 - Added comprehensive debugging output
 - Improved cold-start handling for insufficient examples
 - Enhanced error messages and decision logging
+
+MINIMUM RELIABILITY UPDATE (reporting-only):
+- Adds `mode` to results so metrics can distinguish:
+  - "strict" (real simulation-based canary)
+  - "coldstart_no_examples"
+  - "coldstart_insufficient_examples"
+This does NOT change pass/fail behavior; it only prevents inflated reporting.
 """
 
 from __future__ import annotations
@@ -55,7 +62,7 @@ class CanaryRunner:
         print(f"  - Min tests for statistics: {self.cfg.min_tests_for_stats}")
         print(f"  - Heuristic risk threshold: {self.cfg.heuristic_risk_threshold}")
 
-    def run(self, patch: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, bool]:
+    def run(self, patch: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Run canary deployment test with comprehensive debugging.
 
@@ -89,12 +96,13 @@ class CanaryRunner:
         if len(examples) < self.cfg.min_tests_for_stats:
             print(f"   ⚠️ Only {len(examples)} examples (need {self.cfg.min_tests_for_stats}+ for robust test)")
             print(f"   → Allowing patch due to insufficient data (cold start)")
-            return {
-                "passed": True,
-                "reason": f"Insufficient examples ({len(examples)} < {self.cfg.min_tests_for_stats}) - cold start allowance",
-                "tested": len(examples),
-                "fail_rate": 0.0
-            }
+            return self._result(
+                True,
+                f"Insufficient examples ({len(examples)} < {self.cfg.min_tests_for_stats}) - cold start allowance",
+                tested=len(examples),
+                fail_rate=0.0,
+                mode="coldstart_insufficient_examples"
+            )
 
         # Sample examples
         num_tests = min(self.cfg.sample_size, len(examples))  # ✅ FIXED: Use self.cfg
@@ -231,7 +239,7 @@ class CanaryRunner:
             if snapshot is not None:
                 self._restore(rule_pool, snapshot)
 
-    def _heuristic_only_decision(self, patch: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, bool]:
+    def _heuristic_only_decision(self, patch: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Make decision based purely on heuristics when no examples available.
 
@@ -253,19 +261,19 @@ class CanaryRunner:
         # Decision rules for cold start
         if risk_score > self.cfg.heuristic_risk_threshold:
             print(f"\n   ❌ REJECT: Risk too high ({risk_score:.3f} > {self.cfg.heuristic_risk_threshold:.3f})")
-            return self._result(False, f"Cold start: Risk {risk_score:.3f} exceeds threshold")
+            return self._result(False, f"Cold start: Risk {risk_score:.3f} exceeds threshold", mode="coldstart_no_examples")
 
         if plausibility < 0.3:
             print(f"\n   ❌ REJECT: Plausibility too low ({plausibility:.3f} < 0.3)")
-            return self._result(False, f"Cold start: Plausibility {plausibility:.3f} too low")
+            return self._result(False, f"Cold start: Plausibility {plausibility:.3f} too low", mode="coldstart_no_examples")
 
         if aggregate < 0.4:
             print(f"\n   ❌ REJECT: Aggregate score too low ({aggregate:.3f} < 0.4)")
-            return self._result(False, f"Cold start: Aggregate {aggregate:.3f} below minimum")
+            return self._result(False, f"Cold start: Aggregate {aggregate:.3f} below minimum", mode="coldstart_no_examples")
 
         print(f"\n   ✅ ACCEPT: Scores acceptable for cold start")
         print(f"{'=' * 70}\n")
-        return self._result(True, "Cold start: Heuristics acceptable", tested=0, fail_rate=0.0)
+        return self._result(True, "Cold start: Heuristics acceptable", tested=0, fail_rate=0.0, mode="coldstart_no_examples")
 
     def _get_heuristic_risk(self, scorer: Optional[Any], context: Dict[str, Any]) -> float:
         """Extract risk score from context."""
@@ -298,7 +306,14 @@ class CanaryRunner:
                 print(f"   ⚠️ Error calling '{method}': {e}")
         return None
 
-    def _result(self, passed: bool, reason: str, tested: int = 0, fail_rate: float = 0.0) -> Dict[str, Any]:
+    def _result(
+        self,
+        passed: bool,
+        reason: str,
+        tested: int = 0,
+        fail_rate: float = 0.0,
+        mode: str = "strict"
+    ) -> Dict[str, Any]:
         """Format canary test result."""
         status = '✅ PASS' if passed else '❌ FAIL'
         print(f"CANARY_RUNNER: Result -> {status}")
@@ -308,5 +323,6 @@ class CanaryRunner:
             "passed": passed,
             "tested": tested,
             "fail_rate": round(fail_rate, 4),
-            "reason": reason
+            "reason": reason,
+            "mode": mode
         }
