@@ -1,32 +1,27 @@
-# SELFEVOLVE Configuration File
-# Based on paper: "A Self-Evolving Neuro-symbolic Architecture for Open-World Instructability"
+# SELFEVOLVE Configuration
+# Active LLM: local HuggingFace Transformers (Gemma-2). Other providers are kept as comments.
 
-# System-wide settings
 system:
   name: "SELFEVOLVE"
   version: "1.0.0"
   domain: "travel_planning"
 
-# Planner settings (HTN compiler)
 planner:
   type: "HTN"
   max_depth: 5
-  timeout_ms: 300  # increased from 100 to reduce flaky PlanningFailed
+  timeout_ms: 300
 
-# Executor settings
 executor:
   max_retries: 2
   timeout_seconds: 30
   enable_verification: true
 
-# Metacognitive control (Section VII)
 metacognition:
-  tau_u: 0.25  # Uncertainty threshold for S1/S2 arbitration
-  tau_p: 0.20  # Violation probability threshold
+  tau_u: 0.25          # uncertainty threshold for S1/S2 arbitration
+  tau_p: 0.20          # violation probability threshold
   budget_ms: 2000
   enable_reflection: true
 
-# FDKA Pipeline (Section VIII)
 fdka:
   enabled: true
 
@@ -36,117 +31,110 @@ fdka:
     utility: 0.20
     risk: 0.10
 
-  # Acceptance gate (not a kill switch)
-  threshold: 0.48
+  threshold: 0.48       # acceptance gate threshold (score >= threshold)
 
-  # ✅ MAIN PROVIDER SELECTION
-  # Options: "openai", "deepseek", "transformers", "mock"
   propose_edit:
-    # Offline/local by default
-    llm_provider: "openai"
+    # Provider options: "transformers", "openai", "deepseek", "mock"
+    llm_provider: "transformers"
 
-    # Local model options (use one you have installed):
-    # - mistralai/Mistral-7B-Instruct-v0.3
-    # - meta-llama/Llama-3.1-8B
-    # - google/gemma-2-9b-it
-    # - Qwen/Qwen2.5-7B-Instruct
-    model: "gpt-4o-mini"
+    # ✅ Active local model
+    model: "google/gemma-2-9b-it"
 
-    # Generation/runtime knobs
+    # Generation knobs (note: in this repo max_tokens maps to max_new_tokens)
     temperature: 0.3
-    max_tokens: 2000
+    max_tokens: 512
     timeout_sec: 60.0
-    max_retries: 4
+    max_retries: 2
 
-    # Transformers runtime hints (ignored safely if unsupported)
-    device_map: "auto"         # "auto", "cuda:0", or "cpu"
-    dtype: "auto"              # lets runtime pick fp16/bf16/fp32
-    use_flash_attention: false # set true only if stack supports it
-    trust_remote_code: true
+    # HF runtime hints (safe to keep; some may be ignored by current runner)
+    device_map: "auto"          # "auto" / "cuda:0" / "cpu"
+    dtype: "auto"               # "auto" / "fp16" / "bf16" / "fp32"
+    use_flash_attention: false  # enable only if your stack supports it
+    trust_remote_code: false
     max_input_tokens: 6000
 
-    # Prompt formatting aligned with Mistral instruct models
-    #prompt_template: "mistral-instruct"  # previously "chatml"
-    prompt_template: "deepseek-chat"
+    # Prompt template (may be unused depending on the runner implementation)
+    # prompt_template: "gemma-it"
 
-    # Optional: for custom text-generation servers (not used for HF local)
-    # base_url: "http://localhost:8000/v1"
+    # ---- Alternative providers (keep commented; activate by changing llm_provider) ----
+    # OpenAI:
+    # llm_provider: "openai"
+    # model: "gpt-4o-mini"
 
-  # ✅ Alternative provider configs (activate by changing llm_provider above)
-  # OpenAI:
-  #   llm_provider: "openai"
-  #   model: "gpt-4o-mini"
-  # DeepSeek:
-  #   llm_provider: "deepseek"
-  #   model: "deepseek-chat"
-  #   base_url: "https://api.deepseek.com"
+    # DeepSeek (OpenAI-compatible endpoint):
+    # llm_provider: "deepseek"
+    # model: "deepseek-chat"
+    # base_url: "https://api.deepseek.com"
+
+    # Mock (offline deterministic testing):
+    # llm_provider: "mock"
+    # model: "mock"
 
   consistency:
     use_z3: false
+
   utility:
     k_similar_traces: 20
+
   risk:
     eta: 0.2
+
   budget:
     beta_edge: 5
     beta_step: 10
     beta_tok: 1000
 
-# Governance (Section IX)
 governance:
   provenance:
     enable: true
     log_path: "data/logs/provenance.jsonl"
+
   trust:
     alpha: 2
     beta: 1
+
   gates:
     tau_impact: 0.6
     tau_conf: 0.5
+
   canary:
     num_tests: 8
     statistical_max_fail_rate: 0.1
     heuristic_risk_threshold: 0.6
+
   rollback:
     enable: true
 
-# Knowledge Graphs
 knowledge:
   process_kg_path: "data/knowledge/process_kg.json"
   rule_pool_path: "data/knowledge/operators.json"
 
-# Scenarios
 scenario:
   name: "travel_planning"
-  difficulty: "hard"  # align with ablation stress tests
-  num_tasks: 20       # matches manuscript-style demo runs
+  difficulty: "hard"
+  num_tasks: 20
   failure_rate: 0.4
   min_failures_in_prefix: 5
   prefix_len: 10
   failure_injector_seed: 42
   task_generation_seed: 7
 
-# Evaluation settings
 evaluation:
   baselines: ["static_nesy", "llm_reflect", "verify_only"]
   ablations: ["no_governance", "no_verify", "no_arbitration", "no_fdka"]
 
-# Experiment Control
 experiment:
   agent_to_run: "selfevolve"
 
-# Demo-specific overrides
 demo:
   num_tasks: 20
   failure_rate: 0.4
   min_failures_in_prefix: 5
 
-# Output settings
 output:
   results_dir: "data/results"
   plots_dir: "data/results/plots"
 
-# Logging
 logging:
   level: "INFO"
   log_file: "data/logs/selfevolve.log"

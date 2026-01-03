@@ -7,6 +7,13 @@ UPDATED FOR PoC:
   and VERIFY->S1 pathways, making the metacognitive arbitration meaningful.
 - The S2 (Slow Path) now simulates "deliberation" with an extra check and delay
   to align with the manuscript's description of dual-process reasoning.
+
+MINIMUM RELIABILITY FIX (2026-01):
+- Make injected "constraint/precondition" failures *patchable* by expressing them
+  through state/params *before* Verify-Before-Act, instead of forcing a failure
+  after verification passes.
+- Call failure injector with (task_id, op_name, params, state) when supported,
+  while remaining backward compatible with older injectors.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import time
@@ -68,6 +75,74 @@ class Executor:
             return ok, violated
         return True, None
 
+    # ---------------------------
+    # Failure injector compatibility + patchable constraint injection
+    # ---------------------------
+    def _injector_should_fail(self, task_id: int, op_name: str, params: Dict[str, Any], state: SymbolicState) -> bool:
+        """
+        Calls should_fail with the richest available signature.
+        Backward compatible with legacy injectors that only accept (task_id, op_name).
+        """
+        if not self.failure_injector:
+            return False
+        try:
+            return bool(self.failure_injector.should_fail(task_id, op_name, params=params, state=state))
+        except TypeError:
+            # Legacy signature
+            return bool(self.failure_injector.should_fail(task_id, op_name))
+        except Exception:
+            return False
+
+    def _injector_failure_details(self, task_id: int, op_name: str, params: Dict[str, Any],
+                                  state: SymbolicState) -> Dict[str, Any]:
+        """
+        Calls get_failure_details with the richest available signature.
+        Backward compatible with legacy injectors that only accept (task_id, op_name).
+        """
+        if not self.failure_injector:
+            return {}
+        try:
+            return dict(self.failure_injector.get_failure_details(task_id, op_name, params=params, state=state))
+        except TypeError:
+            return dict(self.failure_injector.get_failure_details(task_id, op_name))
+        except Exception:
+            return {}
+
+    def _apply_constraint_injection_to_state(self, error_info: Dict[str, Any], params: Dict[str, Any],
+                                            state: SymbolicState) -> None:
+        """
+        Minimum, safe state mutations so that constraint injections are caught by Verify-Before-Act.
+
+        Key goal: if the system injects a constraint like "invalid payment", the state should reflect
+        that so a learned predicate such as ValidPayment(...) can fail *causally*, not by post-hoc forcing.
+        """
+        msg = str(error_info.get("message", "") or "")
+        policy_ref = str(error_info.get("policy_ref", "") or "")
+        category = str(error_info.get("category", "") or "")
+
+        # 1) Invalid/expired payment: make ValidPayment fail by adding an "invalid" marker
+        #    (Predicate checks for markers like "invalid", "expired", etc.)
+        if "invalid or expired" in msg.lower() or "pay-401" in policy_ref.lower() or "invalid_payment" in category.lower():
+            payment = params.get("payment", state.get("payment_method"))
+            if payment is not None:
+                # Ensure marker appears in lowercase for predicate match
+                state.set("payment_method", f"{payment} (invalid)")
+            # Also store a structured flag for debugging/analysis (harmless if unused)
+            state.set("payment_invalid", True)
+
+        # 2) Corporate blackout blocked card: make Not(BlockedCard) fail by setting policy + blackout context
+        if "blackout" in msg.lower() or "blocked" in msg.lower() or policy_ref.strip() == "H-23":
+            # Use the same policy key that check_not_blocked_card expects
+            state.set("corporate_card_policy", "blocked_on_blackout_dates")
+            # If blackout dates are already present via world defaults, leave them.
+            # Otherwise, best-effort add a conservative marker; travel_dates already comes from instruction parsing.
+            if not state.get("blackout_dates"):
+                state.set("blackout_dates", ["June 1", "June 2"])
+
+        # 3) Network-related constraint (if present): make NetworkAvailable() fail if that predicate exists/added later
+        if "network" in msg.lower() and ("unavailable" in msg.lower() or "down" in msg.lower()):
+            state.set("network_available", False)
+
     def execute(self, plan: List[Dict[str, Any]], state: SymbolicState, task_id: int) -> Tuple[
         List, bool, Optional[str]]:
         """
@@ -76,6 +151,9 @@ class Executor:
         """
         print("EXECUTOR: Starting plan execution...")
         trace: List[Dict[str, Any]] = []
+
+        # Ensure defaults exist before signal prediction and predicate checks
+        self._apply_world_defaults(state)
 
         # 1. Metacognitive Arbitration (Monitor-Evaluate-Regulate)
         u = self.signal_gen.compute_uncertainty(plan)
@@ -95,7 +173,7 @@ class Executor:
             # S2 = Slow/deliberative path with extra checks.
             print("EXECUTOR: 🤔 S2 (Slow Path) - Performing extra deliberation.")
             # For PoC, simulate deliberation with a "deep check" and a small delay.
-            time.sleep(0.1) # Simulate latency of slower reasoning
+            time.sleep(0.1)  # Simulate latency of slower reasoning
             trace.append({"deliberation": "Simulated deep verification (S2 path)"})
 
         # For VERIFY_S1 and S1, we proceed to the standard execution loop,
@@ -119,27 +197,40 @@ class Executor:
 
             trace.append({"step": op.name, "state_before": state.to_dict()})
 
+            # ---- Controlled Failure Injection (PATCHABLE constraints BEFORE Verify) ----
+            # If an injected failure is a "constraint"/PreconditionUnmet, express it in state/params first
+            # so Verify-Before-Act can catch it. ToolError remains a runtime fault injected after Verify.
+            injected_error_info: Optional[Dict[str, Any]] = None
+            if self._injector_should_fail(task_id, op.name, params, state):
+                error_info = self._injector_failure_details(task_id, op.name, params, state)
+                # Normalize keys across injector variants
+                err_cls = error_info.get("error") or error_info.get("error_type") or "ToolError"
+                injected_error_info = dict(error_info)
+                injected_error_info["error"] = err_cls
+
+                if err_cls != "ToolError":
+                    # Make the constraint visible to predicates
+                    self._apply_constraint_injection_to_state(injected_error_info, params, state)
+                    # Record the injection event for auditability
+                    trace.append({"injected": True, "phase": "pre-verify", **injected_error_info})
+
             # ---- Verify-Before-Act (Standard for all execution paths) ----
             ok, violated = self._verify_preconditions(op, params, state)
             if not ok:
                 print(f"EXECUTOR: ❌ Verify-Before-Act failed for {op.name}. Halting.")
-                trace.append({"error": "PreconditionUnmet", "operator": op.name, "violated": violated})
+                # If we injected a constraint, attach that context too (helps FDKA localization/scoring)
+                payload = {"error": "PreconditionUnmet", "operator": op.name, "violated": violated}
+                if injected_error_info and injected_error_info.get("error") != "ToolError":
+                    payload["injected_constraint"] = True
+                    payload.update({k: v for k, v in injected_error_info.items() if k not in payload})
+                trace.append(payload)
                 return trace, False, "PreconditionUnmet"
 
-            # ---- Controlled Failure Injection (for runtime/tool faults) ----
-            if self.failure_injector and self.failure_injector.should_fail(task_id, op.name):
-                error_info = self.failure_injector.get_failure_details(task_id, op.name)
-                err_cls = error_info.get("error", "ToolError")
-                # Inject a tool error directly
-                if err_cls == "ToolError":
-                    print(f"EXECUTOR: ❌ Injected Failure -> {error_info.get('message', 'tool error')}")
-                    trace.append(error_info)
-                    return trace, False, "ToolError"
-                # Inject other failure types as precondition failures so FDKA can learn a guard
-                else:
-                    print(f"EXECUTOR: ❌ Injected Constraint -> {error_info.get('message', 'constraint violation')}")
-                    trace.append({"error": "PreconditionUnmet", **error_info})
-                    return trace, False, "PreconditionUnmet"
+            # ---- Controlled Failure Injection (runtime/tool faults AFTER Verify) ----
+            if injected_error_info and injected_error_info.get("error") == "ToolError":
+                print(f"EXECUTOR: ❌ Injected Failure -> {injected_error_info.get('message', 'tool error')}")
+                trace.append({"injected": True, "phase": "post-verify", **injected_error_info})
+                return trace, False, "ToolError"
 
             # ---- Apply Effects on Success ----
             state = op.apply_effects(state, params)

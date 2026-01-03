@@ -20,6 +20,11 @@ Small updates in this revision:
 
 Minor changes in this edit:
 - Initialize MetricsCollector before FDKA and pass it to FDKAPipeline so efficiency stats are captured.
+
+MINIMUM RELIABILITY FIX (2026-01):
+- Do NOT mark an operator as "patched" immediately after commit.
+  Instead, defer mark_operator_patched(op) until we observe real success
+  after the patch (prevents inflated SR/RFR/TTA from early injection disabling).
 """
 
 from pathlib import Path
@@ -134,6 +139,10 @@ class SelfEvolveSystem:
 
     def run_task(self, task_id: int, instruction: str):
         print(f"\n{'=' * 70}\nTask {task_id + 1}: {instruction}\n{'=' * 70}")
+
+        # Track operators whose patches were committed during this task; only mark as patched upon success.
+        pending_patched_operators: set[str] = set()
+
         self.state.update_from_instruction(instruction)
         self._reset_world_for_task()
         plan = self.planner.compile(instruction, self.state.to_dict())
@@ -146,11 +155,13 @@ class SelfEvolveSystem:
             self.metrics.record_task(task_id, False, planning_trace)
             print("🧠 Escalating to FDKA for governed self-edit (PlanningFailed)...")
             patch_applied, committed_patch = self._handle_failure(planning_trace, task_id, instruction)
-            # If an operator was patched during planning, mark it
+
+            # ✅ RELIABILITY FIX: do NOT mark operator patched yet. Defer until real success.
             if patch_applied and committed_patch:
                 op = committed_patch.get("operator")
                 if op:
-                    self.scenario.mark_operator_patched(op)
+                    pending_patched_operators.add(op)
+
             if patch_applied:
                 print("🔁 Re-compiling plan after FDKA patch...")
                 plan = self.planner.compile(instruction, self.state.to_dict())
@@ -173,6 +184,12 @@ class SelfEvolveSystem:
                 print("✅ Task Succeeded on this attempt.")
                 self.metrics.record_task(task_id, True, trace)
                 self.experience_pool.add_trace(trace, True, metadata={'instruction': instruction, 'task_id': task_id})
+
+                # ✅ RELIABILITY FIX: only now mark patched operators as "patched" for future failure injection logic.
+                if pending_patched_operators:
+                    for op_name in sorted(pending_patched_operators):
+                        self.scenario.mark_operator_patched(op_name)
+                    pending_patched_operators.clear()
 
                 if task_id > 0 and task_id % 5 == 0:
                     print(f"  🔍 Checking adaptation progress at task {task_id}...")
@@ -198,12 +215,17 @@ class SelfEvolveSystem:
             if failure_type in ("PreconditionUnmet", "ToolError"):
                 print("🧠 Escalating to FDKA for governed self-edit...")
                 patch_applied, committed_patch = self._handle_failure(trace, task_id, instruction)
+
+                # ✅ RELIABILITY FIX: defer mark_operator_patched until we observe success.
                 if patch_applied and committed_patch:
                     operator_name = committed_patch.get("operator")
-                    if operator_name: self.scenario.mark_operator_patched(operator_name)
+                    if operator_name:
+                        pending_patched_operators.add(operator_name)
+
                     print("🔁 Re-compiling plan and retrying execution with the patched operator...")
                     plan = self.planner.compile(instruction, self.state.to_dict())
                     continue
+
                 print("❌ FDKA did not commit a patch. Halting attempts for this task.")
                 break
             print("❌ Non-recoverable failure type; stopping attempts.")

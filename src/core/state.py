@@ -25,6 +25,7 @@ class SymbolicState:
             # Payment information
             "payment_method": "CorporateCard:CC-5512",
             "payment_valid": True,
+            "payment_invalid": False,  # ✅ added for compatibility with injected constraint state
             "card_type": "corporate",
 
             # Booking status
@@ -65,7 +66,20 @@ class SymbolicState:
         **FIX**: Simulates a parser by updating the state from the instruction text.
         A real system would use a sophisticated NLP parser here. This makes the
         state dynamic and relevant to the current task.
+
+        **MINIMUM RELIABILITY FIX (2026-01)**:
+        Reset task-transient payment validity markers at the start of each task to
+        prevent cross-task leakage like "(invalid) (invalid) (invalid)".
         """
+        # --- Reset task-transient payment markers to avoid cross-task state pollution ---
+        base_payment = "CorporateCard:CC-5512"
+
+        # Normalize any previously-tagged payment method back to the base for each new task.
+        # (If later you parse payment from instruction, you can override after this reset.)
+        self.set("payment_method", base_payment)
+        self.set("payment_valid", True)
+        self.set("payment_invalid", False)
+
         # Simple regex to find dates like "Apr 10-12" or "June 20-22"
         date_match = re.search(r'(\w+\s\d+)-(\d+)', instruction)
         if date_match:

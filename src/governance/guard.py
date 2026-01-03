@@ -649,6 +649,7 @@ class Guard:
         common_patterns = [
             'NetworkAvailable',
             'TimeoutOccurred',
+            'ApiTimeoutRetry',  # retry/backoff wrapper is a low-ambiguity mitigation
             'ErrorDetected',
             'ValidInput',
             'ValidPayment',
