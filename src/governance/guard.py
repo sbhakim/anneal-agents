@@ -26,6 +26,12 @@ UPDATED:
   with fallback to legacy 'ambiguity_threshold'.
 - Added derived statistics fields `value_checks` and `causal_checks` in `get_statistics()`
   to align with downstream analysis code expecting those keys.
+
+MINIMUM RELIABILITY UPDATES (2026-01):
+- Ensure ValueKG is hydrated from runtime state (blackout_dates + corporate_card_policy)
+  because governance config alone typically does not carry domain state.
+- Return specific hazard_id when CausalKG triggers a hazard to improve debuggability and
+  avoid opaque "Known hazard condition" escalations.
 """
 
 from __future__ import annotations
@@ -77,6 +83,9 @@ class Guard:
         self.value_kg = None
         self.causal_kg = None
 
+        # Track last domain-state used to hydrate KGs (minimal state-based reinit)
+        self._kg_state_fingerprint: Optional[Tuple[Tuple[str, ...], str]] = None
+
         # Try to initialize KGs if available
         self._initialize_kgs(cfg)
 
@@ -122,6 +131,41 @@ class Guard:
         except (ImportError, Exception):
             self.causal_kg = None
 
+    def _maybe_hydrate_kgs_from_state(self, state: Any) -> None:
+        """
+        MINIMUM FIX:
+        ValueKG was often initialized with empty blackout_dates because governance config
+        doesn't include domain state. If runtime state contains blackout_dates and policy,
+        hydrate (re-init) ValueKG once per distinct state fingerprint.
+        """
+        if not isinstance(state, dict):
+            return
+
+        blackout = state.get("blackout_dates")
+        policy = state.get("corporate_card_policy", "blocked_on_blackout_dates")
+
+        if not isinstance(blackout, list) or not blackout:
+            return
+
+        # Create a stable fingerprint from blackout dates + policy
+        blackout_fp = tuple(sorted(str(x) for x in blackout))
+        fp = (blackout_fp, str(policy))
+
+        if self._kg_state_fingerprint == fp:
+            return
+
+        # Re-init ValueKG with state-derived config (safe, minimal, avoids empty defaults)
+        try:
+            from ..knowledge.value_kg import ValueKG
+            self.value_kg = ValueKG({
+                "blackout_dates": list(blackout),
+                "corporate_card_policy": policy,
+            })
+            self._kg_state_fingerprint = fp
+        except Exception:
+            # Leave existing ValueKG as-is on error
+            pass
+
     # ========================================================================
     # MAIN PUBLIC API
     # ========================================================================
@@ -148,6 +192,9 @@ class Guard:
         """
         context = context or {}
         self.stats['total_checks'] += 1
+
+        # ✅ Minimal reliability: hydrate ValueKG from runtime state if available
+        self._maybe_hydrate_kgs_from_state(context.get("state", {}))
 
         # Stage 1: Value Guardrails (can VETO)
         v_decision, v_payload = self._check_value_guardrail(patch, context)
@@ -615,15 +662,24 @@ class Guard:
         """
         Check CausalKG for known hazards given current state.
 
-        Args:
-            patch: Patch to check
-            state: Current state
-            causal_kg: CausalKG instance (optional)
-
         Returns:
             Tuple of (has_hazard, reason)
         """
-        if not causal_kg or not hasattr(causal_kg, 'check_hazards'):
+        if not causal_kg:
+            return False, ""
+
+        # ✅ Prefer hazard_id-level reporting when available
+        hazards = getattr(causal_kg, "hazards", None)
+        if isinstance(hazards, dict) and hazards:
+            try:
+                for hazard_id, detect in hazards.items():
+                    if callable(detect) and detect(state or {}):
+                        return True, str(hazard_id)
+            except Exception:
+                # fall through to generic check below
+                pass
+
+        if not hasattr(causal_kg, 'check_hazards'):
             return False, ""
 
         try:
@@ -791,12 +847,6 @@ def _risk_proxy_from_action(action: Optional[str]) -> float:
 
     - Adding/modifying effects is riskier than adding preconditions
     - Unknown actions default to medium risk (0.3)
-
-    Args:
-        action: Action type
-
-    Returns:
-        Risk estimate ∈ [0, 1]
     """
     if not action:
         return 0.3
@@ -889,7 +939,7 @@ if __name__ == "__main__":
         'justification': 'Add network guard'
     }
 
-    context = {'scores': {'risk': 0.4}}
+    context = {'scores': {'risk': 0.4}, 'state': {'blackout_dates': ['Apr 10'], 'corporate_card_policy': 'blocked_on_blackout_dates'}}
     result = guard.check(safety_patch, context)
     print(f"Decision: {result['decision']}")
     print(f"Reason: {result['reason']}")
@@ -910,7 +960,6 @@ if __name__ == "__main__":
     result = guard.check(ambiguous_patch)
     print(f"Decision: {result['decision']}")
     print(f"Reason: {result['reason']}")
-    # May pass if heuristics don't catch it, but should have higher ambiguity
     print(f"Causal ambiguity: {result['causal']['ambiguity']:.2f}")
     print("✅ Test 5 passed")
 

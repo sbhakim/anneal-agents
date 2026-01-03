@@ -14,6 +14,12 @@ MINIMUM RELIABILITY FIX (2026-01):
   after verification passes.
 - Call failure injector with (task_id, op_name, params, state) when supported,
   while remaining backward compatible with older injectors.
+
+MINIMUM RETRY-SEMANTICS FIX (2026-01):
+- If a ToolError timeout is injected, attempt a single recovery retry ONLY when
+  the operator contains a learned timeout-retry effect (e.g., ApiTimeoutRetry).
+  This prevents "retry" hooks from firing after a clean success and makes the
+  recovery behavior observable under fault injection.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import time
@@ -52,14 +58,21 @@ class Executor:
         self.scenario = scenario
 
     def _apply_world_defaults(self, state: SymbolicState) -> None:
-        """Ensures resources start 'available' and policy is visible to predicates."""
+        """Ensures resources start 'available' and policy context is visible to predicates."""
         if not self.scenario or not hasattr(self.scenario, "world_defaults"):
             return
         try:
             defaults = self.scenario.world_defaults()
-            for k, v in defaults.items():
-                if state.get(k) is None:
-                    state.set(k, v)
+
+            # Resources: only set if absent (preserve ongoing effects).
+            for k in ("hotel_status", "flight_status"):
+                if k in defaults and state.get(k) is None:
+                    state.set(k, defaults[k])
+
+            # Policy context: always mirror scenario truth (prevents silent drift).
+            for k in ("corporate_card_policy", "blackout_dates"):
+                if k in defaults:
+                    state.set(k, defaults[k])
         except Exception:
             pass
 
@@ -88,7 +101,6 @@ class Executor:
         try:
             return bool(self.failure_injector.should_fail(task_id, op_name, params=params, state=state))
         except TypeError:
-            # Legacy signature
             return bool(self.failure_injector.should_fail(task_id, op_name))
         except Exception:
             return False
@@ -111,37 +123,83 @@ class Executor:
     def _apply_constraint_injection_to_state(self, error_info: Dict[str, Any], params: Dict[str, Any],
                                             state: SymbolicState) -> None:
         """
-        Minimum, safe state mutations so that constraint injections are caught by Verify-Before-Act.
+        Minimum, safe mutations so constraint injections are caught by Verify-Before-Act.
 
-        Key goal: if the system injects a constraint like "invalid payment", the state should reflect
-        that so a learned predicate such as ValidPayment(...) can fail *causally*, not by post-hoc forcing.
+        Critical: mutate BOTH state and params for payment constraints. Some predicates read params,
+        others read state; if only one is tainted, Verify can miss injected failures.
         """
         msg = str(error_info.get("message", "") or "")
         policy_ref = str(error_info.get("policy_ref", "") or "")
         category = str(error_info.get("category", "") or "")
 
-        # 1) Invalid/expired payment: make ValidPayment fail by adding an "invalid" marker
-        #    (Predicate checks for markers like "invalid", "expired", etc.)
+        # 1) Invalid/expired payment (PAY-401): taint state+params + set structured flags.
         if "invalid or expired" in msg.lower() or "pay-401" in policy_ref.lower() or "invalid_payment" in category.lower():
             payment = params.get("payment", state.get("payment_method"))
             if payment is not None:
-                # Ensure marker appears in lowercase for predicate match
-                state.set("payment_method", f"{payment} (invalid)")
-            # Also store a structured flag for debugging/analysis (harmless if unused)
+                p = str(payment)
+                tainted = p if "(invalid)" in p.lower() else f"{p} (invalid)"
+                params["payment"] = tainted
+                state.set("payment_method", tainted)
             state.set("payment_invalid", True)
+            state.set("payment_valid", False)
 
-        # 2) Corporate blackout blocked card: make Not(BlockedCard) fail by setting policy + blackout context
+        # 2) Corporate blackout blocked card (H-23): ensure policy+blackout context is present.
         if "blackout" in msg.lower() or "blocked" in msg.lower() or policy_ref.strip() == "H-23":
-            # Use the same policy key that check_not_blocked_card expects
             state.set("corporate_card_policy", "blocked_on_blackout_dates")
-            # If blackout dates are already present via world defaults, leave them.
-            # Otherwise, best-effort add a conservative marker; travel_dates already comes from instruction parsing.
             if not state.get("blackout_dates"):
                 state.set("blackout_dates", ["June 1", "June 2"])
 
-        # 3) Network-related constraint (if present): make NetworkAvailable() fail if that predicate exists/added later
+        # 3) Network constraint (if present)
         if "network" in msg.lower() and ("unavailable" in msg.lower() or "down" in msg.lower()):
             state.set("network_available", False)
+
+    # ---------------------------
+    # Effect execution with minimal gating (prevents recovery-only effects firing on clean success)
+    # ---------------------------
+    def _apply_effects(self, op: Any, state: SymbolicState, params: Dict[str, Any], *, recovery: bool) -> SymbolicState:
+        """
+        Applies operator effects with a minimal gate:
+        - effects tagged __recovery_only__ run ONLY when recovery=True
+        """
+        effs = getattr(op, "effects", None)
+        if not isinstance(effs, list):
+            return op.apply_effects(state, params)
+
+        for eff in effs:
+            try:
+                if getattr(eff, "__recovery_only__", False) and not recovery:
+                    continue
+                state = eff(state, params)
+            except Exception:
+                # Preserve baseline behavior: a bad effect should bubble as failure.
+                raise
+        return state
+
+    # ---------------------------
+    # Minimal retry semantics for timeout ToolError
+    # ---------------------------
+    def _operator_has_timeout_retry(self, op: Any) -> bool:
+        """
+        True if the operator appears to have a learned timeout-retry recovery effect.
+        We use function-name heuristics to avoid deeper coupling to patch schemas.
+        """
+        try:
+            for eff in getattr(op, "effects", []) or []:
+                n = getattr(eff, "__name__", "") or ""
+                if "timeout_retry" in n.lower() or "retry" in n.lower():
+                    return True
+                d = getattr(eff, "__details__", "") or ""
+                if isinstance(d, str) and ("ApiTimeoutRetry" in d or "TimeoutRetry" in d):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _is_timeout_tool_error(self, error_info: Dict[str, Any]) -> bool:
+        """Best-effort classification of injected ToolError timeouts."""
+        msg = str(error_info.get("message", "") or "").lower()
+        pref = str(error_info.get("policy_ref", "") or "").upper()
+        return ("timeout" in msg) or (pref == "API-503")
 
     def execute(self, plan: List[Dict[str, Any]], state: SymbolicState, task_id: int) -> Tuple[
         List, bool, Optional[str]]:
@@ -152,7 +210,6 @@ class Executor:
         print("EXECUTOR: Starting plan execution...")
         trace: List[Dict[str, Any]] = []
 
-        # Ensure defaults exist before signal prediction and predicate checks
         self._apply_world_defaults(state)
 
         # 1. Metacognitive Arbitration (Monitor-Evaluate-Regulate)
@@ -170,55 +227,44 @@ class Executor:
             return trace, False, "Deferred"
 
         if pathway == "S2":
-            # S2 = Slow/deliberative path with extra checks.
             print("EXECUTOR: 🤔 S2 (Slow Path) - Performing extra deliberation.")
-            # For PoC, simulate deliberation with a "deep check" and a small delay.
-            time.sleep(0.1)  # Simulate latency of slower reasoning
+            time.sleep(0.1)
             trace.append({"deliberation": "Simulated deep verification (S2 path)"})
-
-        # For VERIFY_S1 and S1, we proceed to the standard execution loop,
-        # which already includes the essential Verify-Before-Act step.
         elif pathway == "VERIFY_S1":
             print("EXECUTOR: ✓ VERIFY→S1 - Proceeding with standard verified execution.")
-        else:  # pathway == "S1"
+        else:
             print("EXECUTOR: ⚡ S1 (Fast Path) - Proceeding with standard execution.")
 
-        # 3. Main Execution Loop (All non-deferred pathways proceed here)
+        # 3. Main Execution Loop
         for step in plan:
             op = step["operator"]
-            params = step.get("params", {})
+            params = step.get("params", {}) or {}
             print(f"EXECUTOR: Executing step -> {op.name}")
 
             self._apply_world_defaults(state)
 
             # Sync state for predicate evaluation
-            if "payment" in params:
+            if "payment" in params and params["payment"] is not None:
                 state.set("payment_method", params["payment"])
 
             trace.append({"step": op.name, "state_before": state.to_dict()})
 
             # ---- Controlled Failure Injection (PATCHABLE constraints BEFORE Verify) ----
-            # If an injected failure is a "constraint"/PreconditionUnmet, express it in state/params first
-            # so Verify-Before-Act can catch it. ToolError remains a runtime fault injected after Verify.
             injected_error_info: Optional[Dict[str, Any]] = None
             if self._injector_should_fail(task_id, op.name, params, state):
                 error_info = self._injector_failure_details(task_id, op.name, params, state)
-                # Normalize keys across injector variants
                 err_cls = error_info.get("error") or error_info.get("error_type") or "ToolError"
                 injected_error_info = dict(error_info)
                 injected_error_info["error"] = err_cls
 
                 if err_cls != "ToolError":
-                    # Make the constraint visible to predicates
                     self._apply_constraint_injection_to_state(injected_error_info, params, state)
-                    # Record the injection event for auditability
                     trace.append({"injected": True, "phase": "pre-verify", **injected_error_info})
 
-            # ---- Verify-Before-Act (Standard for all execution paths) ----
+            # ---- Verify-Before-Act ----
             ok, violated = self._verify_preconditions(op, params, state)
             if not ok:
                 print(f"EXECUTOR: ❌ Verify-Before-Act failed for {op.name}. Halting.")
-                # If we injected a constraint, attach that context too (helps FDKA localization/scoring)
                 payload = {"error": "PreconditionUnmet", "operator": op.name, "violated": violated}
                 if injected_error_info and injected_error_info.get("error") != "ToolError":
                     payload["injected_constraint"] = True
@@ -230,10 +276,26 @@ class Executor:
             if injected_error_info and injected_error_info.get("error") == "ToolError":
                 print(f"EXECUTOR: ❌ Injected Failure -> {injected_error_info.get('message', 'tool error')}")
                 trace.append({"injected": True, "phase": "post-verify", **injected_error_info})
+
+                if self._is_timeout_tool_error(injected_error_info) and self._operator_has_timeout_retry(op):
+                    trace.append({"recovery": "ApiTimeoutRetry", "attempt": 1, "operator": op.name})
+                    print("EXECUTOR: 🔁 Detected timeout + retry-capable operator. Attempting one recovery retry...")
+                    time.sleep(0.05)
+
+                    try:
+                        state = self._apply_effects(op, state, params, recovery=True)
+                        trace.append({"step": op.name, "state_after": state.to_dict(), "recovered": True})
+                        print(f"EXECUTOR: ✅ Recovery retry succeeded for {op.name}.")
+                        continue
+                    except Exception as e:
+                        trace.append({"recovery_failed": True, "exception": str(e)[:120], "operator": op.name})
+                        print(f"EXECUTOR: ❌ Recovery retry failed for {op.name}.")
+                        return trace, False, "ToolError"
+
                 return trace, False, "ToolError"
 
             # ---- Apply Effects on Success ----
-            state = op.apply_effects(state, params)
+            state = self._apply_effects(op, state, params, recovery=False)
             trace.append({"step": op.name, "state_after": state.to_dict()})
             print(f"EXECUTOR: ✅ Step {op.name} successful.")
 

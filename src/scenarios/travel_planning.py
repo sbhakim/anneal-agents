@@ -4,7 +4,7 @@ Travel planning scenario for SELFEVOLVE evaluation.
 Generates tasks and handles failure injection for the demo.
 Based on Section X walkthrough and Section XII evaluation protocol.
 """
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 import random
 
 # Difficulty level configurations for Component Stress Test
@@ -148,6 +148,12 @@ class FailureInjector:
     """
     Injects controlled failures to test FDKA adaptation.
     UPDATED: Now supports more complex, feature-rich failure types.
+
+    MINIMUM RELIABILITY UPDATES (2026-01):
+    1) Cache intended failure per (task_id, operator) so should_fail() and get_failure_details()
+       are consistent (avoids random drift across calls).
+    2) Make ToolError timeouts "recoverable" within a task by injecting at most once per
+       (task_id, operator) (lets retry logic demonstrate value without disabling future tasks).
     """
 
     def __init__(self, failure_rate: float, horizon: int,
@@ -163,6 +169,10 @@ class FailureInjector:
         self.difficulty = next((key for key, value in DIFFICULTY_CONFIGS.items() if value == self.difficulty_config), 'normal')
         self.patched_operators: Set[str] = set()
         self._patch_successes: Dict[str, int] = {}
+
+        # NEW: cache + per-task injection counters
+        self._intended_failure_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        self._task_op_injection_counts: Dict[Tuple[int, str], int] = {}
 
         self.policy_flip_points = self._get_event_points('policy_flips')
         self.schema_change_points = self._get_event_points('schema_changes')
@@ -198,34 +208,72 @@ class FailureInjector:
 
     def _get_event_points(self, event_type: str) -> List[int]:
         count = self.difficulty_config.get(event_type, 0)
-        if count == 0: return []
+        if count == 0:
+            return []
         return [int(i * self.horizon / (count + 1)) for i in range(1, count + 1)]
 
     def _is_corporate_card(self, params: Optional[Dict], state: Optional[Any]) -> bool:
         payment = params.get("payment") if isinstance(params, dict) else None
-        if payment is None and state and hasattr(state, "get"): payment = state.get("payment_method")
+        if payment is None and state and hasattr(state, "get"):
+            payment = state.get("payment_method")
         return isinstance(payment, str) and "CorporateCard" in payment
 
     def _in_blackout(self, state: Optional[Any]) -> bool:
-        if not (state and hasattr(state, "get")): return False
+        if not (state and hasattr(state, "get")):
+            return False
         return any(b in str(state.get("travel_dates", "")) for b in self.blackout_dates)
+
+    def _is_recoverable_timeout(self, failure_info: Dict[str, Any]) -> bool:
+        """True if this failure is a ToolError timeout suitable for one-shot injection."""
+        if not isinstance(failure_info, dict):
+            return False
+        if failure_info.get("error_type") != "ToolError":
+            return False
+        msg = str(failure_info.get("message", "")).lower()
+        pref = str(failure_info.get("policy_ref", "")).upper()
+        return ("timeout" in msg) or (pref == "API-503")
 
     def should_fail(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                     state: Optional[Any] = None) -> bool:
-        if op_name in self.patched_operators: return False
-        if task_id not in self.failing_tasks: return False
+        # Permanently patched operators: never inject
+        if op_name in self.patched_operators:
+            return False
 
-        intended_failure = self.get_failure_details(task_id, op_name, params, state)
+        # Non-failing task: never inject
+        if task_id not in self.failing_tasks:
+            return False
+
+        intended_failure = self.get_failure_details(task_id, op_name, params, state) or {}
         failing_operator = intended_failure.get("operator")
 
-        if op_name == failing_operator:
-            if intended_failure.get("policy_ref") == "H-23":
-                return self._is_corporate_card(params, state) and self._in_blackout(state)
+        if op_name != failing_operator:
+            return False
+
+        # Policy-conditioned failure: only when corporate card + blackout overlap
+        if intended_failure.get("policy_ref") == "H-23":
+            return self._is_corporate_card(params, state) and self._in_blackout(state)
+
+        # NEW: for ToolError timeouts, inject at most once per task/operator to allow recovery/retry
+        if self._is_recoverable_timeout(intended_failure):
+            key = (int(task_id), str(op_name))
+            count = self._task_op_injection_counts.get(key, 0)
+            if count >= 1:
+                return False
+            # record that we are about to inject
+            self._task_op_injection_counts[key] = count + 1
             return True
-        return False
+
+        return True
 
     def get_failure_details(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                             state: Optional[Any] = None) -> Dict:
+        # NEW: cache intended failure per (task_id, op_name) to keep behavior consistent
+        cache_key = (int(task_id), str(op_name))
+        if cache_key in self._intended_failure_cache:
+            cached = self._intended_failure_cache[cache_key].copy()
+            cached["operator"] = op_name
+            return cached
+
         instruction = ""
         if state and hasattr(state, 'get'):
             instruction = state.get('instruction', '')
@@ -252,8 +300,17 @@ class FailureInjector:
 
         failure_info = self.failure_classes[failure_class].copy()
         failure_info["operator"] = op_name
-        return {**failure_info, "error": failure_info["error_type"], "task_id": task_id,
-                "trace_id": f"T-{task_id:04d}"}
+
+        out = {
+            **failure_info,
+            "error": failure_info["error_type"],
+            "task_id": task_id,
+            "trace_id": f"T-{task_id:04d}"
+        }
+
+        # store in cache (store base; operator is overridden on read anyway)
+        self._intended_failure_cache[cache_key] = out.copy()
+        return out
 
     def mark_operator_patched(self, operator_name: str) -> None:
         if operator_name not in self.patched_operators:

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import uuid
 import json
+from copy import deepcopy
 
 # Core components
 from .state import SymbolicState
@@ -126,12 +127,15 @@ class SelfEvolveSystem:
         if not hasattr(self.scenario, "world_defaults"):
             return
         defaults = self.scenario.world_defaults()
+
         for k in ("hotel_status", "flight_status"):
             if k in defaults:
-                self.state.set(k, defaults[k])
+                self.state.set(k, deepcopy(defaults[k]))
+
+        # Always apply scenario world defaults so state matches injector/scenario truth.
         for k in ("corporate_card_policy", "blackout_dates"):
-            if k in defaults and self.state.get(k) is None:
-                self.state.set(k, defaults[k])
+            if k in defaults:
+                self.state.set(k, deepcopy(defaults[k]))
 
     def _reset_world_for_attempt(self) -> None:
         if not hasattr(self.scenario, "world_defaults"):
@@ -139,7 +143,7 @@ class SelfEvolveSystem:
         defaults = self.scenario.world_defaults()
         for k in ("hotel_status", "flight_status"):
             if k in defaults:
-                self.state.set(k, defaults[k])
+                self.state.set(k, deepcopy(defaults[k]))
 
     def _normalize_state_for_planning(self) -> None:
         """
@@ -152,11 +156,9 @@ class SelfEvolveSystem:
         # Normalize payment-related fields
         pm = self.state.get("payment_method")
         if isinstance(pm, str) and "invalid" in pm.lower():
-            # Strip all "(invalid)" markers
             cleaned = pm
             while "(invalid)" in cleaned.lower():
                 cleaned = cleaned.replace("(invalid)", "").replace("  ", " ").strip()
-            # If stripping produces empty, restore base
             if not cleaned:
                 cleaned = "CorporateCard:CC-5512"
             self.state.set("payment_method", cleaned)
@@ -166,6 +168,16 @@ class SelfEvolveSystem:
             self.state.set("payment_invalid", False)
         if self.state.get("payment_valid") is False:
             self.state.set("payment_valid", True)
+
+    def _plan_signature(self, plan: list) -> tuple:
+        sig = []
+        for step in plan or []:
+            op = step.get("operator")
+            name = getattr(op, "name", str(op))
+            params = step.get("params", {}) or {}
+            items = tuple(sorted((str(k), repr(v)) for k, v in params.items()))
+            sig.append((name, items))
+        return tuple(sig)
 
     # ---------------------------------------------------------------------
     # Task runner
@@ -212,6 +224,8 @@ class SelfEvolveSystem:
 
         max_attempts = 3
         final_trace = []
+        did_local_repair = False
+
         for attempt in range(max_attempts):
             print(f"\n--- Execution Attempt #{attempt + 1} ---")
             self._reset_world_for_attempt()
@@ -250,6 +264,30 @@ class SelfEvolveSystem:
                 return
 
             print(f"⚠️ Execution failed with type: {failure_type}")
+
+            # Local repair first for precondition failures (e.g., invalid payment).
+            if failure_type == "PreconditionUnmet" and not did_local_repair:
+                before_sig = self._plan_signature(plan)
+                repaired_plan = self.planner.replan(instruction, self.state.to_dict(), plan)
+                after_sig = self._plan_signature(repaired_plan)
+
+                if after_sig != before_sig:
+                    # Ensure state reflects repaired payment identity and clear injected invalid flags.
+                    try:
+                        for st in repaired_plan:
+                            p = (st.get("params") or {}).get("payment")
+                            if p:
+                                self.state.set("payment_method", p)
+                                break
+                    except Exception:
+                        pass
+
+                    self._normalize_state_for_planning()
+                    plan = repaired_plan
+                    did_local_repair = True
+                    print("🔧 Local repair applied. Retrying execution without FDKA...")
+                    continue
+
             if failure_type in ("PreconditionUnmet", "ToolError"):
                 print("🧠 Escalating to FDKA for governed self-edit...")
                 patch_applied, committed_patch = self._handle_failure(trace, task_id, instruction)
@@ -435,7 +473,9 @@ class SelfEvolveSystem:
         sim_state = SymbolicState()
         sim_state.update_from_instruction(instruction)
 
-        sim_plan = self.planner.compile(instruction, sim_state.to_dict())
+        # Compile with the patched rule pool (otherwise canary can test the wrong behavior).
+        sim_planner = Planner(self.config['planner'], patched_rule_pool)
+        sim_plan = sim_planner.compile(instruction, sim_state.to_dict())
         if not sim_plan:
             return {"ok": False, "violations": 1}
 
@@ -457,8 +497,14 @@ class SelfEvolveSystem:
 
     def _extract_failure_info(self, trace: list) -> dict:
         for entry in reversed(trace or []):
-            if isinstance(entry, dict) and "error" in entry:
+            if not isinstance(entry, dict):
+                continue
+            if "error" in entry:
                 return entry
+            if "error_type" in entry:
+                normalized = dict(entry)
+                normalized["error"] = normalized.get("error_type")
+                return normalized
         return {}
 
     # ---------------------------------------------------------------------

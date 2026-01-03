@@ -1,6 +1,4 @@
-################################################################################
-# File: src/knowledge/rule_pool.py
-################################################################################
+# src/knowledge/rule_pool.py
 """
 Manages the collection of all available operators (R_rules).
 UPDATED:
@@ -11,10 +9,19 @@ UPDATED:
   caused an AttributeError. Methods now return a (success, skipped) tuple.
 - RECOVERY FIX: Updated EffectFactory to handle complex LLM patterns like
   'IfThen(ApiTimeoutRetry(api), ExecuteTool())' to resolve evolution halts.
+
+MINIMUM RELIABILITY UPDATE (2026-01):
+- Do not treat duplicate/no-op patches as "applied".
+  Previously, skipped duplicates returned True from update_operator(), which inflated
+  acceptance/commit metrics. Now, duplicates return False (no-op), so the system
+  does not count them as committed.
+- Adds a lightweight patch signature cache (operator+action+normalized details)
+  to de-duplicate semantically identical patches even if factories vary formatting.
 """
 from typing import Dict, Any, Callable, List, Tuple, Optional, Set
 import re
 import copy
+import hashlib
 from ..core.operators import Operator
 from ..core.state import SymbolicState
 
@@ -24,9 +31,33 @@ from ..core.state import SymbolicState
 # ========================================================================
 
 def is_card_valid(state: SymbolicState, params: Dict[str, Any]) -> bool:
-    """Checks for the presence of a payment method."""
+    """
+    Minimal payment validity predicate used by baseline operators.
+
+    Critical: must fail when the system/injector marks payment invalid, otherwise
+    constraint injections (payment_invalid / "(invalid)") will never trigger a
+    PreconditionUnmet and the agent will "succeed" incorrectly.
+    """
     payment = params.get("payment", state.get("payment_method"))
-    return payment is not None
+    if payment is None or payment == "" or payment == "None":
+        return False
+
+    # Honor explicit state flags used by the executor/injector.
+    if state.get("payment_invalid") is True:
+        return False
+    if state.get("payment_valid") is False:
+        return False
+
+    p = str(payment)
+    if "(invalid)" in p.lower():
+        return False
+
+    # Lightweight safety: common invalid markers (kept minimal).
+    invalid_markers = ("expired", "blocked", "declined", "suspended")
+    if any(m in p.lower() for m in invalid_markers):
+        return False
+
+    return True
 
 
 def is_hotel_available(state: SymbolicState, params: Dict[str, Any]) -> bool:
@@ -78,16 +109,16 @@ def check_not_blocked_card(state: SymbolicState, params: Dict[str, Any]) -> bool
 
 def check_valid_payment(state: SymbolicState, params: Dict[str, Any]) -> bool:
     """
-    NEW: Validates that payment method is active and supported.
-    This is the learned precondition for: ValidPayment(payment).
-
-    Checks:
-    - Payment method exists and is not None
-    - Payment is not marked as expired, invalid, or blocked
-    - Payment follows expected format (contains "Card")
-
-    In production, this would integrate with a payment validation API.
+    Learned predicate for: ValidPayment(payment).
     """
+    # Honor explicit state flags first (used by injector/executor).
+    if state.get("payment_invalid") is True:
+        print("PRECONDITION CHECK: ❌ ValidPayment - State marked payment_invalid=True")
+        return False
+    if state.get("payment_valid") is False:
+        print("PRECONDITION CHECK: ❌ ValidPayment - State marked payment_valid=False")
+        return False
+
     payment = params.get("payment", state.get("payment_method", ""))
 
     # Check 1: Payment method must exist
@@ -95,28 +126,25 @@ def check_valid_payment(state: SymbolicState, params: Dict[str, Any]) -> bool:
         print("PRECONDITION CHECK: ❌ ValidPayment - No payment method provided")
         return False
 
-    # Check 2: Convert to string for validation
     payment_str = str(payment)
 
-    # Check 3: Must contain "Card" to be a valid payment method
+    # Check 2: Must contain "Card" to be a valid payment method
     if "Card" not in payment_str:
         print(f"PRECONDITION CHECK: ❌ ValidPayment - Invalid format: {payment_str}")
         return False
 
-    # Check 4: Must not contain invalid/expired markers
+    # Check 3: Must not contain invalid/expired markers
     invalid_markers = ["expired", "invalid", "blocked", "declined", "suspended"]
     if any(marker in payment_str.lower() for marker in invalid_markers):
         print(f"PRECONDITION CHECK: ❌ ValidPayment - Payment marked as invalid: {payment_str}")
         return False
 
-    # Check 5: Optional - Verify payment method is in known valid formats
-    # Format examples: "CorporateCard:CC-5512", "PersonalCard:PC-1134"
+    # Check 4: Optional - Verify payment method is in known valid formats
     valid_formats = ["CorporateCard:", "PersonalCard:", "DebitCard:", "CreditCard:"]
     has_valid_format = any(fmt in payment_str for fmt in valid_formats)
 
     if not has_valid_format:
         print(f"PRECONDITION CHECK: ⚠️  ValidPayment - Unknown format (allowing): {payment_str}")
-        # Allow unknown formats to avoid false negatives
 
     print(f"PRECONDITION CHECK: ✅ ValidPayment({payment_str}) - Check passes.")
     return True
@@ -132,13 +160,14 @@ class PredicateFactory:
     @staticmethod
     def create_precondition(details: str, operator_name: str) -> Optional[Callable]:
         details_clean = (details or "").strip()
+        details_l = details_clean.lower()
 
-        # Handler 1: Not(BlockedCard(...)) - Blackout date validation
-        if "Not(BlockedCard" in details_clean:
+        # Handler 1: Not(BlockedCard(...)) - Blackout date validation (case-insensitive)
+        if "not(blockedcard" in details_l:
             return check_not_blocked_card
 
-        # Handler 2: NetworkAvailable() - Network connectivity check
-        if "NetworkAvailable" in details_clean:
+        # Handler 2: NetworkAvailable() - Network connectivity check (case-insensitive)
+        if "networkavailable" in details_l:
             def check_network_available(state: SymbolicState, params: Dict) -> bool:
                 network_ok = state.get("network_available", True)
                 print(f"PRECONDITION CHECK: {'✅' if network_ok else '❌'} NetworkAvailable")
@@ -147,18 +176,15 @@ class PredicateFactory:
             check_network_available.__name__ = "check_network_available"
             return check_network_available
 
-        # Handler 3: ValidPayment(...) - Payment method validation (NEW)
-        if "ValidPayment" in details_clean:
-            # Return the base function directly - it's already defined
+        # Handler 3: ValidPayment(...) - Payment method validation (case-insensitive)
+        if "validpayment" in details_l:
             return check_valid_payment
 
         # Handler 4: Simple predicate names without arguments (e.g., 'is_flight_available')
         if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', details_clean):
-            # Check if it matches a globally known function in this module
             if details_clean in globals() and callable(globals()[details_clean]):
                 print(f"  ✅ PREDICATE FACTORY: Matched existing predicate '{details_clean}'.")
                 return globals()[details_clean]
-            # Fallback to a generic state check for unknown simple predicates
             predicate_name = details_clean
 
             def generic_simple_check(state: SymbolicState, params: Dict) -> bool:
@@ -174,13 +200,11 @@ class PredicateFactory:
         if match:
             predicate_name = match.group(1)
 
-            # Special case: If we recognize the predicate name but it wasn't caught above
             if predicate_name == "ValidPayment":
                 return check_valid_payment
             if predicate_name == "BlockedCard":
                 return check_not_blocked_card
 
-            # Generic fallback for unknown predicates
             def generic_check(state: SymbolicState, params: Dict) -> bool:
                 result = state.get(f"{predicate_name.lower()}_ok", True)
                 print(f"PRECONDITION CHECK: {'✅' if result else '❌'} {predicate_name} (generic)")
@@ -199,9 +223,10 @@ class EffectFactory:
     @staticmethod
     def create_effect(details: str, operator_name: str) -> Optional[Callable]:
         details_clean = (details or "").strip()
+        details_l = details_clean.lower()
 
-        # Handler 1: Conditional effects with network check
-        if "IfThen" in details_clean and "NetworkAvailable" in details_clean:
+        # Handler 1: Conditional effects with network check (case-insensitive)
+        if "ifthen" in details_l and "networkavailable" in details_l:
             def conditional_booking_effect(state: SymbolicState, params: Dict) -> SymbolicState:
                 if not state.get("network_available", True):
                     print("EFFECT: Skipped conditional effect (network unavailable).")
@@ -215,30 +240,31 @@ class EffectFactory:
             conditional_booking_effect.__name__ = "conditional_effect_network_booking"
             return conditional_booking_effect
 
-        # Handler 2: API Timeout Retry logic (FDKA evolved pattern)
+        # Handler 2: API Timeout Retry logic (FDKA evolved pattern) (case-insensitive)
         # Recognizes: IfThen(ApiTimeoutRetry(api), ExecuteTool())
-        if "ApiTimeoutRetry" in details_clean or "TimeoutRetry" in details_clean:
+        #
+        # IMPORTANT: This is a recovery-only MARKER (no-op). The executor owns retry semantics.
+        if "apitimeoutretry" in details_l or "timeoutretry" in details_l:
             def timeout_retry_effect(state: SymbolicState, params: Dict) -> SymbolicState:
                 print(f"EFFECT: Triggering evolution logic -> {details_clean}")
-                print("EFFECT: Attempting recovery/retry for API timeout...")
-                # Re-invoke base tool logic as recovery
-                if "Hotel" in operator_name:
-                    return book_hotel_effect(state, params)
-                elif "Flight" in operator_name:
-                    return book_flight_effect(state, params)
+                print("EFFECT: ApiTimeoutRetry marker (executor performs the retry).")
                 return state
 
             timeout_retry_effect.__name__ = "timeout_retry_recovery_effect"
+            setattr(timeout_retry_effect, "__recovery_only__", True)
+            setattr(timeout_retry_effect, "__details__", details_clean)
             return timeout_retry_effect
 
         # Handler 3: Simple state updates (original regex)
         match = re.match(r"(\w+)\((\w+)\)", details_clean)
         if match:
             pred, target = match.groups()
+
             def simple_effect(state: SymbolicState, params: Dict) -> SymbolicState:
                 state.set(f"{target}_status", pred)
                 print(f"EFFECT: Updated {target}_status to {pred}")
                 return state
+
             simple_effect.__name__ = f"set_{target}_{pred}"
             return simple_effect
 
@@ -262,17 +288,26 @@ class RulePool:
         self.predicate_factory = PredicateFactory()
         self.effect_factory = EffectFactory()
         self.stats = {'total_patches_applied': 0, 'patches_by_type': {}, 'operators_modified': set()}
+        self._patch_signature_cache: Set[str] = set()
         self.load_operators()
 
     def load_operators(self):
-        book_hotel_op = Operator("BookHotel", ["location", "dates", "payment"], [is_card_valid, is_hotel_available],
-                                 [book_hotel_effect])
+        book_hotel_op = Operator(
+            "BookHotel",
+            ["location", "dates", "payment"],
+            [is_card_valid, is_hotel_available],
+            [book_hotel_effect]
+        )
         book_hotel_op.metadata = {"version": "1.0"}
         self.operators[book_hotel_op.name] = book_hotel_op
         self._snapshot_operator(book_hotel_op.name)
 
-        book_flight_op = Operator("BookFlight", ["origin", "destination", "date"], [is_card_valid, is_flight_available],
-                                  [book_flight_effect])
+        book_flight_op = Operator(
+            "BookFlight",
+            ["origin", "destination", "date"],
+            [is_card_valid, is_flight_available],
+            [book_flight_effect]
+        )
         book_flight_op.metadata = {"version": "1.0"}
         self.operators[book_flight_op.name] = book_flight_op
         self._snapshot_operator(book_flight_op.name)
@@ -283,20 +318,19 @@ class RulePool:
         return {
             "operators": copy.deepcopy(self.operators),
             "operator_history": copy.deepcopy(self.operator_history),
-            "stats": copy.deepcopy(self.stats)
+            "stats": copy.deepcopy(self.stats),
+            "_patch_signature_cache": copy.deepcopy(self._patch_signature_cache),
         }
 
     def restore(self, snap: Dict[str, Any]):
         self.operators = snap["operators"]
         self.operator_history = snap.get("operator_history", {})
         self.stats = snap.get("stats", self.stats)
+        self._patch_signature_cache = snap.get("_patch_signature_cache", self._patch_signature_cache)
 
     def get_operator(self, name: str) -> Optional[Operator]:
         return self.operators.get(name)
 
-    # ========================================================================
-    # ** ADDED METHOD **
-    # ========================================================================
     def list_preconditions(self, name: str) -> List[str]:
         """
         Returns the names of preconditions for a given operator.
@@ -316,10 +350,21 @@ class RulePool:
             try:
                 if not bool(pred(state, params)):
                     return False, getattr(pred, "__name__", "anonymous")
-            except Exception as e:
+            except Exception:
                 return False, getattr(pred, "__name__", "anonymous")
 
         return True, None
+
+    def _normalize_details(self, details: str) -> str:
+        """Normalize patch details for stable signature comparisons."""
+        s = (details or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        return s.lower()
+
+    def _patch_signature(self, op_name: str, action: str, details: str) -> str:
+        """Create a short, stable signature for a patch."""
+        base = f"{op_name}||{action}||{self._normalize_details(details)}"
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
 
     def update_operator(self, patch: Dict[str, Any]) -> bool:
         op_name = patch.get("operator")
@@ -332,6 +377,11 @@ class RulePool:
         if not op:
             return False
 
+        sig = self._patch_signature(op_name, action, details)
+        if sig in self._patch_signature_cache:
+            print(f"\n  ℹ️ RULE_POOL: Patch {patch_id} is a duplicate/no-op (sig={sig}). Not applying.")
+            return False
+
         self._snapshot_operator(op_name)
         print(f"\n  🔧 RULE_POOL: Applying patch {patch_id} to {op_name}")
         print(f"     Action: {action}, Details: {details}")
@@ -342,22 +392,24 @@ class RulePool:
         elif action == "REFINE_EFFECT":
             success, skipped = self._refine_effect(op, details, just)
         elif action == "UPDATE_TOOL_SCHEMA":
-            # This action doesn't have a duplicate check, so it's never skipped
             success = self._update_schema(op, details, just)
             skipped = False
 
-        if success:
-            # Only update metadata if a change was actually made (not skipped)
-            if not skipped:
-                self._update_metadata(op, patch_id)
-                self.stats['total_patches_applied'] += 1
-                self.stats['patches_by_type'][action] = self.stats['patches_by_type'].get(action, 0) + 1
-                self.stats['operators_modified'].add(op_name)
-            print(f"  ✅ RULE_POOL: Patch {patch_id} successfully applied (or was already present).")
-            return True
-        else:
-            print(f"  ❌ RULE_POOL: Patch {patch_id} failed to apply.")
+        if success and skipped:
+            print(f"  ℹ️ RULE_POOL: Patch {patch_id} made no changes (already present). Not counting as applied.")
             return False
+
+        if success:
+            self._update_metadata(op, patch_id)
+            self.stats['total_patches_applied'] += 1
+            self.stats['patches_by_type'][action] = self.stats['patches_by_type'].get(action, 0) + 1
+            self.stats['operators_modified'].add(op_name)
+            self._patch_signature_cache.add(sig)
+            print(f"  ✅ RULE_POOL: Patch {patch_id} successfully applied.")
+            return True
+
+        print(f"  ❌ RULE_POOL: Patch {patch_id} failed to apply.")
+        return False
 
     def _add_precondition(self, op: Operator, details: str, just: str) -> Tuple[bool, bool]:
         new_pre = self.predicate_factory.create_precondition(details, op.name)
@@ -366,7 +418,6 @@ class RulePool:
 
         pred_name = getattr(new_pre, "__name__", "anon")
 
-        # Check for duplicates
         if pred_name in {getattr(fn, "__name__", "") for fn in op.preconditions}:
             print(f"  ℹ️ Precondition '{pred_name}' already exists. Skipping duplicate.")
             return True, True
@@ -384,16 +435,19 @@ class RulePool:
 
         effect_name = getattr(new_eff, "__name__", "anon_eff")
 
-        # Check BOTH function name AND source code for true duplicates
+        # Safety: ensure timeout retry effects are tagged recovery-only even if factories drift.
+        if ("timeout" in effect_name.lower() or "retry" in effect_name.lower()) and getattr(new_eff, "__recovery_only__", None) is None:
+            setattr(new_eff, "__recovery_only__", True)
+
         existing_names = {getattr(fn, "__name__", "") for fn in op.effects}
         if effect_name in existing_names:
-            # Double-check if it's truly identical by comparing details
             existing_details = [getattr(fn, "__details__", "") for fn in op.effects]
             if any(details in ed or ed in details for ed in existing_details if ed):
                 print(f"  ℹ️ Effect '{effect_name}' with similar details already exists. Skipping duplicate.")
                 return True, True
+            print(f"  ℹ️ Effect '{effect_name}' already exists. Skipping duplicate.")
+            return True, True
 
-        # Attach details for future comparison
         setattr(new_eff, "__details__", details)
 
         op.effects.append(new_eff)
@@ -408,7 +462,7 @@ class RulePool:
     def _update_metadata(self, op: Operator, patch_id: str):
         try:
             op.metadata["version"] = f"{float(op.metadata.get('version', '1.0')) + 0.1:.1f}"
-        except:
+        except Exception:
             op.metadata["version"] = "1.1"
 
         if "patch_history" not in op.metadata:
@@ -445,10 +499,8 @@ if __name__ == "__main__":
     print("Testing Enhanced RulePool with ValidPayment")
     print("=" * 70)
 
-    # Initialize RulePool
     rule_pool = RulePool("dummy_path.json")
 
-    # Test 1: ValidPayment predicate creation
     print("\n[Test 1: ValidPayment Predicate Creation]")
     predicate = rule_pool.predicate_factory.create_precondition(
         "ValidPayment(payment)",
@@ -458,19 +510,16 @@ if __name__ == "__main__":
     if predicate:
         print(f"✅ Predicate created: {predicate.__name__}")
 
-        # Test with valid payment
         mock_state = SymbolicState()
         mock_state.set("payment_method", "CorporateCard:CC-5512")
         result = predicate(mock_state, {"payment": "CorporateCard:CC-5512"})
         print(f"   Valid payment test: {'✅ PASS' if result else '❌ FAIL'}")
 
-        # Test with invalid payment
         result2 = predicate(mock_state, {"payment": "ExpiredCard:EC-9999"})
         print(f"   Invalid payment test: {'✅ PASS' if not result2 else '❌ FAIL'}")
     else:
         print("❌ Failed to create predicate")
 
-    # Test 2: Patch application with ValidPayment
     print("\n[Test 2: Patch Application]")
     patch = {
         "id": "test-patch-001",
@@ -483,7 +532,6 @@ if __name__ == "__main__":
     success = rule_pool.update_operator(patch)
     print(f"Patch application: {'✅ SUCCESS' if success else '❌ FAILED'}")
 
-    # Verify precondition was added
     hotel_op = rule_pool.get_operator("BookHotel")
     precond_names = [getattr(p, "__name__", "unknown") for p in hotel_op.preconditions]
     print(f"Current preconditions: {precond_names}")
