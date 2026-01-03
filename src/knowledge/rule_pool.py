@@ -1,4 +1,6 @@
-# src/knowledge/rule_pool.py
+################################################################################
+# File: src/knowledge/rule_pool.py
+################################################################################
 """
 Manages the collection of all available operators (R_rules).
 UPDATED:
@@ -7,6 +9,8 @@ UPDATED:
 - Added ValidPayment predicate handler to support payment validation patches.
 - CRITICAL FIX: Resolved bug where attaching an attribute to a boolean return value
   caused an AttributeError. Methods now return a (success, skipped) tuple.
+- RECOVERY FIX: Updated EffectFactory to handle complex LLM patterns like
+  'IfThen(ApiTimeoutRetry(api), ExecuteTool())' to resolve evolution halts.
 """
 from typing import Dict, Any, Callable, List, Tuple, Optional, Set
 import re
@@ -210,6 +214,33 @@ class EffectFactory:
 
             conditional_booking_effect.__name__ = "conditional_effect_network_booking"
             return conditional_booking_effect
+
+        # Handler 2: API Timeout Retry logic (FDKA evolved pattern)
+        # Recognizes: IfThen(ApiTimeoutRetry(api), ExecuteTool())
+        if "ApiTimeoutRetry" in details_clean or "TimeoutRetry" in details_clean:
+            def timeout_retry_effect(state: SymbolicState, params: Dict) -> SymbolicState:
+                print(f"EFFECT: Triggering evolution logic -> {details_clean}")
+                print("EFFECT: Attempting recovery/retry for API timeout...")
+                # Re-invoke base tool logic as recovery
+                if "Hotel" in operator_name:
+                    return book_hotel_effect(state, params)
+                elif "Flight" in operator_name:
+                    return book_flight_effect(state, params)
+                return state
+
+            timeout_retry_effect.__name__ = "timeout_retry_recovery_effect"
+            return timeout_retry_effect
+
+        # Handler 3: Simple state updates (original regex)
+        match = re.match(r"(\w+)\((\w+)\)", details_clean)
+        if match:
+            pred, target = match.groups()
+            def simple_effect(state: SymbolicState, params: Dict) -> SymbolicState:
+                state.set(f"{target}_status", pred)
+                print(f"EFFECT: Updated {target}_status to {pred}")
+                return state
+            simple_effect.__name__ = f"set_{target}_{pred}"
+            return simple_effect
 
         print(f"  ⚠️ EFFECT FACTORY: Could not parse pattern '{details_clean}'")
         return None
