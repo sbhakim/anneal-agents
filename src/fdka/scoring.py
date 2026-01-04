@@ -11,11 +11,19 @@ UPDATED: Implements real scoring functions from Equations 7-12:
   - Aggregate scoring with budget penalties (Eq. 7)
 
 MANUSCRIPT ENHANCEMENT: Added detailed scoring breakdown output for validation.
+
+MINIMUM SMT (Z3) IMPLEMENTATION (2026-01):
+- If `consistency.use_z3: true` and `z3-solver` is installed, run a tiny SMT check over
+  a small boolean predicate vocabulary extracted from patch details.
+- This is intentionally narrow: it detects logical inconsistency like asserting both
+  ValidPayment and Not(ValidPayment), BlockedCard and Not(BlockedCard), etc.
+- Fallback remains the symbolic heuristic when z3 is unavailable or parsing yields no atoms.
 """
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import math
 import json
 import numpy as np
+import re
 
 
 class Scorer:
@@ -60,6 +68,15 @@ class Scorer:
         self._min_samples_for_filter = 5
         self._low_data_max_risk = 0.6
         self._low_data_allowed_actions = {"ADD_PRECONDITION"}
+
+        # Minimal SMT predicate vocabulary for Eq.10 checks (expand only if needed)
+        self._smt_atoms = {
+            "ValidPayment": "ValidPayment",
+            "InvalidPayment": "InvalidPayment",
+            "ExpiredPayment": "ExpiredPayment",
+            "BlockedCard": "BlockedCard",
+            "NetworkAvailable": "NetworkAvailable",
+        }
 
         print(f"SCORER: Initialized with weights -> {self.weights}")
         print(f"SCORER: LLM provider={self.llm_provider}, SAT solver={'Z3' if self.use_z3 else 'Symbolic Heuristic'}")
@@ -316,20 +333,104 @@ class Scorer:
 
         return score
 
+    # ---------------------------
+    # Minimal SMT-backed consistency check (Eq. 10)
+    # ---------------------------
+    def _extract_smt_literals(self, details: str) -> List[Tuple[str, bool]]:
+        """
+        Extract a small set of boolean literals from a patch string.
+
+        Returns: list of (atom_name, polarity) where polarity=True means asserted,
+                 polarity=False means negated (e.g., Not(BlockedCard(...))).
+        """
+        if not details:
+            return []
+
+        lits: List[Tuple[str, bool]] = []
+        txt = str(details)
+
+        # Detect negated atoms: Not(AtomName(...))
+        for atom in self._smt_atoms.keys():
+            neg_pat = rf"Not\(\s*{re.escape(atom)}\s*\("
+            if re.search(neg_pat, txt):
+                lits.append((atom, False))
+
+        # Detect positive atoms: AtomName(...)
+        for atom in self._smt_atoms.keys():
+            pos_pat = rf"{re.escape(atom)}\s*\("
+            if re.search(pos_pat, txt):
+                lits.append((atom, True))
+
+        # De-dup exact literals
+        out = []
+        seen = set()
+        for a, pol in lits:
+            key = (a, pol)
+            if key not in seen:
+                out.append((a, pol))
+                seen.add(key)
+        return out
+
     def _z3_consistency_check(self, patch: Dict[str, Any]) -> float:
-        try:
-            details = patch.get('details', '')
-            if "Contradiction" in details:
-                print("        ✗ Z3: Detected contradiction")
-                return 0.0
-            else:
-                print("        ✓ Z3: SAT (no contradictions)")
-                return 1.0
-        except ImportError:
-            print("        ⚠️ Z3 not installed, using fallback")
+        """
+        Minimal Z3 SMT check:
+        - Build boolean vars for a tiny predicate vocabulary found in patch details.
+        - Add asserted/negated literals from the patch.
+        - Add a couple of domain axioms (small, safe, and explainable).
+        - SAT => 1.0, UNSAT => 0.0, Unknown/empty => fallback heuristic.
+        """
+        details = str(patch.get('details', '') or '')
+        lits = self._extract_smt_literals(details)
+
+        # If we didn't extract any atoms, SMT has nothing to prove; use heuristic.
+        if not lits:
+            print("        ℹ️ Z3: No parsable SMT atoms in patch; using heuristic fallback")
             return self._symbolic_consistency_check(patch)
+
+        try:
+            from z3 import Solver, Bool, Not, Implies, sat, unsat  # type: ignore
+        except Exception:
+            print("        ⚠️ Z3 not installed (pip install z3-solver). Using heuristic fallback.")
+            return self._symbolic_consistency_check(patch)
+
+        try:
+            s = Solver()
+
+            # Create Bool vars only for atoms that appear
+            atoms_in_patch = sorted({a for a, _ in lits})
+            vars_ = {a: Bool(self._smt_atoms[a]) for a in atoms_in_patch}
+
+            # Add literals from patch
+            for a, pol in lits:
+                if a not in vars_:
+                    continue
+                s.add(vars_[a] if pol else Not(vars_[a]))
+
+            # Minimal domain axioms (keep tiny; expand only if needed)
+            # - ExpiredPayment -> InvalidPayment
+            if "ExpiredPayment" in vars_ and "InvalidPayment" in vars_:
+                s.add(Implies(vars_["ExpiredPayment"], vars_["InvalidPayment"]))
+
+            # - InvalidPayment -> Not(ValidPayment)
+            if "InvalidPayment" in vars_ and "ValidPayment" in vars_:
+                s.add(Implies(vars_["InvalidPayment"], Not(vars_["ValidPayment"])))
+
+            # NOTE: We intentionally do NOT assert BlockedCard -> InvalidPayment.
+            # BlockedCard is policy-based, not necessarily "invalid".
+
+            res = s.check()
+            if res == sat:
+                print(f"        ✓ Z3: SAT over atoms={atoms_in_patch}")
+                return 1.0
+            if res == unsat:
+                print(f"        ✗ Z3: UNSAT (inconsistent literals/axioms) over atoms={atoms_in_patch}")
+                return 0.0
+
+            print("        ⚠️ Z3: UNKNOWN; using conservative mid-score")
+            return 0.5
+
         except Exception as e:
-            print(f"        ⚠️ Z3 error: {e}, using fallback")
+            print(f"        ⚠️ Z3 error: {e}, using heuristic fallback")
             return self._symbolic_consistency_check(patch)
 
     def _symbolic_consistency_check(self, patch: Dict[str, Any]) -> float:

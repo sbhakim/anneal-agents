@@ -8,6 +8,11 @@ MINIMUM ROBUSTNESS UPDATES (targeted):
 - If examples are insufficient, run LOW-POWER canary on what exists.
 - If no examples exist, optionally run a deterministic micro-suite if provided in context.
 - Heuristic-only mode is now conservative: only monotonic-safe, low-risk patches can pass.
+
+MINIMUM SMT DEMO SUPPORT (2026-01):
+- If context provides `synthetic_patches` and a `scorer`, run a lightweight SMT sanity check
+  (consistency only) and surface results in the canary output. This is used to demonstrate
+  Z3 UNSAT detection without affecting normal canary decisions unless explicitly requested.
 """
 
 from __future__ import annotations
@@ -69,6 +74,19 @@ class CanaryRunner:
         print(f"Operator: {patch.get('operator')}")
         print(f"Details: {str(patch.get('details', 'N/A'))[:60]}...")
 
+        # Optional SMT sanity checks (non-blocking by default).
+        smt_sanity = self._run_smt_sanity_checks(context)
+        require_unsat = bool(context.get("smt_sanity_require_unsat", False))
+        if require_unsat:
+            # Used only for deliberate "prove UNSAT is caught" demos; keep separate from main canary logic.
+            if not smt_sanity or not any(r.get("is_unsat") for r in smt_sanity):
+                return self._result(
+                    False,
+                    "SMT sanity check required an UNSAT result but none observed",
+                    mode="smt_sanity_only",
+                    smt_sanity=smt_sanity,
+                )
+
         examples: List[Any] = context.get("examples", []) or []
         suite: List[Any] = context.get("canary_suite", []) or []
 
@@ -86,12 +104,15 @@ class CanaryRunner:
                 test_inputs=self._sample_examples(suite, min(self.cfg.sample_size, len(suite))),
                 mode="deterministic_only",
                 reject_on_any_failure=True,
+                smt_sanity=smt_sanity,
             )
 
         # If nothing to test, fall back to conservative heuristics.
         if not examples and not suite:
             print("  No examples and no suite -> conservative heuristic-only mode")
-            return self._heuristic_only_decision(patch, context)
+            out = self._heuristic_only_decision(patch, context)
+            out["smt_sanity"] = smt_sanity
+            return out
 
         # Always include deterministic suite inputs if provided, because it strengthens coverage.
         # Keep it bounded by sample_size.
@@ -122,7 +143,58 @@ class CanaryRunner:
             test_inputs=combined,
             mode=mode,
             reject_on_any_failure=low_power,  # low-power must be strict: any failure => reject
+            smt_sanity=smt_sanity,
         )
+
+    def _run_smt_sanity_checks(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Optional SMT sanity checks for manuscript/demo evidence.
+
+        Expected context keys:
+          - scorer: Scorer instance
+          - synthetic_patches: list[patch_dict]
+        """
+        scorer = context.get("scorer")
+        synthetic = context.get("synthetic_patches", []) or []
+
+        if not scorer or not synthetic:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        print("\nSMT Sanity Checks (consistency only):")
+        for i, p in enumerate(synthetic, 1):
+            try:
+                pid = p.get("id", f"synthetic-{i}")
+                details = str(p.get("details", ""))[:80]
+                print(f"  SMT[{i}] patch_id={pid} details='{details}...'")
+
+                # Call consistency directly so the Z3 trace is visible and fast.
+                consistency = float(getattr(scorer, "_score_consistency")(p))
+                is_unsat = consistency <= 0.0
+
+                out.append(
+                    {
+                        "patch_id": pid,
+                        "consistency": round(consistency, 3),
+                        "is_unsat": bool(is_unsat),
+                        "solver": "z3" if bool(getattr(scorer, "use_z3", False)) else "heuristic",
+                    }
+                )
+            except Exception as e:
+                out.append(
+                    {
+                        "patch_id": p.get("id", f"synthetic-{i}"),
+                        "consistency": None,
+                        "is_unsat": None,
+                        "solver": "unknown",
+                        "error": str(e)[:120],
+                    }
+                )
+
+        # Lightweight summary line for logs
+        unsat_n = sum(1 for r in out if r.get("is_unsat"))
+        print(f"  SMT sanity summary: {unsat_n}/{len(out)} UNSAT")
+        return out
 
     def _run_simulations(
         self,
@@ -131,6 +203,7 @@ class CanaryRunner:
         test_inputs: List[Any],
         mode: str,
         reject_on_any_failure: bool,
+        smt_sanity: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         rule_pool = context.get("rule_pool")
         stage_fn = context.get("stage_fn")
@@ -138,11 +211,11 @@ class CanaryRunner:
 
         if not rule_pool or not stage_fn:
             print("  FAILED: Missing rule_pool or stage_fn")
-            return self._result(False, "Missing canary context (rule_pool or stage_fn)", mode=mode)
+            return self._result(False, "Missing canary context (rule_pool or stage_fn)", mode=mode, smt_sanity=smt_sanity)
 
         if not simulator:
             print("  FAILED: No simulator provided")
-            return self._result(False, "No simulator available", mode=mode)
+            return self._result(False, "No simulator available", mode=mode, smt_sanity=smt_sanity)
 
         print("\nStaging patch...")
         snapshot = self._safe_call(rule_pool, "snapshot")
@@ -151,7 +224,7 @@ class CanaryRunner:
             staged = stage_fn(patch)
             if not staged:
                 print("  FAILED: Could not stage patch")
-                return self._result(False, "Patch staging failed", mode=mode)
+                return self._result(False, "Patch staging failed", mode=mode, smt_sanity=smt_sanity)
 
             print("  Patch staged successfully")
             print(f"\nRunning {len(test_inputs)} simulations...")
@@ -197,6 +270,7 @@ class CanaryRunner:
                     tested=tested,
                     fail_rate=fail_rate,
                     mode=mode,
+                    smt_sanity=smt_sanity,
                 )
 
             if reject_on_any_failure and violations > 0:
@@ -207,6 +281,7 @@ class CanaryRunner:
                     tested=tested,
                     fail_rate=fail_rate,
                     mode=mode,
+                    smt_sanity=smt_sanity,
                 )
 
             if mode in ("low_power", "deterministic_only"):
@@ -217,6 +292,7 @@ class CanaryRunner:
                     tested=tested,
                     fail_rate=fail_rate,
                     mode=mode,
+                    smt_sanity=smt_sanity,
                 )
 
             max_allowed_failures = int(self.cfg.max_fail_rate * tested)
@@ -234,6 +310,7 @@ class CanaryRunner:
                     tested=tested,
                     fail_rate=fail_rate,
                     mode=mode,
+                    smt_sanity=smt_sanity,
                 )
 
             passed = (violations == 0) or (pass_rate >= 0.8 and statistical_pass)
@@ -243,6 +320,7 @@ class CanaryRunner:
                 tested=tested,
                 fail_rate=fail_rate,
                 mode=mode,
+                smt_sanity=smt_sanity,
             )
 
         finally:
@@ -334,15 +412,19 @@ class CanaryRunner:
         tested: int = 0,
         fail_rate: float = 0.0,
         mode: str = "strict",
+        smt_sanity: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         status = "PASS" if passed else "FAIL"
         print(f"CANARY_RUNNER: Result -> {status}")
         print(f"               Reason: {reason}")
 
-        return {
+        out = {
             "passed": passed,
             "tested": tested,
             "fail_rate": round(float(fail_rate), 4),
             "reason": reason,
             "mode": mode,
         }
+        if smt_sanity:
+            out["smt_sanity"] = smt_sanity
+        return out

@@ -10,6 +10,12 @@ Notes:
 - Cases are intentionally stable so before/after comparisons are fair.
 - Operator filtering supports both single operators ("BookFlight") and composite labels
   like "BookFlight+BookHotel" when canary is invoked for a specific operator.
+
+SMT / Z3 demo support (minimal, opt-in):
+- We keep the runtime canary suite stable (no changes to CANARY_SUITE) to avoid shifting
+  baselines across runs.
+- Synthetic SMT patches are provided separately so CanaryRunner can run a consistency-only
+  sanity check (SAT/UNSAT evidence) when context passes `synthetic_patches`.
 """
 
 from __future__ import annotations
@@ -83,6 +89,34 @@ CANARY_SUITE: List[Dict[str, Any]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------
+# Synthetic SMT sanity patches (opt-in; does not affect standard canary suite)
+# ---------------------------------------------------------------------
+
+# Intentionally tiny: one SAT-ish patch and one explicit contradiction to demonstrate UNSAT.
+# CanaryRunner will run scorer._score_consistency(...) over these when the caller passes them
+# as `synthetic_patches` in the canary context.
+SMT_SANITY_PATCHES: List[Dict[str, Any]] = [
+    {
+        "id": "SMT-SAT-01",
+        "operator": "BookHotel",
+        "action": "ADD_PRECONDITION",
+        # Single-atom claim: Z3 SAT is expected; this mainly proves the Z3 path runs.
+        "details": "Precondition: NetworkAvailable(request) must hold. NetworkAvailable(request).",
+    },
+    {
+        "id": "SMT-UNSAT-01",
+        "operator": "BookHotel",
+        "action": "ADD_PRECONDITION",
+        # Explicit contradiction: ValidPayment and Not(ValidPayment) on the same symbolic token.
+        # This should be UNSAT under the minimal Z3 encoding in src/fdka/scoring.py.
+        "details": (
+            "Precondition: ValidPayment(payment) and Not(ValidPayment(payment)) must both hold. "
+            "ValidPayment(payment). Not(ValidPayment(payment))."
+        ),
+    },
+]
+
 
 def get_canary_suite() -> List[Dict[str, Any]]:
     """Return a copy of the deterministic canary micro-suite."""
@@ -106,4 +140,31 @@ def get_canary_suite_for_operator(operator_name: str) -> List[Dict[str, Any]]:
         parts = [p.strip() for p in ex_op.split("+") if p.strip()]
         if op == ex_op or op in parts:
             out.append(ex)
+    return out
+
+
+def get_smt_sanity_patches() -> List[Dict[str, Any]]:
+    """
+    Return a copy of synthetic SMT sanity patches.
+
+    These are not executed as tasks; they are used for consistency-only SMT checks
+    in CanaryRunner when the caller passes `synthetic_patches` in canary context.
+    """
+    return list(SMT_SANITY_PATCHES)
+
+
+def get_smt_sanity_patches_for_operator(operator_name: str) -> List[Dict[str, Any]]:
+    """
+    Filter SMT sanity patches for an operator (keeps the demo targeted in logs).
+
+    If operator_name is empty/None -> return full SMT patch list.
+    """
+    op = (operator_name or "").strip()
+    if not op:
+        return get_smt_sanity_patches()
+
+    out: List[Dict[str, Any]] = []
+    for p in SMT_SANITY_PATCHES:
+        if str(p.get("operator", "")).strip() == op:
+            out.append(p)
     return out

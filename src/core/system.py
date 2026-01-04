@@ -25,6 +25,10 @@ MINIMUM METRICS SEMANTICS:
 - Never call metrics.record_task() twice for the same task_id.
   Planning can fail and later succeed after a patch; we treat the planning failure as an
   observed failure event inside the aggregated trace, but we record the task outcome once.
+
+MINIMUM SMT/DEMO WIRING (2026-01):
+- Pass synthetic SMT sanity patches into canary_context when available so CanaryRunner can
+  log SAT/UNSAT evidence (consistency-only) without affecting the main canary decision.
 """
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
@@ -62,7 +66,10 @@ from ..utils.metrics import MetricsCollector
 
 # Scenario
 from ..scenarios.travel_planning import TravelPlanningScenario
-from ..scenarios.test_cases import get_canary_suite_for_operator
+from ..scenarios.test_cases import (
+    get_canary_suite_for_operator,
+    get_smt_sanity_patches_for_operator,
+)
 
 
 class SelfEvolveSystem:
@@ -285,7 +292,6 @@ class SelfEvolveSystem:
 
                 if task_id > 0 and task_id % 5 == 0:
                     print(f"  🔍 Checking adaptation progress at task {task_id}...")
-                    # Prefer event-based keys once metrics is updated; keep this loop conservative.
                     for failure_key in list(self.metrics.failure_event_counts.keys()) or list(self.metrics.failure_classes.keys()):
                         if self.metrics.check_adaptation(failure_key, window_size=min(10, task_id)):
                             print(f"  ✅ Adaptation confirmed for '{failure_key}'")
@@ -453,6 +459,8 @@ class SelfEvolveSystem:
             # Canary should see both “what broke” and “what previously worked” for regression sensitivity.
             examples = (fail_examples[-5:] + succ_examples[-5:]) or self.experience_pool.traces[-10:]
 
+            # Synthetic SMT sanity patches are opt-in evidence:
+            # they should not change the accept/reject decision unless canary_context requests it.
             canary_context = {
                 "rule_pool": self.rule_pool,
                 "stage_fn": self.rule_pool.update_operator,
@@ -460,7 +468,8 @@ class SelfEvolveSystem:
                 "examples": examples,
                 "canary_suite": get_canary_suite_for_operator(op_name),
                 "scorer": self.scorer,
-                "scores": scores
+                "scores": scores,
+                "synthetic_patches": get_smt_sanity_patches_for_operator(op_name),
             }
 
             canary_result = self.canary_runner.run(proposed_patch, canary_context) or {}
