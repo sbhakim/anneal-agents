@@ -88,6 +88,30 @@ class Executor:
             return ok, violated
         return True, None
 
+    def _sync_payment_from_params(self, params: Dict[str, Any], state: SymbolicState) -> None:
+        """
+        Keep payment identity consistent across params/state AND prevent "sticky" invalid flags.
+
+        Key bug fixed: if a prior attempt injected payment_invalid=True, and a later attempt
+        switches to a clean payment method, the old flags must not continue to poison Verify.
+        """
+        if "payment" not in params or params["payment"] is None:
+            return
+
+        payment = params["payment"]
+        state.set("payment_method", payment)
+
+        p = str(payment)
+        if "(invalid)" in p.lower():
+            state.set("payment_invalid", True)
+            state.set("payment_valid", False)
+        else:
+            # Clear transient invalid markers when a clean payment is provided.
+            if state.get("payment_invalid") is True:
+                state.set("payment_invalid", False)
+            if state.get("payment_valid") is False:
+                state.set("payment_valid", True)
+
     # ---------------------------
     # Failure injector compatibility + patchable constraint injection
     # ---------------------------
@@ -243,9 +267,8 @@ class Executor:
 
             self._apply_world_defaults(state)
 
-            # Sync state for predicate evaluation
-            if "payment" in params and params["payment"] is not None:
-                state.set("payment_method", params["payment"])
+            # Sync state for predicate evaluation (and clear sticky invalid flags on clean payment)
+            self._sync_payment_from_params(params, state)
 
             trace.append({"step": op.name, "state_before": state.to_dict()})
 

@@ -1,23 +1,19 @@
 # src/knowledge/rule_pool.py
 """
 Manages the collection of all available operators (R_rules).
-UPDATED:
-- Added the missing `list_preconditions` method for FDKA serialization.
-- Fixed idempotency bug: Effects are now checked by function name.
-- Added ValidPayment predicate handler to support payment validation patches.
-- CRITICAL FIX: Resolved bug where attaching an attribute to a boolean return value
-  caused an AttributeError. Methods now return a (success, skipped) tuple.
-- RECOVERY FIX: Updated EffectFactory to handle complex LLM patterns like
-  'IfThen(ApiTimeoutRetry(api), ExecuteTool())' to resolve evolution halts.
 
-MINIMUM RELIABILITY UPDATE (2026-01):
-- Do not treat duplicate/no-op patches as "applied".
-  Previously, skipped duplicates returned True from update_operator(), which inflated
-  acceptance/commit metrics. Now, duplicates return False (no-op), so the system
-  does not count them as committed.
-- Adds a lightweight patch signature cache (operator+action+normalized details)
-  to de-duplicate semantically identical patches even if factories vary formatting.
+UPDATED (minimum, high-impact):
+- Duplicate/no-op patches are now treated as a SUCCESSFUL COMMIT outcome for control-flow
+  (truthy return), but are NOT counted as "applied" in RulePool stats.
+- update_operator now returns a small result object (PatchUpdateResult) instead of a bare bool.
+  This avoids the prior "duplicate => False => halt task" failure mode, while keeping metrics honest.
+
+Notes:
+- PatchUpdateResult is truthy if (applied OR skipped-as-duplicate/no-op), so existing code that
+  does `if rule_pool.update_operator(patch): ...` keeps working and no longer halts on no-ops.
+- Use result.applied vs result.skipped if you want to distinguish in metrics later.
 """
+from dataclasses import dataclass
 from typing import Dict, Any, Callable, List, Tuple, Optional, Set
 import re
 import copy
@@ -276,6 +272,27 @@ class EffectFactory:
 # RULE POOL (Main Operator Registry)
 # ========================================================================
 
+@dataclass(frozen=True)
+class PatchUpdateResult:
+    """
+    Result of attempting to apply a patch to the RulePool.
+
+    Truthiness:
+      - True  => either applied OR skipped as duplicate/no-op (safe for control-flow)
+      - False => genuine failure to apply / unknown operator / invalid patch
+    """
+    applied: bool
+    skipped: bool = False
+    reason: str = ""
+    signature: str = ""
+    patch_id: str = ""
+    operator: str = ""
+    action: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.applied or self.skipped)
+
+
 class RulePool:
     """A repository for storing, retrieving, verifying, and updating symbolic operators."""
 
@@ -366,7 +383,7 @@ class RulePool:
         base = f"{op_name}||{action}||{self._normalize_details(details)}"
         return hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
 
-    def update_operator(self, patch: Dict[str, Any]) -> bool:
+    def update_operator(self, patch: Dict[str, Any]) -> PatchUpdateResult:
         op_name = patch.get("operator")
         action = patch.get("action")
         details = patch.get("details", "")
@@ -375,12 +392,28 @@ class RulePool:
 
         op = self.operators.get(op_name)
         if not op:
-            return False
+            return PatchUpdateResult(
+                applied=False,
+                skipped=False,
+                reason="unknown_operator",
+                signature="",
+                patch_id=patch_id,
+                operator=str(op_name),
+                action=str(action),
+            )
 
         sig = self._patch_signature(op_name, action, details)
         if sig in self._patch_signature_cache:
             print(f"\n  ℹ️ RULE_POOL: Patch {patch_id} is a duplicate/no-op (sig={sig}). Not applying.")
-            return False
+            return PatchUpdateResult(
+                applied=False,
+                skipped=True,
+                reason="duplicate_cached",
+                signature=sig,
+                patch_id=patch_id,
+                operator=str(op_name),
+                action=str(action),
+            )
 
         self._snapshot_operator(op_name)
         print(f"\n  🔧 RULE_POOL: Applying patch {patch_id} to {op_name}")
@@ -396,8 +429,18 @@ class RulePool:
             skipped = False
 
         if success and skipped:
+            # De-dup future identical attempts, but do NOT count this as an applied patch.
+            self._patch_signature_cache.add(sig)
             print(f"  ℹ️ RULE_POOL: Patch {patch_id} made no changes (already present). Not counting as applied.")
-            return False
+            return PatchUpdateResult(
+                applied=False,
+                skipped=True,
+                reason="no_change_already_present",
+                signature=sig,
+                patch_id=patch_id,
+                operator=str(op_name),
+                action=str(action),
+            )
 
         if success:
             self._update_metadata(op, patch_id)
@@ -406,10 +449,26 @@ class RulePool:
             self.stats['operators_modified'].add(op_name)
             self._patch_signature_cache.add(sig)
             print(f"  ✅ RULE_POOL: Patch {patch_id} successfully applied.")
-            return True
+            return PatchUpdateResult(
+                applied=True,
+                skipped=False,
+                reason="applied",
+                signature=sig,
+                patch_id=patch_id,
+                operator=str(op_name),
+                action=str(action),
+            )
 
         print(f"  ❌ RULE_POOL: Patch {patch_id} failed to apply.")
-        return False
+        return PatchUpdateResult(
+            applied=False,
+            skipped=False,
+            reason="apply_failed",
+            signature=sig,
+            patch_id=patch_id,
+            operator=str(op_name),
+            action=str(action),
+        )
 
     def _add_precondition(self, op: Operator, details: str, just: str) -> Tuple[bool, bool]:
         new_pre = self.predicate_factory.create_precondition(details, op.name)
@@ -531,6 +590,8 @@ if __name__ == "__main__":
 
     success = rule_pool.update_operator(patch)
     print(f"Patch application: {'✅ SUCCESS' if success else '❌ FAILED'}")
+    if hasattr(success, "applied") and hasattr(success, "skipped"):
+        print(f"  applied={success.applied}, skipped={success.skipped}, reason={success.reason}, sig={success.signature}")
 
     hotel_op = rule_pool.get_operator("BookHotel")
     precond_names = [getattr(p, "__name__", "unknown") for p in hotel_op.preconditions]

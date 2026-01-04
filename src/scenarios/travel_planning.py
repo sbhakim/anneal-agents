@@ -150,10 +150,9 @@ class FailureInjector:
     UPDATED: Now supports more complex, feature-rich failure types.
 
     MINIMUM RELIABILITY UPDATES (2026-01):
-    1) Cache intended failure per (task_id, operator) so should_fail() and get_failure_details()
-       are consistent (avoids random drift across calls).
-    2) Make ToolError timeouts "recoverable" within a task by injecting at most once per
-       (task_id, operator) (lets retry logic demonstrate value without disabling future tasks).
+    1) Cache intended failure so should_fail() and get_failure_details() are consistent.
+    2) Make ToolError timeouts recoverable within a task by injecting at most once per
+       (task_id, operator, payment_key) (lets retry logic demonstrate value).
     """
 
     def __init__(self, failure_rate: float, horizon: int,
@@ -170,9 +169,9 @@ class FailureInjector:
         self.patched_operators: Set[str] = set()
         self._patch_successes: Dict[str, int] = {}
 
-        # NEW: cache + per-task injection counters
-        self._intended_failure_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
-        self._task_op_injection_counts: Dict[Tuple[int, str], int] = {}
+        # Cache key includes payment identity so switching cards can change injected outcomes.
+        self._intended_failure_cache: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        self._task_op_injection_counts: Dict[Tuple[int, str, str], int] = {}
 
         self.policy_flip_points = self._get_event_points('policy_flips')
         self.schema_change_points = self._get_event_points('schema_changes')
@@ -199,7 +198,6 @@ class FailureInjector:
                 "operator": "ConfirmBooking", "error_type": "PreconditionUnmet",
                 "message": "Cannot confirm booking with conflicting refund policies.", "category": "constraint"
             },
-            # ✅ FINAL FIX: Added the missing definition for 'invalid_payment'
             "invalid_payment": {"operator": "BookHotel", "error_type": "PreconditionUnmet",
                                 "message": "Payment method is invalid or expired.",
                                 "policy_ref": "PAY-401", "category": "logical"}
@@ -211,6 +209,12 @@ class FailureInjector:
         if count == 0:
             return []
         return [int(i * self.horizon / (count + 1)) for i in range(1, count + 1)]
+
+    def _payment_key(self, params: Optional[Dict], state: Optional[Any]) -> str:
+        payment = params.get("payment") if isinstance(params, dict) else None
+        if payment is None and state and hasattr(state, "get"):
+            payment = state.get("payment_method")
+        return str(payment) if payment is not None else ""
 
     def _is_corporate_card(self, params: Optional[Dict], state: Optional[Any]) -> bool:
         payment = params.get("payment") if isinstance(params, dict) else None
@@ -253,13 +257,16 @@ class FailureInjector:
         if intended_failure.get("policy_ref") == "H-23":
             return self._is_corporate_card(params, state) and self._in_blackout(state)
 
-        # NEW: for ToolError timeouts, inject at most once per task/operator to allow recovery/retry
+        # Payment invalidation should only target corporate cards so switching payment can recover.
+        if intended_failure.get("policy_ref") == "PAY-401":
+            return self._is_corporate_card(params, state)
+
+        # For ToolError timeouts, inject at most once per task/operator/payment to allow recovery/retry
         if self._is_recoverable_timeout(intended_failure):
-            key = (int(task_id), str(op_name))
+            key = (int(task_id), str(op_name), self._payment_key(params, state))
             count = self._task_op_injection_counts.get(key, 0)
             if count >= 1:
                 return False
-            # record that we are about to inject
             self._task_op_injection_counts[key] = count + 1
             return True
 
@@ -267,8 +274,8 @@ class FailureInjector:
 
     def get_failure_details(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                             state: Optional[Any] = None) -> Dict:
-        # NEW: cache intended failure per (task_id, op_name) to keep behavior consistent
-        cache_key = (int(task_id), str(op_name))
+        payment_key = self._payment_key(params, state)
+        cache_key = (int(task_id), str(op_name), payment_key)
         if cache_key in self._intended_failure_cache:
             cached = self._intended_failure_cache[cache_key].copy()
             cached["operator"] = op_name
@@ -308,7 +315,6 @@ class FailureInjector:
             "trace_id": f"T-{task_id:04d}"
         }
 
-        # store in cache (store base; operator is overridden on read anyway)
         self._intended_failure_cache[cache_key] = out.copy()
         return out
 

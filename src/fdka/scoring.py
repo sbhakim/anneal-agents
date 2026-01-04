@@ -12,7 +12,7 @@ UPDATED: Implements real scoring functions from Equations 7-12:
 
 MANUSCRIPT ENHANCEMENT: Added detailed scoring breakdown output for validation.
 """
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List
 import math
 import json
 import numpy as np
@@ -56,18 +56,47 @@ class Scorer:
         self.dual_step_size = 0.01
         self.last_risk_score = 0.0  # Store last risk for canary fallback
 
-        # ✅ ADDED: Track scoring history for manuscript analysis
         self.scoring_history = []
+        self._min_samples_for_filter = 5
+        self._low_data_max_risk = 0.6
+        self._low_data_allowed_actions = {"ADD_PRECONDITION"}
 
         print(f"SCORER: Initialized with weights -> {self.weights}")
         print(f"SCORER: LLM provider={self.llm_provider}, SAT solver={'Z3' if self.use_z3 else 'Symbolic Heuristic'}")
+
+    def _allow_low_data_patch(self, patch: Dict[str, Any], total_traces: int, reason: str) -> bool:
+        """Low-data policy: allow only monotonic-safe edits, otherwise reject and rely on local repair."""
+        action = str(patch.get("action", ""))
+        risk = self._score_risk(patch)
+
+        if action not in self._low_data_allowed_actions:
+            print(
+                f"  ❌ Probabilistic Filter (low-data): {reason}. "
+                f"Only allowing {sorted(self._low_data_allowed_actions)} during cold start; got '{action}'."
+            )
+            return False
+
+        if risk > self._low_data_max_risk:
+            print(
+                f"  ❌ Probabilistic Filter (low-data): {reason}. "
+                f"Risk {risk:.3f} exceeds low-data cap {self._low_data_max_risk:.3f}."
+            )
+            return False
+
+        print(
+            f"  ✅ Probabilistic Filter (low-data): {reason}. "
+            f"Allowing '{action}' with risk {risk:.3f} (traces={total_traces}). Canary will still gate."
+        )
+        return True
 
     def probabilistic_pre_filter(self, patch: Dict[str, Any], trace: List) -> bool:
         """
         Implements the formal acceptance criterion from Section 8.3.5.
         A patch is only viable if it can provably reduce the error rate.
 
-        **UPDATED**: Added minimum sample size requirement to avoid cold-start paradox.
+        MINIMUM ROBUSTNESS UPDATE:
+        - Removes unconditional cold-start allowance.
+        - In low-data regimes, allows only monotonic-safe, low-risk edits.
         """
         if not self.experience_pool:
             print("  ⚠️ Probabilistic Filter: No experience pool, skipping check.")
@@ -78,47 +107,46 @@ class Scorer:
         if not operator_name:
             return True
 
-        # **FIX**: Require minimum sample size before activating filter
         success_traces = self.experience_pool.get_success_traces(operator=operator_name)
         failure_traces = self.experience_pool.get_failure_traces(operator=operator_name)
         total_traces = len(success_traces) + len(failure_traces)
 
-        MIN_SAMPLES = 5  # Need at least 5 traces for statistical validity
+        if total_traces < self._min_samples_for_filter:
+            return self._allow_low_data_patch(
+                patch,
+                total_traces=total_traces,
+                reason=f"only {total_traces} traces (need {self._min_samples_for_filter}+)"
+            )
 
-        if total_traces < MIN_SAMPLES:
-            print(
-                f"  ℹ️ Probabilistic Filter: Only {total_traces} traces (need {MIN_SAMPLES}). Allowing patch (cold start).")
-            return True  # Allow patches during cold start
-
-        # 1. Estimate error rate among executions the patch would block
         blocked_traces = self.experience_pool.retrieve_similar(failure_info, k=self.k_similar)
         if not blocked_traces:
-            return True
+            # No evidence either way: fall back to low-data policy (even though total_traces is sufficient).
+            return self._allow_low_data_patch(
+                patch,
+                total_traces=total_traces,
+                reason="no similar traces retrieved for counterfactual estimate"
+            )
 
         error_count = sum(1 for t in blocked_traces if not t.get('success'))
         p_err_hat = error_count / len(blocked_traces) if blocked_traces else 0.0
 
-        # 2. Estimate the operator's baseline error rate (residual)
         baseline_residual = len(failure_traces) / total_traces if total_traces else 0.2
-
-        # 3. Check the necessary and sufficient condition for improvement
         improves = p_err_hat > baseline_residual
 
         print(
-            f"  🔎 Probabilistic Filter: Est. Blocked Error Rate={p_err_hat:.2f}, Baseline Residual={baseline_residual:.2f}. {'PASS' if improves else 'FAIL'}")
+            f"  🔎 Probabilistic Filter: Est. Blocked Error Rate={p_err_hat:.2f}, "
+            f"Baseline Residual={baseline_residual:.2f}. {'PASS' if improves else 'FAIL'}"
+        )
         return improves
 
     def score(self, patch: Dict[str, Any], trace: List = None) -> Dict[str, float]:
         """
         Calculates the aggregate score and returns all score components.
-
-        ✅ UPDATED: Enhanced output for manuscript validation of Equations 7-12.
         """
         print("\n" + "=" * 70)
         print("  📊 MULTI-DIMENSIONAL SCORING (Section VIII-C)")
         print("=" * 70)
 
-        # Patch identification
         patch_id = patch.get('id', 'unknown')
         operator = patch.get('operator', 'unknown')
         action = patch.get('action', 'unknown')
@@ -128,14 +156,12 @@ class Scorer:
         print(f"  Details: {patch.get('details', 'N/A')[:60]}...")
         print()
 
-        # Run the probabilistic pre-filter first
         if not self.probabilistic_pre_filter(patch, trace):
             print("  ❌ REJECTED by probabilistic pre-filter (Section 8.3.5)")
-            print("     No provable improvement over baseline error rate.")
+            print("     No provable (or permitted low-data) improvement over baseline error rate.")
             print("=" * 70)
             return {"aggregate": 0.0, "plausibility": 0.0, "consistency": 0.0, "utility": 0.0, "risk": 1.0}
 
-        # ✅ Compute individual score components with detailed output
         print("  🔬 Computing Score Components:")
         print("  " + "-" * 66)
 
@@ -144,10 +170,9 @@ class Scorer:
         utility = self._score_utility(patch, trace)
         risk = self._score_risk(patch)
 
-        self.last_risk_score = risk  # Cache for canary runner
+        self.last_risk_score = risk
         budget_penalty = self._compute_budget_penalty()
 
-        # ✅ Show weighted contribution calculation (Equation 7)
         print("\n  📐 Aggregate Score Calculation (Eq. 7):")
         print("  " + "-" * 66)
         print(
@@ -159,13 +184,12 @@ class Scorer:
         print(f"     Risk:         -{risk:.3f} × {self.weights['risk']:.2f} = {-risk * self.weights['risk']:.3f}")
         print(f"     Budget:       -penalty = -{budget_penalty:.3f}")
 
-        # Calculate aggregate
         agg_score = (
-                self.weights['plausibility'] * plausibility +
-                self.weights['consistency'] * consistency +
-                self.weights['utility'] * utility -
-                self.weights['risk'] * risk -
-                budget_penalty
+            self.weights['plausibility'] * plausibility +
+            self.weights['consistency'] * consistency +
+            self.weights['utility'] * utility -
+            self.weights['risk'] * risk -
+            budget_penalty
         )
         agg_score = max(0.0, min(1.0, agg_score))
 
@@ -173,10 +197,8 @@ class Scorer:
         print(f"     → AGGREGATE SCORE: {agg_score:.3f}")
         print("=" * 70)
 
-        # Update dual variables for budget management
         self._update_dual_variables()
 
-        # ✅ ADDED: Store scoring record for analysis
         scoring_record = {
             "patch_id": patch_id,
             "operator": operator,
@@ -193,7 +215,6 @@ class Scorer:
         }
         self.scoring_history.append(scoring_record)
 
-        # Return a dictionary with all scores for downstream use (e.g., canary test)
         return {
             "aggregate": agg_score,
             "plausibility": plausibility,
@@ -204,16 +225,10 @@ class Scorer:
         }
 
     def _score_plausibility(self, patch: Dict[str, Any], trace: List) -> float:
-        """
-        Estimates plausibility via LLM confidence (Equation 9).
-        ✅ UPDATED: Enhanced output showing reasoning.
-        """
         print("  [1/4] Plausibility (Eq. 9 - LLM Confidence):")
 
-        # A full implementation would make an LLM call to get log-probabilities
         score = self._mock_plausibility(patch, trace)
 
-        # Extract context for explanation
         failure_info = self._extract_failure_info(trace)
         error_type = failure_info.get('error', 'Unknown')
         action = patch.get('action', 'Unknown')
@@ -225,7 +240,6 @@ class Scorer:
         return score
 
     def _mock_plausibility(self, patch: Dict[str, Any], trace: List) -> float:
-        """A more realistic mock that bases plausibility on the failure context."""
         failure_info = self._extract_failure_info(trace)
         error_type = failure_info.get('error', '')
 
@@ -248,10 +262,6 @@ class Scorer:
         return 1.0 / (1.0 + math.exp(-x))
 
     def _score_consistency(self, patch: Dict[str, Any]) -> float:
-        """
-        Checks consistency via SAT solving (Equation 10).
-        ✅ UPDATED: Enhanced output showing verification method.
-        """
         print("  [2/4] Consistency (Eq. 10 - SAT/Symbolic Check):")
         print(f"        Solver: {'Z3 (SMT)' if self.use_z3 else 'Symbolic Heuristic'}")
 
@@ -265,10 +275,7 @@ class Scorer:
         return score
 
     def _z3_consistency_check(self, patch: Dict[str, Any]) -> float:
-        """Placeholder for a real consistency check using the Z3 SAT/SMT solver."""
         try:
-            # import z3
-            # ... (Z3 logic would go here) ...
             details = patch.get('details', '')
             if "Contradiction" in details:
                 print("        ✗ Z3: Detected contradiction")
@@ -284,7 +291,6 @@ class Scorer:
             return self._symbolic_consistency_check(patch)
 
     def _symbolic_consistency_check(self, patch: Dict[str, Any]) -> float:
-        """Simplified symbolic consistency checking without Z3."""
         action = patch.get('action', '')
         details = patch.get('details', '')
         contradictions = [('True', 'False'), ('Always', 'Never')]
@@ -310,10 +316,6 @@ class Scorer:
         return 1.0
 
     def _score_utility(self, patch: Dict[str, Any], trace: List) -> float:
-        """
-        Estimates utility via counterfactual replay (Equation 11).
-        ✅ UPDATED: Enhanced output showing retrieval and prevention details.
-        """
         print("  [3/4] Utility (Eq. 11 - Counterfactual Replay):")
 
         if not self.experience_pool:
@@ -326,14 +328,12 @@ class Scorer:
             failure_info = self._extract_failure_info(trace)
             similar_traces = self.experience_pool.retrieve_similar(failure_info, k=self.k_similar)
 
-            # **FIX**: Use current trace as "similar" if pool empty (cold start)
             if not similar_traces:
                 print("        ℹ️ Cold start (no history)")
                 print("        Assuming patch prevents current failure")
                 print("        Estimated: 0.800 (optimistic first-fix)")
                 return 0.8
 
-            # ✅ ADDED: Detailed counterfactual analysis output
             prevented_count = sum(1 for s in similar_traces if self._would_prevent_failure(patch, s))
             utility = prevented_count / len(similar_traces)
 
@@ -357,7 +357,6 @@ class Scorer:
 
     def _would_prevent_failure(self, patch: Dict, trace_record: Dict) -> bool:
         patch_op = patch.get('operator')
-        # Robustly get operator name from nested metadata
         trace_op = trace_record.get('metadata', {}).get('operator')
 
         if trace_record.get('success') or patch_op != trace_op:
@@ -384,10 +383,6 @@ class Scorer:
             return 0.5
 
     def _score_risk(self, patch: Dict[str, Any]) -> float:
-        """
-        Quantifies potential harm (Equation 12).
-        ✅ UPDATED: Enhanced output showing classifier and scope analysis.
-        """
         print("  [4/4] Risk (Eq. 12 - Value Classifier + Scope):")
 
         q_val = self._value_violation_classifier(patch)
@@ -402,7 +397,6 @@ class Scorer:
         return risk
 
     def _value_violation_classifier(self, patch: Dict[str, Any]) -> float:
-        """A lightweight classifier for value-violation probability (q_val)."""
         action, details = patch.get('action', ''), patch.get('details', '')
         risk_by_action = {'ADD_PRECONDITION': 0.1, 'REFINE_EFFECT': 0.3, 'UPDATE_TOOL_SCHEMA': 0.4}
         base_risk = risk_by_action.get(action, 0.5)
@@ -411,50 +405,43 @@ class Scorer:
         return min(1.0, base_risk + sensitivity_penalty)
 
     def _compute_scope(self, patch: Dict[str, Any]) -> float:
-        """Estimates the 'blast radius' of a patch."""
         action, details = patch.get('action', ''), patch.get('details', '')
-        if action == 'UPDATE_TOOL_SCHEMA': return 0.5
-        if any(p in details for p in ['Valid', 'Check', 'Safe']): return 0.2
-        if any(m in details for m in ['BlockedCard', patch.get('operator')]): return 0.05
+        if action == 'UPDATE_TOOL_SCHEMA':
+            return 0.5
+        if any(p in details for p in ['Valid', 'Check', 'Safe']):
+            return 0.2
+        if any(m in details for m in ['BlockedCard', patch.get('operator')]):
+            return 0.05
         return 0.01
 
     def _compute_budget_penalty(self) -> float:
-        """Computes penalty for cumulative resource costs this episode."""
         penalty = sum(self.dual_vars[r] * self.episode_costs[r] for r in ['edge', 'step', 'tok'])
         return min(0.5, penalty)
 
     def _update_dual_variables(self) -> None:
-        """Adjusts Lagrangian dual variables to enforce soft budget targets."""
         for r in ['edge', 'step', 'tok']:
             self.dual_vars[r] = max(0.0, self.dual_vars[r] + self.dual_step_size * (
-                    self.episode_costs[r] - self.budget_targets[r]))
+                self.episode_costs[r] - self.budget_targets[r]
+            ))
 
     def set_experience_pool(self, experience_pool):
         self.experience_pool = experience_pool
         print(f"SCORER: Experience pool updated")
 
-    # ✅ ADDED: Method to export scoring history for manuscript analysis
     def get_scoring_summary(self) -> Dict[str, Any]:
-        """
-        Get summary statistics of all scoring operations.
-        Useful for manuscript data analysis.
-        """
         if not self.scoring_history:
             return {}
 
         summary = {
             "total_patches_scored": len(self.scoring_history),
             "average_scores": {
-                "plausibility": sum(r["scores"]["plausibility"] for r in self.scoring_history) / len(
-                    self.scoring_history),
-                "consistency": sum(r["scores"]["consistency"] for r in self.scoring_history) / len(
-                    self.scoring_history),
+                "plausibility": sum(r["scores"]["plausibility"] for r in self.scoring_history) / len(self.scoring_history),
+                "consistency": sum(r["scores"]["consistency"] for r in self.scoring_history) / len(self.scoring_history),
                 "utility": sum(r["scores"]["utility"] for r in self.scoring_history) / len(self.scoring_history),
                 "risk": sum(r["scores"]["risk"] for r in self.scoring_history) / len(self.scoring_history),
                 "aggregate": sum(r["scores"]["aggregate"] for r in self.scoring_history) / len(self.scoring_history),
             },
-            "acceptance_rate": sum(1 for r in self.scoring_history if r["scores"]["aggregate"] >= 0.5) / len(
-                self.scoring_history),
+            "acceptance_rate": sum(1 for r in self.scoring_history if r["scores"]["aggregate"] >= 0.5) / len(self.scoring_history),
             "history": self.scoring_history
         }
 

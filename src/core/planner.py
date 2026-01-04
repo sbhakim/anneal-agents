@@ -88,16 +88,21 @@ class Planner:
 
         for i, step in enumerate(failed_plan):
             if step["operator"].name == "BookHotel":
-                if "CorporateCard" in step["params"].get("payment", ""):
+                current_payment = str((step.get("params") or {}).get("payment", "") or "")
+                if "CorporateCard" in current_payment:
                     print("PLANNER: Detected failure with Corporate Card. Attempting to switch payment method.")
 
                     new_plan = copy.deepcopy(failed_plan)
 
-                    # Prefer "new corporate" if the instruction implies it; otherwise fallback to personal.
+                    # Prefer "new corporate" if requested, but avoid returning the same payment again.
                     if "new corporate" in instruction.lower():
                         alternative_payment = "CorporateCard:CC-NEW"
+                        if "CC-NEW" in current_payment:
+                            alternative_payment = "PersonalCard:PC-1134"
                     else:
                         alternative_payment = "PersonalCard:PC-1134"
+                        if "PersonalCard" in current_payment:
+                            alternative_payment = "CorporateCard:CC-NEW"
 
                     new_plan[i]["params"]["payment"] = alternative_payment
                     print(f"PLANNER: New plan generated with payment method: {alternative_payment}")
