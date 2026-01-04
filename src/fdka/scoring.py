@@ -64,12 +64,48 @@ class Scorer:
         print(f"SCORER: Initialized with weights -> {self.weights}")
         print(f"SCORER: LLM provider={self.llm_provider}, SAT solver={'Z3' if self.use_z3 else 'Symbolic Heuristic'}")
 
-    def _allow_low_data_patch(self, patch: Dict[str, Any], total_traces: int, reason: str) -> bool:
-        """Low-data policy: allow only monotonic-safe edits, otherwise reject and rely on local repair."""
+    def _is_timeout_retry_effect(self, patch: Dict[str, Any], trace: List) -> bool:
+        """
+        Narrow cold-start exception:
+        Allow REFINE_EFFECT only for ToolError timeout-style failures and only when
+        the patch details clearly encode a retry/timeout-guard pattern.
+        """
+        action = str(patch.get("action", ""))
+        if action != "REFINE_EFFECT":
+            return False
+
+        failure_info = self._extract_failure_info(trace)
+        err = str(failure_info.get("error", ""))
+
+        # Accept only tool/runtime transient class (avoid policy/semantic edits)
+        if "ToolError" not in err and "RuntimeError" not in err:
+            return False
+
+        details = str(patch.get("details", "")).lower()
+
+        # Must look like a retry/timeout guard, not a general effect rewrite.
+        timeout_markers = (
+            "timeout",
+            "apitimeoutretry",
+            "retryontimeout",
+            "retry_on_timeout",
+            "api-503",
+            "503",
+            "networkavailable",
+            "retry(",
+            "backoff",
+        )
+        return any(m in details for m in timeout_markers)
+
+    def _allow_low_data_patch(self, patch: Dict[str, Any], total_traces: int, reason: str, trace: List = None) -> bool:
+        """Low-data policy: allow only monotonic-safe edits, plus a narrow timeout-retry exception."""
         action = str(patch.get("action", ""))
         risk = self._score_risk(patch)
 
-        if action not in self._low_data_allowed_actions:
+        # Minimal, surgical exception: allow REFINE_EFFECT only for timeout-retry ToolError recovery.
+        timeout_retry_ok = bool(trace) and self._is_timeout_retry_effect(patch, trace)
+
+        if action not in self._low_data_allowed_actions and not timeout_retry_ok:
             print(
                 f"  ❌ Probabilistic Filter (low-data): {reason}. "
                 f"Only allowing {sorted(self._low_data_allowed_actions)} during cold start; got '{action}'."
@@ -83,9 +119,13 @@ class Scorer:
             )
             return False
 
+        allowed_action_label = action
+        if timeout_retry_ok and action not in self._low_data_allowed_actions:
+            allowed_action_label = f"{action} (timeout-retry exception)"
+
         print(
             f"  ✅ Probabilistic Filter (low-data): {reason}. "
-            f"Allowing '{action}' with risk {risk:.3f} (traces={total_traces}). Canary will still gate."
+            f"Allowing '{allowed_action_label}' with risk {risk:.3f} (traces={total_traces}). Canary will still gate."
         )
         return True
 
@@ -115,7 +155,8 @@ class Scorer:
             return self._allow_low_data_patch(
                 patch,
                 total_traces=total_traces,
-                reason=f"only {total_traces} traces (need {self._min_samples_for_filter}+)"
+                reason=f"only {total_traces} traces (need {self._min_samples_for_filter}+)",
+                trace=trace
             )
 
         blocked_traces = self.experience_pool.retrieve_similar(failure_info, k=self.k_similar)
@@ -124,7 +165,8 @@ class Scorer:
             return self._allow_low_data_patch(
                 patch,
                 total_traces=total_traces,
-                reason="no similar traces retrieved for counterfactual estimate"
+                reason="no similar traces retrieved for counterfactual estimate",
+                trace=trace
             )
 
         error_count = sum(1 for t in blocked_traces if not t.get('success'))

@@ -93,16 +93,6 @@ class CanaryRunner:
             print("  No examples and no suite -> conservative heuristic-only mode")
             return self._heuristic_only_decision(patch, context)
 
-        # We have at least some examples.
-        low_power = len(examples) < self.cfg.min_tests_for_stats
-        mode = "low_power" if low_power else "strict"
-
-        if low_power:
-            print(
-                f"  LOW-POWER canary: only {len(examples)} examples "
-                f"(need {self.cfg.min_tests_for_stats}+ for statistical test)"
-            )
-
         # Always include deterministic suite inputs if provided, because it strengthens coverage.
         # Keep it bounded by sample_size.
         num_from_examples = min(self.cfg.sample_size, len(examples))
@@ -113,6 +103,17 @@ class CanaryRunner:
             remaining = max(0, self.cfg.sample_size - len(combined))
             if remaining > 0:
                 combined.extend(self._sample_examples(suite, min(remaining, len(suite))))
+
+        # Statistical power is determined by the number of tests actually executed,
+        # not by whether they came from examples vs a deterministic suite.
+        low_power = len(combined) < self.cfg.min_tests_for_stats
+        mode = "low_power" if low_power else "strict"
+
+        if low_power:
+            print(
+                f"  LOW-POWER canary: only {len(combined)} total inputs "
+                f"(need {self.cfg.min_tests_for_stats}+ for statistical test)"
+            )
 
         print(f"  Testing with: {len(combined)} inputs (examples+suite)")
         return self._run_simulations(

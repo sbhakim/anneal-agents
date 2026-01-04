@@ -20,6 +20,10 @@ MINIMUM RETRY-SEMANTICS FIX (2026-01):
   the operator contains a learned timeout-retry effect (e.g., ApiTimeoutRetry).
   This prevents "retry" hooks from firing after a clean success and makes the
   recovery behavior observable under fault injection.
+
+MINIMUM METRICS COMPATIBILITY FIX (2026-01):
+- Ensure every failure path emits a trace entry with {error|error_type, operator}.
+  This keeps event-based metrics reliable even when tasks ultimately succeed.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import time
@@ -195,7 +199,7 @@ class Executor:
                     continue
                 state = eff(state, params)
             except Exception:
-                # Preserve baseline behavior: a bad effect should bubble as failure.
+                # Preserve baseline behavior: a bad effect should surface as an execution failure.
                 raise
         return state
 
@@ -247,7 +251,7 @@ class Executor:
         # 2. Act based on the chosen pathway
         if pathway == "DEFER":
             print("EXECUTOR: ⏸️ Execution deferred due to budget constraints.")
-            trace.append({"error": "Deferred", "reason": "Budget exceeded"})
+            trace.append({"error": "Deferred", "operator": "SYSTEM", "reason": "Budget exceeded"})
             return trace, False, "Deferred"
 
         if pathway == "S2":
@@ -279,6 +283,7 @@ class Executor:
                 err_cls = error_info.get("error") or error_info.get("error_type") or "ToolError"
                 injected_error_info = dict(error_info)
                 injected_error_info["error"] = err_cls
+                injected_error_info.setdefault("operator", op.name)
 
                 if err_cls != "ToolError":
                     self._apply_constraint_injection_to_state(injected_error_info, params, state)
@@ -311,14 +316,36 @@ class Executor:
                         print(f"EXECUTOR: ✅ Recovery retry succeeded for {op.name}.")
                         continue
                     except Exception as e:
-                        trace.append({"recovery_failed": True, "exception": str(e)[:120], "operator": op.name})
+                        trace.append({
+                            "error": "ToolError",
+                            "operator": op.name,
+                            "message": "Recovery retry failed",
+                            "exception": str(e)[:120]
+                        })
                         print(f"EXECUTOR: ❌ Recovery retry failed for {op.name}.")
                         return trace, False, "ToolError"
 
+                trace.append({
+                    "error": "ToolError",
+                    "operator": op.name,
+                    "message": injected_error_info.get("message", "Injected tool error"),
+                    "policy_ref": injected_error_info.get("policy_ref"),
+                })
                 return trace, False, "ToolError"
 
             # ---- Apply Effects on Success ----
-            state = self._apply_effects(op, state, params, recovery=False)
+            try:
+                state = self._apply_effects(op, state, params, recovery=False)
+            except Exception as e:
+                trace.append({
+                    "error": "ToolError",
+                    "operator": op.name,
+                    "message": "Exception during effect application",
+                    "exception": str(e)[:120],
+                })
+                print(f"EXECUTOR: ❌ Exception during {op.name} effects.")
+                return trace, False, "ToolError"
+
             trace.append({"step": op.name, "state_after": state.to_dict()})
             print(f"EXECUTOR: ✅ Step {op.name} successful.")
 

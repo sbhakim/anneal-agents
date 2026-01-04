@@ -12,6 +12,18 @@ UPDATED:
 - NEW: to_governance_dict() helper for compact governance export
 - NEW: to_patches_frame() helper for tidy patch-score analysis
 - CHANGE: export_efficiency_csv() writes an empty CSV with headers when no data
+
+MINIMAL UPDATE (ACM defensibility):
+- Track "failure events observed" even when the final task succeeds.
+  This prevents summaries like "No failures detected" when the system actually
+  encountered injected errors but recovered.
+- Track "recovery tasks" (success with >=1 observed failure event).
+- Extend per-failure analysis + Table 3 CSV with Observed_Events.
+
+MINIMUM FIX (correctness):
+- Treat both 'error' and 'error_type' as failure events (traces are not uniform).
+- Normalize operator/error into stable strings for indexing/reporting.
+- Track per-failure-class event timelines so TTA/RFR can be computed even when tasks succeed.
 """
 import json
 from typing import Dict, Any, List, Optional
@@ -47,10 +59,16 @@ class MetricsCollector:
         self.success_count = 0
         self.failure_count = 0
 
-        # Failure tracking for RFR and TTA
+        # Failure tracking for RFR and TTA (terminal task failures)
         self.failure_classes: Dict[str, List[int]] = defaultdict(list)  # failure_type -> [task_ids]
         self.first_failure: Dict[str, int] = {}  # failure_type -> first task_id
         self.adapted_at: Dict[str, int] = {}  # failure_type -> task_id when RFR < 5%
+
+        # Failure-event tracking (observed failures, recovered or not)
+        self.failure_events_observed: int = 0
+        self.failure_event_counts: Dict[str, int] = defaultdict(int)  # failure_key -> count
+        self.failure_event_classes: Dict[str, List[int]] = defaultdict(list)  # failure_key -> [task_ids]
+        self.recovery_tasks: int = 0  # tasks that succeeded after >=1 observed failure event
 
         # Patch tracking
         self.patches: List[Dict] = []
@@ -102,20 +120,38 @@ class MetricsCollector:
     def record_task(self, task_id: int, success: bool, trace: List[Dict]) -> None:
         """Record the outcome of a task execution."""
         self.task_count += 1
+
+        # Count observed failure events in the trace (even if final task succeeds).
+        # Trace formats vary; treat either 'error' or 'error_type' as an observed failure event.
+        observed_failure_keys = self._extract_all_failure_keys(trace)
+        if observed_failure_keys:
+            self.failure_events_observed += len(observed_failure_keys)
+            for fk in observed_failure_keys:
+                self.failure_event_counts[fk] += 1
+                self.failure_event_classes[fk].append(task_id)
+                if fk not in self.first_failure:
+                    self.first_failure[fk] = task_id
+                    print(f"METRICS: First observed failure event '{fk}' at task {task_id}")
+
         task_record = {
             "task_id": task_id,
             "success": success,
             "timestamp": time.time(),
-            "trace_length": len(trace)
+            "trace_length": len(trace),
+            "observed_failure_events": len(observed_failure_keys)
         }
 
         if success:
             self.success_count += 1
+            # Recovery task = succeeded but encountered at least one failure event.
+            if observed_failure_keys:
+                self.recovery_tasks += 1
+                task_record["recovered"] = True
         else:
             self.failure_count += 1
             failure_info = self._extract_failure_info(trace)
             if failure_info:
-                failure_key = f"{failure_info.get('operator', 'UNKNOWN')}:{failure_info.get('error', 'UNKNOWN')}"
+                failure_key = f"{self._norm_operator(failure_info.get('operator', 'UNKNOWN'))}:{self._norm_error(failure_info.get('error', 'UNKNOWN'))}"
                 self.failure_classes[failure_key].append(task_id)
 
                 if failure_key not in self.first_failure:
@@ -294,26 +330,20 @@ class MetricsCollector:
         """
         Check if the system has adapted to a failure class.
 
-        Args:
-            failure_key: The failure type identifier
-            window_size: Size of the sliding window for RFR calculation
-
-        Returns:
-            True if adapted (RFR < 5%)
+        Adaptation is defined as RFR < 5% in a recent window.
+        For recovered runs, we measure RFR on observed failure-events, not just terminal failures.
         """
         if window_size is None:
             window_size = min(20, max(10, self.task_count // 2))
 
-        if failure_key not in self.failure_classes:
+        # Prefer event timelines (works even when tasks succeed); fall back to terminal failures.
+        classes = self.failure_event_classes if self.failure_event_classes else self.failure_classes
+        if failure_key not in classes:
             return False
 
         recent_task_start = max(0, self.task_count - window_size)
-        recent_failures = [
-            fid for fid in self.failure_classes[failure_key]
-            if fid >= recent_task_start
-        ]
-
-        rfr = len(recent_failures) / window_size if window_size > 0 else 0
+        recent_failures = [tid for tid in classes[failure_key] if tid >= recent_task_start]
+        rfr = len(recent_failures) / window_size if window_size > 0 else 0.0
 
         if rfr < 0.05 and failure_key not in self.adapted_at:
             self.adapted_at[failure_key] = self.task_count
@@ -323,7 +353,7 @@ class MetricsCollector:
         return rfr < 0.05
 
     def calculate_tta(self) -> Dict[str, Optional[float]]:
-        """Calculate Time-to-Adapt for each failure class."""
+        """Calculate Time-to-Adapt for each failure class (based on first observed event)."""
         tta_results = {}
         for failure_key, first_fail in self.first_failure.items():
             if failure_key in self.adapted_at:
@@ -333,12 +363,19 @@ class MetricsCollector:
         return tta_results
 
     def calculate_rfr(self, window_size: int = 100) -> float:
-        """Calculate overall Repeat Failure Rate."""
+        """
+        Calculate overall Repeat Failure Rate.
+
+        In recovered runs, terminal failures can be zero. For paper-facing reporting,
+        this computes repeat failures from observed failure-events when available.
+        """
         if self.task_count == 0:
             return 0.0
 
+        classes = self.failure_event_classes if self.failure_event_classes else self.failure_classes
+
         repeat_failures = sum(
-            len(ft) - 1 for ft in self.failure_classes.values()
+            len(ft) - 1 for ft in classes.values()
             if len(ft) > 1
         )
 
@@ -375,13 +412,20 @@ class MetricsCollector:
         """
         Detailed breakdown by failure class.
 
-        Returns:
-            Dictionary mapping failure_key to analysis metrics
+        Notes:
+        - "total_instances" = terminal failures (task ended in failure)
+        - "observed_events" = failure events seen in traces (may be recovered)
+        - "final_rfr" uses observed events if available (more meaningful for recovered runs).
         """
-        analysis = {}
+        analysis: Dict[str, Dict[str, Any]] = {}
 
-        for failure_key, fail_tasks in self.failure_classes.items():
+        # Union of terminal failure classes and observed failure-event classes.
+        all_keys = set(self.failure_classes.keys()) | set(self.failure_event_counts.keys()) | set(self.failure_event_classes.keys())
+
+        for failure_key in sorted(all_keys):
             operator_name = failure_key.split(':')[0]
+            fail_tasks_terminal = self.failure_classes.get(failure_key, [])
+            fail_tasks_observed = self.failure_event_classes.get(failure_key, [])
 
             # Get patches for this operator
             operator_patches = [
@@ -389,19 +433,20 @@ class MetricsCollector:
                 if p.get('operator') == operator_name
             ]
 
-            # Calculate final RFR (last 20 tasks)
+            # Final RFR in last 20 tasks (prefer observed events)
             recent_start = max(0, self.task_count - 20)
-            recent_failures = [t for t in fail_tasks if t >= recent_start]
+            recent_failures = [t for t in (fail_tasks_observed or fail_tasks_terminal) if t >= recent_start]
             final_rfr = len(recent_failures) / 20.0
 
-            # Calculate TTA
+            # TTA keyed off first observed event
             tta = None
             if failure_key in self.adapted_at:
                 tta = self.adapted_at[failure_key] - self.first_failure.get(failure_key, 0)
 
             analysis[failure_key] = {
                 "first_occurrence": self.first_failure.get(failure_key, -1),
-                "total_instances": len(fail_tasks),
+                "total_instances": len(fail_tasks_terminal),
+                "observed_events": int(self.failure_event_counts.get(failure_key, 0)),
                 "adapted_at": self.adapted_at.get(failure_key),
                 "tta": tta,
                 "patches_proposed": len(operator_patches),
@@ -424,6 +469,11 @@ class MetricsCollector:
             "successes": self.success_count,
             "failures": self.failure_count,
             "success_rate": self.get_success_rate(),
+
+            # Observed failure events (includes recovered events)
+            "failure_events_observed": self.failure_events_observed,
+            "recovery_tasks": self.recovery_tasks,
+
             "patches_proposed": self.patch_count,
             "patches_accepted": self.accepted_patches,
             "patches_rejected": self.rejected_patches,
@@ -435,6 +485,7 @@ class MetricsCollector:
             "rollback_precision": self.calculate_rollback_precision(),
             "human_interventions": self.human_interventions,
             "failure_classes": {k: len(v) for k, v in self.failure_classes.items()},
+            "failure_event_counts": dict(self.failure_event_counts),
             "elapsed_time_seconds": elapsed_time,
             "tasks_per_second": self.task_count / elapsed_time if elapsed_time > 0 else 0,
             "governance_stats": self.get_governance_stats(),
@@ -458,6 +509,10 @@ class MetricsCollector:
         print(f"  Failures: {summary['failures']}")
         print(f"  Success Rate: {summary['success_rate']:.1%}")
 
+        print(f"\n[Observed Failures & Recoveries]")
+        print(f"  Failure Events Observed: {summary['failure_events_observed']}")
+        print(f"  Recovery Tasks: {summary['recovery_tasks']}")
+
         print(f"\n[Patch Statistics]")
         print(f"  Patches Proposed: {summary['patches_proposed']}")
         print(f"  Patches Accepted: {summary['patches_accepted']}")
@@ -479,7 +534,10 @@ class MetricsCollector:
                 else:
                     print(f"  {k}: Not yet adapted")
         else:
-            print("  No failures detected")
+            if summary.get("failure_events_observed", 0) > 0:
+                print("  No terminal failures (failures were recovered during execution)")
+            else:
+                print("  No failures detected")
 
         gov_stats = summary['governance_stats']
         print(f"\n[Governance Statistics]")
@@ -536,7 +594,8 @@ class MetricsCollector:
             # Create empty CSV with headers
             pd.DataFrame(columns=[
                 'Failure_Class', 'Operator', 'Error_Type', 'First_Task',
-                'Total_Instances', 'TTA', 'Patches_Proposed', 'Patches_Accepted', 'Final_RFR'
+                'Observed_Events', 'Total_Instances', 'TTA',
+                'Patches_Proposed', 'Patches_Accepted', 'Final_RFR'
             ]).to_csv(filepath, index=False)
             print(f"   ⚠️ Table 3: No failure data")
             return
@@ -548,6 +607,7 @@ class MetricsCollector:
                 'Operator': metrics['operator'],
                 'Error_Type': metrics['error_type'],
                 'First_Task': metrics['first_occurrence'],
+                'Observed_Events': metrics.get('observed_events', 0),
                 'Total_Instances': metrics['total_instances'],
                 'TTA': f"{metrics['tta']}" if metrics['tta'] is not None else "∞",
                 'Patches_Proposed': metrics['patches_proposed'],
@@ -666,11 +726,65 @@ class MetricsCollector:
         return pd.DataFrame(rows)
 
     def _extract_failure_info(self, trace: List[Dict]) -> Optional[Dict]:
-        """Extract failure information from execution trace."""
+        """Extract terminal failure information from execution trace."""
         for entry in reversed(trace or []):
-            if isinstance(entry, dict) and "error" in entry:
-                return entry
+            if not isinstance(entry, dict):
+                continue
+            if "error" in entry or "error_type" in entry:
+                normalized = dict(entry)
+                if "error" not in normalized and "error_type" in normalized:
+                    normalized["error"] = normalized.get("error_type")
+                if "operator" in normalized:
+                    normalized["operator"] = self._norm_operator(normalized.get("operator"))
+                if "error" in normalized:
+                    normalized["error"] = self._norm_error(normalized.get("error"))
+                return normalized
         return None
+
+    def _extract_all_failure_keys(self, trace: List[Dict]) -> List[str]:
+        """
+        Extract all observed failure events from a trace.
+
+        Trace format is not uniform:
+        - some entries use 'error'
+        - some use 'error_type'
+        """
+        keys: List[str] = []
+        for entry in trace or []:
+            if not isinstance(entry, dict):
+                continue
+
+            if "error" in entry:
+                err = entry.get("error")
+            elif "error_type" in entry:
+                err = entry.get("error_type")
+            else:
+                continue
+
+            op = self._norm_operator(entry.get("operator", "UNKNOWN"))
+            er = self._norm_error(err)
+            keys.append(f"{op}:{er}")
+        return keys
+
+    def _norm_operator(self, op: Any) -> str:
+        if op is None:
+            return "UNKNOWN"
+        # Operator objects often have a `.name`
+        name = getattr(op, "name", None)
+        if name:
+            return str(name)
+        return str(op)
+
+    def _norm_error(self, err: Any) -> str:
+        if err is None:
+            return "UNKNOWN"
+        if isinstance(err, dict):
+            # Common shapes: {"type": "..."} or {"name": "..."} or {"error": "..."}
+            for k in ("type", "name", "error", "error_type", "kind"):
+                if k in err and err[k]:
+                    return str(err[k])
+            return "UNKNOWN"
+        return str(err)
 
 
 # ========================================================================

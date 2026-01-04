@@ -1,5 +1,10 @@
 # SELFEVOLVE Configuration
-# Active LLM: local HuggingFace Transformers (Gemma-2). Other providers are kept as comments.
+# Domain: travel_planning
+# Notes:
+# - This file is intentionally verbose for reproducibility and reviewer traceability.
+# - Seeds and failure injection controls are pinned to make before/after comparisons fair.
+# - LLM provider blocks include local/offline Transformer options plus remote providers for parity.
+# - Some HF runtime keys may be ignored depending on the repo runner implementation.
 
 system:
   name: "SELFEVOLVE"
@@ -12,6 +17,7 @@ planner:
   timeout_ms: 300
 
 executor:
+  # Baseline retries are part of the runtime behavior; keep stable when comparing adaptation runs.
   max_retries: 2
   timeout_seconds: 30
   enable_verification: true
@@ -31,32 +37,44 @@ fdka:
     utility: 0.20
     risk: 0.10
 
-  threshold: 0.48       # acceptance gate threshold (score >= threshold)
+  threshold: 0.48       # patch accept if aggregate >= threshold
 
   propose_edit:
     # Provider options: "transformers", "openai", "deepseek", "mock"
     llm_provider: "transformers"
 
-    # ✅ Active local model
+    # -------------------------------------------------------------------------
+    # Local / offline Transformers (HF) model selection
+    # -------------------------------------------------------------------------
+    # Active local model (Gemma-2 Instruct).
     model: "google/gemma-2-9b-it"
 
-    # Generation knobs (note: in this repo max_tokens maps to max_new_tokens)
+    # Other local/offline options (uncomment + set model accordingly):
+    # model: "mistralai/Mistral-7B-Instruct-v0.2"
+    # model: "meta-llama/Llama-3.1-8B-Instruct"
+    # model: "Qwen/Qwen2.5-7B-Instruct"
+    # model: "microsoft/Phi-3-mini-128k-instruct"
+    # model: "tiiuae/falcon-7b-instruct"
+    #
+    # Local path example (pre-downloaded weights):
+    # model: "/models/gemma-2-9b-it"
+
+    # Generation knobs (repo: max_tokens maps to max_new_tokens)
     temperature: 0.3
     max_tokens: 512
     timeout_sec: 60.0
     max_retries: 2
 
-    # HF runtime hints (safe to keep; some may be ignored by current runner)
+    # HF runtime hints (runner may ignore some keys)
     device_map: "auto"          # "auto" / "cuda:0" / "cpu"
     dtype: "auto"               # "auto" / "fp16" / "bf16" / "fp32"
-    use_flash_attention: false  # enable only if your stack supports it
+    use_flash_attention: false
     trust_remote_code: false
     max_input_tokens: 6000
 
-    # Prompt template (may be unused depending on the runner implementation)
-    # prompt_template: "gemma-it"
-
-    # ---- Alternative providers (keep commented; activate by changing llm_provider) ----
+    # -------------------------------------------------------------------------
+    # Remote providers (kept for parity / ablations; switch llm_provider to use)
+    # -------------------------------------------------------------------------
     # OpenAI:
     # llm_provider: "openai"
     # model: "gpt-4o-mini"
@@ -98,6 +116,8 @@ governance:
     tau_conf: 0.5
 
   canary:
+    # Canary uses either retrieved examples and/or a deterministic suite (when wired).
+    # num_tests is the intended cap for canary simulation passes.
     num_tests: 8
     statistical_max_fail_rate: 0.1
     heuristic_risk_threshold: 0.6
@@ -112,6 +132,8 @@ knowledge:
 scenario:
   name: "travel_planning"
   difficulty: "hard"
+
+  # Task generation + failure injection controls (keep stable for comparisons)
   num_tasks: 20
   failure_rate: 0.4
   min_failures_in_prefix: 5
@@ -127,6 +149,7 @@ experiment:
   agent_to_run: "selfevolve"
 
 demo:
+  # Demo mode parameters; keep aligned with scenario unless intentionally diverging.
   num_tasks: 20
   failure_rate: 0.4
   min_failures_in_prefix: 5

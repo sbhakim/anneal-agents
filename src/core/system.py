@@ -16,8 +16,11 @@ CRITICAL BEHAVIORAL GUARANTEE (Reliability):
 MINIMUM PLANNING NORMALIZATION:
 - Normalize task-transient state before planning/replanning to prevent
   "(invalid) (invalid)" leakage into params/state and compiled plans.
-"""
 
+MINIMUM METRICS CORRECTNESS:
+- Aggregate traces across execution attempts so recovered failures are still visible to metrics/canary.
+  Without this, "success after retries" can look like "no failures observed".
+"""
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import uuid
@@ -54,6 +57,7 @@ from ..utils.metrics import MetricsCollector
 
 # Scenario
 from ..scenarios.travel_planning import TravelPlanningScenario
+from ..scenarios.test_cases import get_canary_suite_for_operator
 
 
 class SelfEvolveSystem:
@@ -226,17 +230,31 @@ class SelfEvolveSystem:
         final_trace = []
         did_local_repair = False
 
+        # Aggregate attempt traces so recovered failures remain visible to metrics and retrieval.
+        aggregated_trace: list = []
+
         for attempt in range(max_attempts):
             print(f"\n--- Execution Attempt #{attempt + 1} ---")
             self._reset_world_for_attempt()
 
             trace, success, failure_type = self.executor.execute(plan, self.state, task_id)
+
+            # Preserve per-attempt trace and keep an aggregated trace for this task.
+            if trace:
+                aggregated_trace.extend(trace)
             final_trace = trace or final_trace
 
             if success:
                 print("✅ Task Succeeded on this attempt.")
-                self.metrics.record_task(task_id, True, trace)
-                self.experience_pool.add_trace(trace, True, metadata={'instruction': instruction, 'task_id': task_id})
+
+                # Record the whole task lifecycle (including earlier failed attempts).
+                task_trace_for_metrics = aggregated_trace or trace
+                self.metrics.record_task(task_id, True, task_trace_for_metrics)
+                self.experience_pool.add_trace(
+                    task_trace_for_metrics,
+                    True,
+                    metadata={'instruction': instruction, 'task_id': task_id}
+                )
 
                 # ✅ RELIABILITY: only now mark patched operators as "patched" (disables future injection honestly)
                 if pending_patched_operators:
@@ -246,7 +264,8 @@ class SelfEvolveSystem:
 
                 if task_id > 0 and task_id % 5 == 0:
                     print(f"  🔍 Checking adaptation progress at task {task_id}...")
-                    for failure_key in list(self.metrics.failure_classes.keys()):
+                    # Prefer event-based keys once metrics is updated; keep this loop conservative.
+                    for failure_key in list(self.metrics.failure_event_counts.keys()) or list(self.metrics.failure_classes.keys()):
                         if self.metrics.check_adaptation(failure_key, window_size=min(10, task_id)):
                             print(f"  ✅ Adaptation confirmed for '{failure_key}'")
 
@@ -313,9 +332,12 @@ class SelfEvolveSystem:
         if self._last_committed_patch_id:
             self.trust_scorer.update_trust_score(self._last_committed_patch_id, success=False)
         self._last_committed_patch_id = None
-        self.metrics.record_task(task_id, False, final_trace)
 
-        failure_info = self._extract_failure_info(final_trace)
+        # If we failed, keep the fullest trace we have.
+        task_trace_for_metrics = aggregated_trace or final_trace
+        self.metrics.record_task(task_id, False, task_trace_for_metrics)
+
+        failure_info = self._extract_failure_info(task_trace_for_metrics)
         if failure_info:
             metadata = {
                 'instruction': instruction,
@@ -324,7 +346,7 @@ class SelfEvolveSystem:
                 'error_type': failure_info.get('error'),
             }
             if not any(t['metadata'].get('task_id') == task_id and not t['success'] for t in self.experience_pool.traces):
-                self.experience_pool.add_trace(final_trace, False, metadata=metadata)
+                self.experience_pool.add_trace(task_trace_for_metrics, False, metadata=metadata)
             self.metrics.check_adaptation(f"{failure_info.get('operator')}:{failure_info.get('error')}")
 
     # ---------------------------------------------------------------------
@@ -403,12 +425,19 @@ class SelfEvolveSystem:
 
         if guard_result['decision'] == 'allow':
             print(" FDKA: Guardrails passed. Proceeding to canary test...")
+
+            op_name = proposed_patch.get("operator")
+            fail_examples = self.experience_pool.get_failure_traces(operator=op_name) or []
+            succ_examples = self.experience_pool.get_success_traces(operator=op_name) or []
+            # Canary should see both “what broke” and “what previously worked” for regression sensitivity.
+            examples = (fail_examples[-5:] + succ_examples[-5:]) or self.experience_pool.traces[-10:]
+
             canary_context = {
                 "rule_pool": self.rule_pool,
                 "stage_fn": self.rule_pool.update_operator,
                 "simulator": self._run_canary_simulation,
-                "examples": self.experience_pool.get_failure_traces(operator=proposed_patch.get("operator"))
-                            or self.experience_pool.traces[-10:],
+                "examples": examples,
+                "canary_suite": get_canary_suite_for_operator(op_name),
                 "scorer": self.scorer,
                 "scores": scores
             }
