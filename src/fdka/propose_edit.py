@@ -10,6 +10,10 @@ UPDATED:
 - Deterministic validation after normalization; helpful warnings on unknown predicates.
 - Timeouts for LLM calls; graceful fallbacks to mock generation.
 - NEW: Return and preserve a top-level `usage` dict (tokens, latency, model).
+
+MINIMUM MANUSCRIPT/RESULTS UPDATE (2026-01):
+- Add privacy-safe provenance hooks: hash of (system+user prompt) + hash of raw model text.
+  This makes runs auditable/reproducible without logging the raw prompt/response.
 """
 
 from typing import List, Dict, Any, Optional
@@ -45,6 +49,18 @@ try:
     torch._dynamo.config.suppress_errors = True  # type: ignore[attr-defined]
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+
+
+def _hash_text(x: Any) -> str:
+    """Stable sha256 hash for audit trails (no raw prompt logging)."""
+    try:
+        if isinstance(x, (dict, list, tuple)):
+            s = json.dumps(x, sort_keys=True, default=str)
+        else:
+            s = str(x)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    except Exception:
+        return hashlib.sha256(repr(x).encode("utf-8")).hexdigest()
 
 
 # ---------------------------
@@ -251,8 +267,19 @@ class FDKAPipeline:
             patch.setdefault("operator", op_name)
             patch.setdefault("id", f"patch-{uuid.uuid4().hex[:8]}")
             patch.setdefault("source", "fdka.v1.3")
-            # ensure usage dict always present for downstream simplicity
+
+            # Always present: used by metrics + provenance.
             patch.setdefault("usage", {"tokens_used": 0, "latency_sec": 0.0, "model": self.llm_provider_type})
+            patch.setdefault(
+                "llm_trace",
+                {
+                    "provider": self.llm_provider_type,
+                    "model": patch.get("usage", {}).get("model", self.llm_provider_type),
+                    "prompt_hash": "",
+                    "response_hash": "",
+                },
+            )
+
             print(
                 f"FDKA: [3/3] Patch proposed -> {patch.get('action', 'N/A')}: {patch.get('details', 'N/A')} (id={patch.get('id')})")
             print("--- FDKA PROPOSAL COMPLETED ---")
@@ -266,7 +293,13 @@ class FDKAPipeline:
                 "details": msg,
                 "id": f"patch-{uuid.uuid4().hex[:8]}",
                 "source": "fdka.v1.3",
-                "usage": {"tokens_used": 0, "latency_sec": 0.0, "model": self.llm_provider_type}
+                "usage": {"tokens_used": 0, "latency_sec": 0.0, "model": self.llm_provider_type},
+                "llm_trace": {
+                    "provider": self.llm_provider_type,
+                    "model": self.llm_provider_type,
+                    "prompt_hash": "",
+                    "response_hash": "",
+                },
             }
 
     # ---------------------------
@@ -360,6 +393,8 @@ class FDKAPipeline:
             {"role": "user", "content": prompt_dict["user"]}
         ]
 
+        prompt_hash = prompt_dict.get("prompt_hash") or _hash_text([m.get("role") + ":" + m.get("content", "") for m in messages])
+
         for attempt in range(2):  # Try up to 2 times
             t0 = time.time()
             result = self.llm.generate(messages=messages)
@@ -381,10 +416,17 @@ class FDKAPipeline:
                 continue
 
             raw_text = result['text']
+            response_hash = _hash_text(raw_text)
+
             parsed = self._extract_json_from_text(raw_text)
             if parsed is not None:
-                # attach usage so caller can also log/aggregate if desired
                 parsed["usage"] = usage
+                parsed["llm_trace"] = {
+                    "provider": self.llm_provider_type,
+                    "model": usage.get("model", self.llm_provider_type),
+                    "prompt_hash": prompt_hash,
+                    "response_hash": response_hash,
+                }
                 return parsed
 
             # retry prompt to fix JSON
@@ -408,6 +450,8 @@ class FDKAPipeline:
         try:
             print("  🧠 Calling local model...")
             full_prompt = f"{prompt_dict['system']}\n\n{prompt_dict['user']}"
+            prompt_hash = prompt_dict.get("prompt_hash") or _hash_text(full_prompt)
+
             cfg = self.config.get('transformers_config', self.config) or {}
 
             # time the call for latency
@@ -424,6 +468,8 @@ class FDKAPipeline:
             )
             latency = max(0.0, time.time() - t0)
             txt = (out[0]["generated_text"] if out and isinstance(out, list) and "generated_text" in out[0] else "").strip()
+            response_hash = _hash_text(txt)
+
             parsed = self._extract_json_from_text(txt)
 
             # estimate tokens (best-effort) using tokenizer
@@ -448,6 +494,12 @@ class FDKAPipeline:
 
             if parsed is not None:
                 parsed["usage"] = usage
+                parsed["llm_trace"] = {
+                    "provider": "transformers",
+                    "model": usage.get("model", "transformers"),
+                    "prompt_hash": prompt_hash,
+                    "response_hash": response_hash,
+                }
                 return parsed
             raise ValueError("No valid JSON found in local LLM output")
         except (TimeoutException, json.JSONDecodeError, Exception) as e:
@@ -469,7 +521,6 @@ class FDKAPipeline:
         start = text.find('{')
         end = text.rfind('}')
         if start != -1 and end != -1 and end > start:
-            candidate = text[start:end + 1]
             # attempt bracket balancing
             bal = 0
             last = start
@@ -518,12 +569,19 @@ RULES:
 - For network/timeout: {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())"}}}}
 
 Return only the JSON object, no prose."""
-        return {"system": system_prompt, "user": user_prompt, "serialized_prompt": sp}
+        return {
+            "system": system_prompt,
+            "user": user_prompt,
+            "serialized_prompt": sp,
+            "prompt_hash": _hash_text(system_prompt + "\n\n" + user_prompt),
+        }
 
     def _mock_llm_generate(self, sp):
         error = sp.get("error", {}).get("type", "")
         ev = (sp.get("error", {}).get("evidence", "") or "").lower()
         operator_name = sp.get("operator", {}).get("name", "Unknown")
+        prompt_hash = _hash_text(sp)
+
         print(f"  🎯 Mock template matching: error={error}, evidence='{ev[:50]}...'")
         for k, t in PATCH_TEMPLATES.items():
             if isinstance(k, tuple):
@@ -531,9 +589,22 @@ Return only the JSON object, no prose."""
                 if ft == error and any(kw in ev for kw in kws):
                     out = {**t, "operator": operator_name}
                     out["usage"] = {"tokens_used": 0, "latency_sec": 0.0, "model": "mock"}
+                    out["llm_trace"] = {
+                        "provider": "mock",
+                        "model": "mock",
+                        "prompt_hash": prompt_hash,
+                        "response_hash": _hash_text(out),
+                    }
                     return out
+
         out = {**PATCH_TEMPLATES["default"], "operator": operator_name}
         out["usage"] = {"tokens_used": 0, "latency_sec": 0.0, "model": "mock"}
+        out["llm_trace"] = {
+            "provider": "mock",
+            "model": "mock",
+            "prompt_hash": prompt_hash,
+            "response_hash": _hash_text(out),
+        }
         return out
 
     # ---------------------------
@@ -546,21 +617,31 @@ Return only the JSON object, no prose."""
             if not isinstance(raw, dict):
                 raw = {"action": "REJECTED", "details": "non_dict_patch"}
                 return raw
+
             # Normalize action before validation
             act = _normalize_action(raw.get("action", ""))
             raw["action"] = act
+
             # If operator missing, attempt to infer from serialized prompt (no-op here)
             if not raw.get("operator"):
                 raw["operator"] = (rp and getattr(rp, "last_operator", None)) or "Unknown"
+
             # Schema checks
             self._validate_schema(raw)
+
             # Typing/semantic hints (non-fatal)
             self._validate_typing_and_semantics(raw, rp)
-            # Normalize final patch (preserve optional usage)
+
+            # Normalize final patch (preserve optional usage + llm_trace)
             return self._normalize_patch(raw)
         except Exception as e:
-            # Fail-soft
-            return {"action": "REJECTED", "details": f"validation_error: {e}", "usage": raw.get("usage") if isinstance(raw, dict) else None}
+            # Fail-soft: preserve audit metadata if present
+            return {
+                "action": "REJECTED",
+                "details": f"validation_error: {e}",
+                "usage": raw.get("usage") if isinstance(raw, dict) else None,
+                "llm_trace": raw.get("llm_trace") if isinstance(raw, dict) else None,
+            }
 
     def _validate_schema(self, p):
         if not isinstance(p, dict) or not all(k in p for k in ["action", "operator", "patch"]):
@@ -590,7 +671,13 @@ Return only the JSON object, no prose."""
         }
         content_str = f"{norm['operator']}:{norm['action']}:{norm['details']}"
         norm["content_hash"] = hashlib.sha256(content_str.encode()).hexdigest()[:12]
+
         # preserve optional usage payload for external logging/CSV
         if isinstance(p, dict) and "usage" in p:
             norm["usage"] = p["usage"]
+
+        # preserve prompt/response hashes (privacy-safe provenance)
+        if isinstance(p, dict) and "llm_trace" in p and isinstance(p["llm_trace"], dict):
+            norm["llm_trace"] = p["llm_trace"]
+
         return norm

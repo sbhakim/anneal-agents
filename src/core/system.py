@@ -20,6 +20,11 @@ MINIMUM PLANNING NORMALIZATION:
 MINIMUM METRICS CORRECTNESS:
 - Aggregate traces across execution attempts so recovered failures are still visible to metrics/canary.
   Without this, "success after retries" can look like "no failures observed".
+
+MINIMUM METRICS SEMANTICS:
+- Never call metrics.record_task() twice for the same task_id.
+  Planning can fail and later succeed after a patch; we treat the planning failure as an
+  observed failure event inside the aggregated trace, but we record the task outcome once.
 """
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
@@ -190,6 +195,10 @@ class SelfEvolveSystem:
     def run_task(self, task_id: int, instruction: str):
         print(f"\n{'=' * 70}\nTask {task_id + 1}: {instruction}\n{'=' * 70}")
 
+        # Aggregate trace across the entire task lifecycle (planning + attempts).
+        # This is what we pass to metrics so recovered failures remain visible.
+        aggregated_trace: list = []
+
         # Track operators whose patches were committed during this task;
         # only mark as patched upon observed post-patch success.
         pending_patched_operators: set[str] = set()
@@ -200,13 +209,14 @@ class SelfEvolveSystem:
 
         plan = self.planner.compile(instruction, self.state.to_dict())
 
-        # Treat planning failure as learnable and route through FDKA
+        # Treat planning failure as learnable and route through FDKA.
+        # IMPORTANT: do NOT record_task() here; a planning failure may be recovered later.
         if not plan:
             print("PLANNER: ❌ Plan compilation failed.")
-            planning_trace = [{"error": "PlanningFailed", "operator": "UNKNOWN", "instruction": instruction}]
-            self.metrics.record_task(task_id, False, planning_trace)
-            print("🧠 Escalating to FDKA for governed self-edit (PlanningFailed)...")
+            planning_trace = [{"error": "PlanningFailed", "operator": "PLANNER", "instruction": instruction}]
+            aggregated_trace.extend(planning_trace)
 
+            print("🧠 Escalating to FDKA for governed self-edit (PlanningFailed)...")
             patch_applied, committed_patch = self._handle_failure(planning_trace, task_id, instruction)
 
             # Defer mark_operator_patched until success
@@ -221,17 +231,28 @@ class SelfEvolveSystem:
                 plan = self.planner.compile(instruction, self.state.to_dict())
                 if not plan:
                     print("PLANNER: ❌ Still failed after patch; aborting task.")
+                    self.metrics.record_task(task_id, False, aggregated_trace)
+                    if not any(t['metadata'].get('task_id') == task_id and not t['success'] for t in self.experience_pool.traces):
+                        self.experience_pool.add_trace(
+                            aggregated_trace,
+                            False,
+                            metadata={"instruction": instruction, "task_id": task_id, "operator": "PLANNER", "error_type": "PlanningFailed"},
+                        )
                     return
             else:
                 print("❌ No patch committed; aborting task.")
+                self.metrics.record_task(task_id, False, aggregated_trace)
+                if not any(t['metadata'].get('task_id') == task_id and not t['success'] for t in self.experience_pool.traces):
+                    self.experience_pool.add_trace(
+                        aggregated_trace,
+                        False,
+                        metadata={"instruction": instruction, "task_id": task_id, "operator": "PLANNER", "error_type": "PlanningFailed"},
+                    )
                 return
 
         max_attempts = 3
         final_trace = []
         did_local_repair = False
-
-        # Aggregate attempt traces so recovered failures remain visible to metrics and retrieval.
-        aggregated_trace: list = []
 
         for attempt in range(max_attempts):
             print(f"\n--- Execution Attempt #{attempt + 1} ---")

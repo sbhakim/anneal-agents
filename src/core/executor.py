@@ -24,6 +24,11 @@ MINIMUM RETRY-SEMANTICS FIX (2026-01):
 MINIMUM METRICS COMPATIBILITY FIX (2026-01):
 - Ensure every failure path emits a trace entry with {error|error_type, operator}.
   This keeps event-based metrics reliable even when tasks ultimately succeed.
+
+MINIMUM UPDATE (2026-01):
+- Mirror failure class into BOTH `error` and `error_type` in emitted trace events.
+  Traces in this repo are not fully uniform; metrics now supports either key,
+  but emitting both removes schema ambiguity for Table 3 and RFR/TTA.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import time
@@ -77,6 +82,10 @@ class Executor:
             for k in ("corporate_card_policy", "blackout_dates"):
                 if k in defaults:
                     state.set(k, defaults[k])
+
+            # Network is used by some patches/predicates; keep a sensible default when missing.
+            if "network_available" in defaults and state.get("network_available") is None:
+                state.set("network_available", defaults["network_available"])
         except Exception:
             pass
 
@@ -251,7 +260,7 @@ class Executor:
         # 2. Act based on the chosen pathway
         if pathway == "DEFER":
             print("EXECUTOR: ⏸️ Execution deferred due to budget constraints.")
-            trace.append({"error": "Deferred", "operator": "SYSTEM", "reason": "Budget exceeded"})
+            trace.append({"error": "Deferred", "error_type": "Deferred", "operator": "SYSTEM", "reason": "Budget exceeded"})
             return trace, False, "Deferred"
 
         if pathway == "S2":
@@ -280,9 +289,12 @@ class Executor:
             injected_error_info: Optional[Dict[str, Any]] = None
             if self._injector_should_fail(task_id, op.name, params, state):
                 error_info = self._injector_failure_details(task_id, op.name, params, state)
+
+                # Normalize injected class label for downstream consumers.
                 err_cls = error_info.get("error") or error_info.get("error_type") or "ToolError"
                 injected_error_info = dict(error_info)
                 injected_error_info["error"] = err_cls
+                injected_error_info["error_type"] = err_cls
                 injected_error_info.setdefault("operator", op.name)
 
                 if err_cls != "ToolError":
@@ -293,9 +305,16 @@ class Executor:
             ok, violated = self._verify_preconditions(op, params, state)
             if not ok:
                 print(f"EXECUTOR: ❌ Verify-Before-Act failed for {op.name}. Halting.")
-                payload = {"error": "PreconditionUnmet", "operator": op.name, "violated": violated}
+
+                payload = {
+                    "error": "PreconditionUnmet",
+                    "error_type": "PreconditionUnmet",
+                    "operator": op.name,
+                    "violated": violated
+                }
                 if injected_error_info and injected_error_info.get("error") != "ToolError":
                     payload["injected_constraint"] = True
+                    # Keep policy_ref/category/message if present; metrics uses operator+error(_type)
                     payload.update({k: v for k, v in injected_error_info.items() if k not in payload})
                 trace.append(payload)
                 return trace, False, "PreconditionUnmet"
@@ -318,6 +337,7 @@ class Executor:
                     except Exception as e:
                         trace.append({
                             "error": "ToolError",
+                            "error_type": "ToolError",
                             "operator": op.name,
                             "message": "Recovery retry failed",
                             "exception": str(e)[:120]
@@ -327,6 +347,7 @@ class Executor:
 
                 trace.append({
                     "error": "ToolError",
+                    "error_type": "ToolError",
                     "operator": op.name,
                     "message": injected_error_info.get("message", "Injected tool error"),
                     "policy_ref": injected_error_info.get("policy_ref"),
@@ -339,6 +360,7 @@ class Executor:
             except Exception as e:
                 trace.append({
                     "error": "ToolError",
+                    "error_type": "ToolError",
                     "operator": op.name,
                     "message": "Exception during effect application",
                     "exception": str(e)[:120],

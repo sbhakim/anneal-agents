@@ -14,6 +14,12 @@ MINIMUM RELIABILITY UPDATE (2026-01):
 - Cache failure details per (task, operator, payment_key) to keep injections stable
   across retries/attempts within a run while allowing different cards to experience
   different injected failures.
+
+MINIMUM MANUSCRIPT/RESULTS UPDATE (2026-01):
+- Normalize failure labeling with a small, fixed vocabulary:
+    error_type: {"ToolError","PreconditionUnmet","PolicyViolation","PlanningFailed"}
+    policy_ref: stable IDs (e.g., "API-503","PAY-401","H-23")
+- Ensure both 'error' and 'error_type' are present for downstream metrics robustness.
 """
 from typing import Dict, Any, List, Set, Optional, Tuple
 import random
@@ -34,6 +40,7 @@ class FailureInjector:
             blackout_dates: List[str] = None,
             min_failures_in_prefix: int = 3,
             prefix_len: int = 10,
+            seed: Optional[int] = None,
     ):
         self.failure_rate = failure_rate
         self.policy_flip_at = policy_flip_at
@@ -41,6 +48,11 @@ class FailureInjector:
         self.blackout_dates = blackout_dates or []
         self.min_failures_in_prefix = min_failures_in_prefix
         self.prefix_len = min(prefix_len, horizon)
+
+        # Single RNG for deterministic, reproducible failure selection/details per configured seed.
+        # Without this, global random calls from elsewhere can perturb the injection schedule.
+        self._rng = random.Random(seed if seed is not None else 1337)
+        self._seed = seed if seed is not None else 1337
 
         # Track which operators have been successfully patched by FDKA
         self.patched_operators: Set[str] = set()
@@ -51,7 +63,7 @@ class FailureInjector:
 
         # Precompute failing tasks
         self.failing_tasks = self._select_failing_tasks()
-        print(f"FAILURE_INJECTOR: Initialized. {len(self.failing_tasks)} tasks will fail.")
+        print(f"FAILURE_INJECTOR: Initialized (seed={self._seed}). {len(self.failing_tasks)} tasks will fail.")
 
     def _select_failing_tasks(self) -> List[int]:
         """
@@ -61,14 +73,14 @@ class FailureInjector:
 
         # Force min_failures in prefix
         prefix_tasks = list(range(self.prefix_len))
-        random.shuffle(prefix_tasks)
+        self._rng.shuffle(prefix_tasks)
         for task in prefix_tasks[:self.min_failures_in_prefix]:
             failing.add(task)
 
         # Add remaining failures randomly across horizon
         target = int(self.failure_rate * self.horizon)
         all_tasks = list(range(self.horizon))
-        random.shuffle(all_tasks)
+        self._rng.shuffle(all_tasks)
         for task in all_tasks:
             if len(failing) >= target:
                 break
@@ -112,7 +124,6 @@ class FailureInjector:
         p = self._payment_string(params, state)
 
         # Extract the token after "XCard:" if present; e.g., "CorporateCard:CC-NEW"
-        m = None
         try:
             m = p.split()[0]  # strip trailing markers like "(invalid)"
         except Exception:
@@ -134,7 +145,7 @@ class FailureInjector:
         # Critical: invalid_payment (PAY-401) should ONLY target the baseline corporate card.
         allow_invalid_payment = (payment_key == "CorporateCard:CC-5512")
 
-        r = random.random()
+        r = self._rng.random()
         if r < 0.50:
             error_type = "PreconditionUnmet"
             message = "Corporate cards blocked for reservations during blackout dates"
@@ -157,8 +168,10 @@ class FailureInjector:
                 self.blackout_dates.extend(["June 1", "June 2"])
             message += " (Policy updated: Extended blackout periods)"
 
+        # Stable labeling: keep both keys so downstream components don't depend on one trace schema.
         details = {
-            "error": error_type,
+            "error": error_type,         # executor primarily consumes 'error'
+            "error_type": error_type,    # metrics consume either 'error' or 'error_type'
             "operator": op_name,
             "message": message,
             "policy_ref": policy_ref,
@@ -176,6 +189,7 @@ class FailureInjector:
         UPDATED:
         - Backward compatible (params/state optional).
         - Conditional: failures depend on payment identity so local repair can recover.
+        - Deterministic: selection is driven by the injector's own RNG (seeded in __init__).
         """
         if op_name in self.patched_operators:
             return False
@@ -201,6 +215,8 @@ class FailureInjector:
     def get_failure_details(self, task_id: int, op_name: str, params: Dict[str, Any] = None, state: Any = None) -> Dict[str, Any]:
         """
         Returns stable failure details for this (task, operator, payment_key).
+
+        Note: return value always includes both 'error' and 'error_type' for schema stability.
         """
         p_key = self._payment_key(params, state)
         return dict(self._cached_failure(task_id, op_name, p_key))

@@ -32,6 +32,10 @@ MINIMUM RELIABILITY UPDATES (2026-01):
   because governance config alone typically does not carry domain state.
 - Return specific hazard_id when CausalKG triggers a hazard to improve debuggability and
   avoid opaque "Known hazard condition" escalations.
+
+MINIMUM MANUSCRIPT/RESULTS UPDATE (2026-01):
+- Return a structured `reason_code` (stable vocabulary) in addition to free-text `reason`.
+  This makes Table 4 + audit logs consistent across runs.
 """
 
 from __future__ import annotations
@@ -186,9 +190,10 @@ class Guard:
         Returns:
             Dictionary with:
             - decision: 'veto' | 'request_human' | 'allow'
+            - reason_code: stable code for analysis (Table 4 / audits)
             - reason: Human-readable explanation
-            - value: Value guard payload (impact, explanation)
-            - causal: Causal guard payload (ambiguity, impact, explanation)
+            - value: Value guard payload (impact, explanation, reason_code)
+            - causal: Causal guard payload (ambiguity, impact, explanation, reason_code)
         """
         context = context or {}
         self.stats['total_checks'] += 1
@@ -203,9 +208,15 @@ class Guard:
             self.stats['value_vetoes'] += 1
             return {
                 "decision": "veto",
+                "reason_code": v_payload.get("reason_code", "VALUE:VETO"),
                 "reason": v_payload.get("explanation", "Value guard veto"),
                 "value": v_payload,
-                "causal": {"ambiguity": 0.0, "impact": 0.0, "explanation": "Skipped due to value veto"},
+                "causal": {
+                    "ambiguity": 0.0,
+                    "impact": 0.0,
+                    "reason_code": "CAUSAL:SKIPPED_VALUE_VETO",
+                    "explanation": "Skipped due to value veto"
+                },
             }
 
         # Stage 2: Causal Guardrails (can REQUEST_HUMAN)
@@ -215,6 +226,7 @@ class Guard:
             self.stats['causal_escalations'] += 1
             return {
                 "decision": "request_human",
+                "reason_code": c_payload.get("reason_code", "CAUSAL:REQUEST_HUMAN"),
                 "reason": c_payload.get("explanation", "Causal guard requested human review"),
                 "value": v_payload,
                 "causal": c_payload,
@@ -224,6 +236,7 @@ class Guard:
         self.stats['allows'] += 1
         return {
             "decision": "allow",
+            "reason_code": "ALLOW",
             "reason": "Guards passed",
             "value": v_payload,
             "causal": c_payload,
@@ -253,10 +266,11 @@ class Guard:
             Tuple of (decision, payload) where decision ∈ {'veto', 'allow'}
         """
         if not self.cfg.enable_value_guard:
-            return "allow", {"impact": 0.0, "explanation": "Value guard disabled"}
+            return "allow", {"impact": 0.0, "reason_code": "VALUE:DISABLED", "explanation": "Value guard disabled"}
 
         impact = None
         explanation = ""
+        reason_code = "VALUE:ALLOW"
 
         # Try ValueKG if available (preferred)
         value_kg = ctx.get("value_kg") or self.value_kg
@@ -270,13 +284,13 @@ class Guard:
                 deontic_ok = value_kg.check_deontic(state, params)
 
                 if not deontic_ok:
-                    # Identify specific violated rule
                     violated_rule = self._identify_violated_rule(patch, state, value_kg)
                     explanation = f"Violated deontic rule: {violated_rule}" if violated_rule else "Deontic constraint violated"
-                    return "veto", {"impact": 1.0, "explanation": explanation}
+                    return "veto", {"impact": 1.0, "reason_code": "VALUE:DEONTIC", "explanation": explanation}
 
-                impact = 0.2  # Passed deontic checks, low risk
+                impact = 0.2
                 explanation = "Passed ValueKG deontic checks"
+                reason_code = "VALUE:KG_OK"
 
             except Exception as e:
                 explanation = f"ValueKG error: {e}. Using heuristics."
@@ -285,7 +299,7 @@ class Guard:
         # Check dangerous patterns (always active, even with KG)
         has_danger, danger_reason = self._check_dangerous_patterns(patch)
         if has_danger:
-            return "veto", {"impact": 1.0, "explanation": danger_reason}
+            return "veto", {"impact": 1.0, "reason_code": "VALUE:DANGEROUS_PATTERN", "explanation": danger_reason}
 
         # Heuristic fallback when KG unavailable or didn't compute impact
         if impact is None:
@@ -294,23 +308,22 @@ class Guard:
             action = _get(patch, "action")
             details = _get(patch, "details", "")
 
-            # Enhanced heuristic for safety refinements
             is_safety_refinement = (action == "REFINE_EFFECT" and "IfThen" in details)
 
             if is_safety_refinement:
-                # Safety-enhancing patches have lower risk
                 impact = _clamp01(scores.get("risk", 0.25))
                 explanation = "Heuristic impact (lowered for safety refinement)"
+                reason_code = "VALUE:HEURISTIC_SAFETY_REFINEMENT"
             else:
-                # Conservative proxy for other actions
                 impact = _clamp01(scores.get("risk", _risk_proxy_from_action(action)))
                 explanation = "Heuristic impact from scores/risk proxy"
+                reason_code = "VALUE:HEURISTIC"
 
         # Decision
         if impact >= self.cfg.tau_impact:
-            return "veto", {"impact": impact, "explanation": explanation}
+            return "veto", {"impact": impact, "reason_code": "VALUE:IMPACT_THRESHOLD", "explanation": explanation}
 
-        return "allow", {"impact": impact, "explanation": explanation}
+        return "allow", {"impact": impact, "reason_code": reason_code, "explanation": explanation}
 
     def _check_dangerous_patterns(self, patch: Any) -> Tuple[bool, str]:
         """
@@ -327,7 +340,6 @@ class Guard:
         action = _get(patch, "action", "")
         details = _get(patch, "details", "").lower()
 
-        # Dangerous keyword pairs
         dangerous_patterns = [
             ('disable', 'security'),
             ('remove', 'auth'),
@@ -345,15 +357,12 @@ class Guard:
             if all(keyword in details for keyword in pattern):
                 return True, f"Dangerous pattern: {' '.join(pattern)}"
 
-        # Removing preconditions is inherently dangerous
         if action == 'REMOVE_PRECONDITION':
             return True, "Removing preconditions weakens safety guarantees"
 
-        # Removing "Not" from safety constraints
         if re.search(r'remove.*not\(', details, re.IGNORECASE):
             return True, "Removing negation from safety constraint"
 
-        # Weakening existing guards
         weaken_keywords = ['weaken', 'relax', 'loosen', 'reduce']
         safety_keywords = ['guard', 'check', 'verify', 'validate', 'precondition']
 
@@ -375,20 +384,16 @@ class Guard:
         """
         params = {}
 
-        # Get payment method from state
         if state:
             params['payment'] = state.get('payment_method', '')
 
-        # Extract from patch details using regex
         details = _get(patch, "details", "")
 
-        # Payment method extraction
         if 'payment' in details.lower():
             match = re.search(r'payment[,\s]*([A-Za-z0-9:_-]+)', details)
             if match:
                 params['payment'] = match.group(1)
 
-        # Date extraction
         if 'dates' in details.lower() or 'date' in details.lower():
             if state:
                 params['dates'] = state.get('travel_dates', '')
@@ -403,21 +408,12 @@ class Guard:
     ) -> Optional[str]:
         """
         Identify which specific deontic rule was violated.
-
-        Args:
-            patch: Patch being checked
-            state: Current state
-            value_kg: ValueKG instance
-
-        Returns:
-            Rule ID or None if not identifiable
         """
         if not value_kg or not hasattr(value_kg, 'rules'):
             return None
 
         params = self._extract_params(patch, state)
 
-        # Check each rule individually
         for rule_id, rule_fn in value_kg.rules.items():
             try:
                 if not rule_fn(state or {}, params):
@@ -434,27 +430,9 @@ class Guard:
     def _check_causal_guardrail(self, patch: Any, ctx: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """
         Check for causal ambiguity and high-impact propagation.
-
-        From Eq. 17:
-        φ_cau(Δo) ≡ Ambig(u, Δo) ∨ HighImpact(Δo)
-
-        From Eq. 18:
-        Guard_cau(Δo) = {
-            request_human,  φ_cau(Δo),
-            allow,          ¬φ_cau(Δo)
-        }
-
-        Unlike value guards, causal guards don't veto - they escalate to human review.
-
-        Args:
-            patch: Patch to validate
-            ctx: Context with state, scores, causal_kg, trace
-
-        Returns:
-            Tuple of (decision, payload) where decision ∈ {'allow', 'request_human'}
         """
         if not self.cfg.enable_causal_guard:
-            return "allow", {"ambiguity": 0.0, "impact": 0.0, "explanation": "Causal guard disabled"}
+            return "allow", {"ambiguity": 0.0, "impact": 0.0, "reason_code": "CAUSAL:DISABLED", "explanation": "Causal guard disabled"}
 
         causal_kg = ctx.get("causal_kg") or self.causal_kg
         trace = ctx.get("trace", {})
@@ -463,6 +441,7 @@ class Guard:
         ambiguity = None
         impact = None
         explanation = ""
+        reason_code = "CAUSAL:ALLOW"
 
         # Try CausalKG if available (preferred)
         if causal_kg and hasattr(causal_kg, "assess_trace"):
@@ -472,15 +451,16 @@ class Guard:
                 ambiguity = _clamp01(res.get("ambiguity"))
                 impact = _clamp01(res.get("impact"))
                 explanation = res.get("explanation", "CausalKG assessment")
+                reason_code = "CAUSAL:KG"
             except Exception as e:
                 explanation = f"CausalKG error: {e}. Using heuristics."
 
-        # Additional causal checks
         is_ambiguous, ambig_reason = self._check_ambiguity(patch, state, causal_kg)
         if is_ambiguous:
             return "request_human", {
                 "ambiguity": 1.0,
                 "impact": impact or 0.5,
+                "reason_code": "CAUSAL:AMBIGUITY",
                 "explanation": f"Causal ambiguity: {ambig_reason}"
             }
 
@@ -489,14 +469,17 @@ class Guard:
             return "request_human", {
                 "ambiguity": ambiguity or 0.3,
                 "impact": 1.0,
+                "reason_code": "CAUSAL:HIGH_IMPACT",
                 "explanation": f"High-impact: {impact_reason}"
             }
 
         has_hazard, hazard_reason = self._check_hazards(patch, state, causal_kg)
         if has_hazard:
+            hz = str(hazard_reason).strip() or "UNKNOWN"
             return "request_human", {
                 "ambiguity": ambiguity or 0.3,
                 "impact": impact or 0.7,
+                "reason_code": f"CAUSAL:HAZARD:{hz}",
                 "explanation": f"Hazard: {hazard_reason}"
             }
 
@@ -507,22 +490,24 @@ class Guard:
             ambiguity = _clamp01(min(1.0, 0.2 * max(0, len(candidates) - 1)))
             if not explanation:
                 explanation = "Heuristic ambiguity from candidate count"
+                reason_code = "CAUSAL:HEURISTIC"
 
         if impact is None:
             scores = ctx.get("scores", {})
             impact = _clamp01(scores.get("risk", 0.3))
 
-        # Decision based on thresholds
         if ambiguity >= self.cfg.tau_ambiguity:
             return "request_human", {
                 "ambiguity": ambiguity,
                 "impact": impact,
+                "reason_code": "CAUSAL:THRESHOLD",
                 "explanation": explanation or "High causal ambiguity"
             }
 
         return "allow", {
             "ambiguity": ambiguity,
             "impact": impact,
+            "reason_code": reason_code,
             "explanation": explanation or "Causal checks passed"
         }
 
@@ -534,22 +519,10 @@ class Guard:
     ) -> Tuple[bool, str]:
         """
         Check for causal ambiguity: low identifiability of causal claims.
-
-        From paper: "Does the patch rely on a causal claim with low identifiability?"
-        Uses backdoor criterion, instrumental variables, or sensitivity analysis.
-
-        Args:
-            patch: Patch to check
-            state: Current state
-            causal_kg: CausalKG instance (optional)
-
-        Returns:
-            Tuple of (is_ambiguous, reason)
         """
         details = _get(patch, "details", "")
         action = _get(patch, "action", "")
 
-        # Check for circular dependencies
         if causal_kg and hasattr(causal_kg, 'detect_cycles'):
             try:
                 has_cycles = causal_kg.detect_cycles()
@@ -558,12 +531,10 @@ class Guard:
             except Exception:
                 pass
 
-        # Effect refinements change causal structure
         if action == 'REFINE_EFFECT':
             if not self._has_causal_evidence(details, state):
                 return True, "Insufficient evidence for causal relationship"
 
-        # Conditional effects introduce causal assumptions
         if 'IfThen' in details or 'When' in details:
             condition_vars = self._extract_condition_vars(details)
             if not self._are_vars_identifiable(condition_vars):
@@ -579,38 +550,19 @@ class Guard:
     ) -> Tuple[bool, str]:
         """
         Check for high-impact propagation: large downstream fan-out or irreversible effects.
-
-        From paper: "Does the patch affect operators with large downstream
-        fan-out or irreversible effects?"
-
-        CRITICAL FIX: Context-aware analysis - safety preconditions are LOW risk,
-        while financial operations are HIGH risk.
-
-        Args:
-            patch: Patch to check
-            state: Current state
-            causal_kg: CausalKG instance (optional)
-
-        Returns:
-            Tuple of (is_high_impact, reason)
         """
         operator = _get(patch, "operator", "")
         action = _get(patch, "action", "")
         details = _get(patch, "details", "")
 
-        # CRITICAL: Safety preconditions are LOW risk (they ADD safety, not remove it)
         if action == 'ADD_PRECONDITION':
-            # These are safety-enhancing, not risky
             safety_predicates = [
                 'Valid', 'Check', 'Verify', 'Ensure', 'Require',
                 'Not(Blocked', 'Not(Invalid', 'Not(Expired'
             ]
-
             if any(pred in details for pred in safety_predicates):
-                # This is a safety check being added - LOW risk
                 return False, "Safety precondition (low risk)"
 
-        # High-impact operators (irreversible actions)
         high_impact_operators = [
             'ProcessPayment', 'ExecuteTransaction', 'DeleteData',
             'SendNotification', 'DeploySystem', 'ModifyDatabase',
@@ -620,7 +572,6 @@ class Guard:
         if operator in high_impact_operators:
             return True, f"Operator '{operator}' has irreversible effects"
 
-        # High-impact operations (REFINE_EFFECT or execution contexts only)
         if action in ['REFINE_EFFECT', 'UPDATE_EFFECT', 'EXECUTE']:
             high_impact_operations = [
                 'Delete', 'Remove', 'Drop', 'Destroy', 'Erase',
@@ -633,11 +584,9 @@ class Guard:
                 if operation in details:
                     return True, f"High-impact operation: {operation}"
 
-        # Schema updates affect all tool users
         if action == 'UPDATE_TOOL_SCHEMA':
             return True, "Tool schema changes affect multiple operators"
 
-        # Check CausalKG for propagation effects
         if causal_kg and hasattr(causal_kg, 'get_intervention_effects'):
             try:
                 effects = causal_kg.get_intervention_effects(action, state or {})
@@ -646,7 +595,6 @@ class Guard:
             except Exception:
                 pass
 
-        # Estimate fan-out
         fan_out = self._estimate_fan_out(patch)
         if fan_out > self.cfg.tau_impact:
             return True, f"High fan-out: {fan_out:.1%} of operators affected"
@@ -661,14 +609,10 @@ class Guard:
     ) -> Tuple[bool, str]:
         """
         Check CausalKG for known hazards given current state.
-
-        Returns:
-            Tuple of (has_hazard, reason)
         """
         if not causal_kg:
             return False, ""
 
-        # ✅ Prefer hazard_id-level reporting when available
         hazards = getattr(causal_kg, "hazards", None)
         if isinstance(hazards, dict) and hazards:
             try:
@@ -676,7 +620,6 @@ class Guard:
                     if callable(detect) and detect(state or {}):
                         return True, str(hazard_id)
             except Exception:
-                # fall through to generic check below
                 pass
 
         if not hasattr(causal_kg, 'check_hazards'):
@@ -698,20 +641,16 @@ class Guard:
     def _has_causal_evidence(self, details: str, state: Optional[Dict]) -> bool:
         """
         Check if we have empirical evidence for a causal relationship.
-
-        In full implementation, would query historical data or experiments.
-        For now, assume common patterns have evidence.
         """
         common_patterns = [
             'NetworkAvailable',
             'TimeoutOccurred',
-            'ApiTimeoutRetry',  # retry/backoff wrapper is a low-ambiguity mitigation
+            'ApiTimeoutRetry',
             'ErrorDetected',
             'ValidInput',
             'ValidPayment',
             'BlockedCard'
         ]
-
         return any(pattern in details for pattern in common_patterns)
 
     def _extract_condition_vars(self, details: str) -> List[str]:
@@ -727,37 +666,27 @@ class Guard:
     def _are_vars_identifiable(self, vars: List[str]) -> bool:
         """
         Check if variables have sufficient identifiability.
-
-        In full implementation, would use backdoor criterion or IV analysis.
-        For now, assume single-word predicates are identifiable.
         """
         return all(len(var) > 0 for var in vars)
 
     def _estimate_fan_out(self, patch: Any) -> float:
         """
         Estimate blast radius / fan-out of a patch.
-
-        Returns:
-            Fraction ∈ [0, 1] of affected operators
         """
         action = _get(patch, "action", "")
         details = _get(patch, "details", "")
 
-        # Schema updates affect many operators
         if action == 'UPDATE_TOOL_SCHEMA':
             return 0.5
 
-        # Generic predicates affect more operators
         generic_markers = ['Valid', 'Check', 'Safe', 'Allow', 'Verify']
         if any(marker in details for marker in generic_markers):
             return 0.3
 
-        # Specific predicates have narrow scope
         specific_markers = ['BlockedCard', 'Hotel', 'Flight', 'Booking']
         if any(marker in details for marker in specific_markers):
             return 0.05
 
-        # Default: moderate scope
         return 0.15
 
     # ========================================================================
@@ -767,14 +696,8 @@ class Guard:
     def get_statistics(self) -> Dict[str, Any]:
         """
         Get statistics about guardrail checks.
-
-        Returns:
-            Dictionary with counts and rates
         """
         total = self.stats['total_checks']
-        # Derived counts matching downstream analysis expectations:
-        # - Value guard is evaluated for every check
-        # - Causal guard is skipped when a value veto fires
         value_checks = total
         causal_checks = max(0, total - self.stats['value_vetoes'])
 
@@ -806,10 +729,6 @@ class Guard:
     ) -> None:
         """
         Update guardrail thresholds dynamically.
-
-        Args:
-            impact: New impact threshold (0-1)
-            ambiguity: New ambiguity threshold (0-1)
         """
         if impact is not None:
             self.cfg.tau_impact = max(0.0, min(1.0, impact))
@@ -844,9 +763,6 @@ def _clamp01(x: Optional[float]) -> float:
 def _risk_proxy_from_action(action: Optional[str]) -> float:
     """
     Heuristic risk proxy when scorer unavailable.
-
-    - Adding/modifying effects is riskier than adding preconditions
-    - Unknown actions default to medium risk (0.3)
     """
     if not action:
         return 0.3
@@ -860,7 +776,7 @@ def _risk_proxy_from_action(action: Optional[str]) -> float:
     if "ADD_PRECONDITION" in a:
         return 0.2
     if "REMOVE" in a:
-        return 0.8  # Removing things is high-risk
+        return 0.8
 
     return 0.3
 
@@ -874,7 +790,6 @@ if __name__ == "__main__":
     print("Testing Enhanced Guardrails System")
     print("=" * 70)
 
-    # Mock configuration
     config = {
         'value_guard': True,
         'causal_guard': True,
@@ -885,7 +800,6 @@ if __name__ == "__main__":
 
     guard = Guard(config)
 
-    # Test 1: Safe patch (should allow)
     print("\n[Test 1: Safe ADD_PRECONDITION patch]")
     safe_patch = {
         'action': 'ADD_PRECONDITION',
@@ -896,11 +810,11 @@ if __name__ == "__main__":
 
     result = guard.check(safe_patch)
     print(f"Decision: {result['decision']}")
+    print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     assert result['decision'] == 'allow', "Safe patch should pass"
     print("✅ Test 1 passed")
 
-    # Test 2: Dangerous pattern (should veto)
     print("\n[Test 2: Dangerous patch - removing security]")
     dangerous_patch = {
         'action': 'REFINE_EFFECT',
@@ -911,11 +825,11 @@ if __name__ == "__main__":
 
     result = guard.check(dangerous_patch)
     print(f"Decision: {result['decision']}")
+    print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     assert result['decision'] == 'veto', "Dangerous patch should be vetoed"
     print("✅ Test 2 passed")
 
-    # Test 3: High-impact patch (should request human)
     print("\n[Test 3: High-impact schema update]")
     high_impact_patch = {
         'action': 'UPDATE_TOOL_SCHEMA',
@@ -926,11 +840,11 @@ if __name__ == "__main__":
 
     result = guard.check(high_impact_patch)
     print(f"Decision: {result['decision']}")
+    print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     assert result['decision'] == 'request_human', "High-impact should escalate"
     print("✅ Test 3 passed")
 
-    # Test 4: Safety refinement (should have lower risk)
     print("\n[Test 4: Safety-enhancing REFINE_EFFECT]")
     safety_patch = {
         'action': 'REFINE_EFFECT',
@@ -942,13 +856,13 @@ if __name__ == "__main__":
     context = {'scores': {'risk': 0.4}, 'state': {'blackout_dates': ['Apr 10'], 'corporate_card_policy': 'blocked_on_blackout_dates'}}
     result = guard.check(safety_patch, context)
     print(f"Decision: {result['decision']}")
+    print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     print(f"Value impact: {result['value']['impact']:.2f}")
     assert result['decision'] == 'allow', "Safety refinement should pass"
     assert result['value']['impact'] < 0.6, "Should have low impact"
     print("✅ Test 4 passed")
 
-    # Test 5: Ambiguous causal patch
     print("\n[Test 5: Causal ambiguity check]")
     ambiguous_patch = {
         'action': 'REFINE_EFFECT',
@@ -959,11 +873,11 @@ if __name__ == "__main__":
 
     result = guard.check(ambiguous_patch)
     print(f"Decision: {result['decision']}")
+    print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     print(f"Causal ambiguity: {result['causal']['ambiguity']:.2f}")
     print("✅ Test 5 passed")
 
-    # Show statistics
     print("\n[Guardrail Statistics]")
     stats = guard.get_statistics()
     for key, value in stats.items():
