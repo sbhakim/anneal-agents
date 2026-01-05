@@ -22,11 +22,13 @@ MINIMUM SMT (Z3) IMPLEMENTATION (2026-01):
 MINIMUM TOOL-DRIFT ACCEPTANCE (2026-01):
 - In low-data regimes, allow UPDATE_TOOL_SCHEMA when trace evidence indicates tool drift
   (e.g., deprecated v1 endpoint). Canary still gates commit.
+
+MINIMUM DEFENSIBILITY UPDATE (2026-01):
+- Emit a structured Z3 verdict payload in returned scores under key "z3".
+  Guard/provenance can reuse this (no duplicate parsing in guard).
 """
 from typing import Dict, Any, List, Tuple
 import math
-import json
-import numpy as np
 import re
 
 
@@ -67,6 +69,9 @@ class Scorer:
         self.dual_vars = {'edge': 0.0, 'step': 0.0, 'tok': 0.0}
         self.dual_step_size = 0.01
         self.last_risk_score = 0.0  # Store last risk for canary fallback
+
+        # Last formal check payload (for guard/provenance to reuse)
+        self.last_z3_result: Dict[str, Any] = {"verdict": "NOT_RUN", "parse_coverage": 0.0, "atoms": []}
 
         self.scoring_history = []
         self._min_samples_for_filter = 5
@@ -231,7 +236,7 @@ class Scorer:
         )
         return improves
 
-    def score(self, patch: Dict[str, Any], trace: List = None) -> Dict[str, float]:
+    def score(self, patch: Dict[str, Any], trace: List = None) -> Dict[str, Any]:
         """
         Calculates the aggregate score and returns all score components.
         """
@@ -252,7 +257,11 @@ class Scorer:
             print("  ❌ REJECTED by probabilistic pre-filter (Section 8.3.5)")
             print("     No provable (or permitted low-data) improvement over baseline error rate.")
             print("=" * 70)
-            return {"aggregate": 0.0, "plausibility": 0.0, "consistency": 0.0, "utility": 0.0, "risk": 1.0}
+            self.last_z3_result = {"verdict": "NOT_RUN", "parse_coverage": 0.0, "atoms": []}
+            return {
+                "aggregate": 0.0, "plausibility": 0.0, "consistency": 0.0, "utility": 0.0, "risk": 1.0,
+                "z3": dict(self.last_z3_result)
+            }
 
         print("  🔬 Computing Score Components:")
         print("  " + "-" * 66)
@@ -301,7 +310,8 @@ class Scorer:
                 "consistency": consistency,
                 "utility": utility,
                 "risk": risk,
-                "budget_penalty": budget_penalty
+                "budget_penalty": budget_penalty,
+                "z3": dict(self.last_z3_result),
             },
             "weights": self.weights.copy()
         }
@@ -313,7 +323,8 @@ class Scorer:
             "consistency": consistency,
             "utility": utility,
             "risk": risk,
-            "budget_penalty": budget_penalty
+            "budget_penalty": budget_penalty,
+            "z3": dict(self.last_z3_result),  # reused by Guard/Provenance (audit + hard veto)
         }
 
     def _score_plausibility(self, patch: Dict[str, Any], trace: List) -> float:
@@ -357,12 +368,18 @@ class Scorer:
         print("  [2/4] Consistency (Eq. 10 - SAT/Symbolic Check):")
         print(f"        Solver: {'Z3 (SMT)' if self.use_z3 else 'Symbolic Heuristic'}")
 
+        # Always populate self.last_z3_result for audit/joinability.
         if self.use_z3:
-            score = self._z3_consistency_check(patch)
+            score, z3_payload = self._z3_consistency_check(patch)
         else:
             score = self._symbolic_consistency_check(patch)
+            z3_payload = {"verdict": "NOT_RUN", "parse_coverage": 0.0, "atoms": [], "solver": "none"}
+
+        self.last_z3_result = dict(z3_payload)
 
         print(f"        Result: {score:.3f} ({'✓ Consistent' if score >= 0.5 else '✗ Contradiction'})")
+        if self.last_z3_result.get("verdict") and self.last_z3_result.get("verdict") != "NOT_RUN":
+            print(f"        Z3 verdict: {self.last_z3_result.get('verdict')} (coverage={self.last_z3_result.get('parse_coverage', 0.0):.2f})")
 
         return score
 
@@ -392,24 +409,40 @@ class Scorer:
                 seen.add(key)
         return out
 
-    def _z3_consistency_check(self, patch: Dict[str, Any]) -> float:
+    def _z3_consistency_check(self, patch: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         details = str(patch.get('details', '') or '')
         lits = self._extract_smt_literals(details)
 
+        atoms_in_patch = sorted({a for a, _ in lits})
+        coverage = 1.0 if atoms_in_patch else 0.0
+
         if not lits:
             print("        ℹ️ Z3: No parsable SMT atoms in patch; using heuristic fallback")
-            return self._symbolic_consistency_check(patch)
+            score = self._symbolic_consistency_check(patch)
+            return score, {
+                "verdict": "UNKNOWN",
+                "parse_coverage": coverage,
+                "atoms": atoms_in_patch,
+                "solver": "z3",
+                "note": "no_atoms_fallback",
+            }
 
         try:
             from z3 import Solver, Bool, Not, Implies, sat, unsat  # type: ignore
         except Exception:
             print("        ⚠️ Z3 not installed (pip install z3-solver). Using heuristic fallback.")
-            return self._symbolic_consistency_check(patch)
+            score = self._symbolic_consistency_check(patch)
+            return score, {
+                "verdict": "NOT_RUN",
+                "parse_coverage": coverage,
+                "atoms": atoms_in_patch,
+                "solver": "z3",
+                "note": "z3_missing_fallback",
+            }
 
         try:
             s = Solver()
 
-            atoms_in_patch = sorted({a for a, _ in lits})
             vars_ = {a: Bool(self._smt_atoms[a]) for a in atoms_in_patch}
 
             for a, pol in lits:
@@ -417,6 +450,7 @@ class Scorer:
                     continue
                 s.add(vars_[a] if pol else Not(vars_[a]))
 
+            # Tiny axiom set (keep narrow; this is consistency-only).
             if "ExpiredPayment" in vars_ and "InvalidPayment" in vars_:
                 s.add(Implies(vars_["ExpiredPayment"], vars_["InvalidPayment"]))
 
@@ -426,17 +460,24 @@ class Scorer:
             res = s.check()
             if res == sat:
                 print(f"        ✓ Z3: SAT over atoms={atoms_in_patch}")
-                return 1.0
+                return 1.0, {"verdict": "SAT", "parse_coverage": coverage, "atoms": atoms_in_patch, "solver": "z3"}
             if res == unsat:
                 print(f"        ✗ Z3: UNSAT (inconsistent literals/axioms) over atoms={atoms_in_patch}")
-                return 0.0
+                return 0.0, {"verdict": "UNSAT", "parse_coverage": coverage, "atoms": atoms_in_patch, "solver": "z3"}
 
             print("        ⚠️ Z3: UNKNOWN; using conservative mid-score")
-            return 0.5
+            return 0.5, {"verdict": "UNKNOWN", "parse_coverage": coverage, "atoms": atoms_in_patch, "solver": "z3"}
 
         except Exception as e:
             print(f"        ⚠️ Z3 error: {e}, using heuristic fallback")
-            return self._symbolic_consistency_check(patch)
+            score = self._symbolic_consistency_check(patch)
+            return score, {
+                "verdict": "UNKNOWN",
+                "parse_coverage": coverage,
+                "atoms": atoms_in_patch,
+                "solver": "z3",
+                "note": "z3_error_fallback",
+            }
 
     def _symbolic_consistency_check(self, patch: Dict[str, Any]) -> float:
         action = patch.get('action', '')

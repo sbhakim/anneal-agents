@@ -14,6 +14,11 @@ MINIMUM DEFENSIBILITY UPDATE (2026-01):
 - Uses a simple geometric decay so near-term violations matter more than far-term ones.
 - Optionally mixes in a small "recent failures" prior from state when present, improving
   arbitration stability without adding new dependencies or learning code.
+
+MINIMUM RELIABILITY UPDATE (2026-01):
+- Uncertainty now measures missing/empty REQUIRED params (not just None across op.params).
+- Honors planner meta.needs_regrounding and treats common placeholders as ungrounded.
+- p_viol now includes required_params + validators in the gap computation (aligns with Verify-Before-Act).
 """
 from typing import Dict, Any, List
 from ..knowledge.rule_pool import RulePool
@@ -35,6 +40,18 @@ class SignalGenerator:
         """
         self.config = config
         self.rule_pool = rule_pool
+
+    @staticmethod
+    def _is_ungrounded_value(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s == "":
+                return True
+            if s in {"none", "null", "unknown", "tbd", "n/a", "na"}:
+                return True
+        return False
 
     def compute_uncertainty(self, plan: List[Dict[str, Any]]) -> float:
         """
@@ -58,18 +75,25 @@ class SignalGenerator:
         for step in plan:
             op = step.get("operator")
             params = step.get("params", {}) or {}
+            meta = step.get("meta", {}) or {}
             if not op:
                 continue
 
-            for expected_param in getattr(op, "params", []):
+            # Prefer required_params for defensibility; fall back to op.params.
+            expected = list(getattr(op, "required_params", None) or getattr(op, "params", []) or [])
+            needs_reground = set(meta.get("needs_regrounding", []) or [])
+
+            for key in expected:
                 total_params += 1
-                if params.get(expected_param) is None:
+                v = params.get(key, None)
+                if key in needs_reground or self._is_ungrounded_value(v):
                     ungrounded_params += 1
 
         uncertainty = (ungrounded_params / total_params) if total_params > 0 else 0.0
         uncertainty = max(0.0, min(1.0, float(uncertainty)))
         print(
-            f"SIGNALS: Computed uncertainty u = {uncertainty:.2f} ({ungrounded_params}/{total_params} ungrounded params)"
+            f"SIGNALS: Computed uncertainty u = {uncertainty:.2f} "
+            f"({ungrounded_params}/{total_params} ungrounded required params)"
         )
         return uncertainty
 
@@ -79,6 +103,7 @@ class SignalGenerator:
         This implements a lookahead "precondition gap" proxy:
         - checks up to `violation_horizon` upcoming operators
         - applies geometric decay so earlier failures weigh more
+        - includes required_params + validators to match Verify-Before-Act
 
         Args:
             plan: The current symbolic plan.
@@ -102,25 +127,48 @@ class SignalGenerator:
             step = plan[i]
             op = step.get("operator")
             params = step.get("params", {}) or {}
+            meta = step.get("meta", {}) or {}
             if not op:
                 continue
 
-            preconds = getattr(op, "preconditions", []) or []
-            total_preconditions = len(preconds)
-            if total_preconditions == 0:
-                continue
-
             unmet = 0
+            total = 0
+
+            # 0) Required grounding gap (matches RulePool.evaluate_preconditions)
+            required = list(getattr(op, "required_params", None) or [])
+            needs_reground = set(meta.get("needs_regrounding", []) or [])
+            for key in required:
+                total += 1
+                v = params.get(key, None)
+                if key in needs_reground or self._is_ungrounded_value(v):
+                    unmet += 1
+
+            # 1) Validators (schema/domain checks)
+            validators = getattr(op, "validators", None) or []
+            for validate in validators:
+                total += 1
+                try:
+                    if not bool(validate(state, params)):
+                        unmet += 1
+                except Exception:
+                    unmet += 1
+
+            # 2) Symbolic predicates (policy/availability/etc.)
+            preconds = getattr(op, "preconditions", None) or []
             for pred in preconds:
+                total += 1
                 try:
                     if not bool(pred(state, params)):
                         unmet += 1
                 except Exception:
                     unmet += 1  # treat check errors as potential violations
 
+            if total == 0:
+                continue
+
             w = (decay ** i)
             weighted_unmet += w * unmet
-            weighted_total += w * total_preconditions
+            weighted_total += w * total
 
         p_gap = (weighted_unmet / weighted_total) if weighted_total > 0 else 0.0
 

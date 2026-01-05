@@ -476,12 +476,31 @@ class SelfEvolveSystem:
             print(" FDKA: ❌ No patch proposed (provider error or empty response).")
             self.metrics.record_value_check(vetoed=False, reason="no_patch_proposed")
             self.metrics.record_causal_check(escalated=False, reason="no_patch_proposed")
+            # Audit: proposed_patch is empty; still record a consistent event
+            self.provenance.log_patch_event(
+                {"id": f"patch-{uuid.uuid4().hex[:8]}", "decision": "rejected", "reason": "no_patch_proposed"},
+                decision="rejected",
+                reason="no_patch_proposed",
+                trace={"trace_id": f"task-{task_id}"},
+                context={"task_id": task_id, "instruction": instruction},
+            )
             return False, None
+
+        # Ensure a stable patch id exists for joinability across metrics/provenance/rule_pool.
+        if not proposed_patch.get("id"):
+            proposed_patch["id"] = f"patch-{uuid.uuid4().hex[:8]}"
 
         if proposed_patch.get("action") == "REJECTED":
             print(f" FDKA: ❌ Patch rejected during validation: {proposed_patch.get('details')}")
             self.metrics.record_value_check(vetoed=False, reason="validation_reject")
             self.metrics.record_causal_check(escalated=False, reason="validation_reject")
+            self.provenance.log_patch_event(
+                proposed_patch,
+                decision="rejected",
+                reason="validation_reject",
+                trace={"trace_id": f"task-{task_id}"},
+                context={"task_id": task_id, "instruction": instruction},
+            )
             return False, None
 
         scores = self.scorer.score(proposed_patch, trace) or {}
@@ -492,6 +511,13 @@ class SelfEvolveSystem:
             self.metrics.record_patch(proposed_patch, success=False, committed=False, scores=scores)
             self.metrics.record_value_check(vetoed=False, reason="below_threshold")
             self.metrics.record_causal_check(escalated=False, reason="below_threshold")
+            self.provenance.log_patch_event(
+                proposed_patch,
+                decision="rejected",
+                reason="below_threshold",
+                trace={"trace_id": f"task-{task_id}"},
+                context={"task_id": task_id, "instruction": instruction, "scores": scores},
+            )
             return False, None
 
         guard_result = self.guard.check(
@@ -511,6 +537,8 @@ class SelfEvolveSystem:
             escalated=(guard_result['decision'] == 'request_human'),
             reason=guard_result.get('reason', '')
         )
+
+        canary_result: Dict[str, Any] = {}
 
         if guard_result['decision'] == 'allow':
             print(" FDKA: Guardrails passed. Proceeding to canary test...")
@@ -536,9 +564,29 @@ class SelfEvolveSystem:
 
             if canary_result.get("passed"):
                 print(" FDKA: Canary test passed. Committing patch permanently.")
-                if self.rule_pool.update_operator(proposed_patch):
-                    patch_applied = True
-                    patch_dict = proposed_patch
+
+                # IMPORTANT: PatchUpdateResult truthiness includes "skipped"; use .applied for commit semantics.
+                update_res = self.rule_pool.update_operator(proposed_patch)
+
+                patch_applied = bool(getattr(update_res, "applied", False))
+                patch_dict = proposed_patch if patch_applied else None
+
+                # If canary staging accidentally mutated the live pool, commit may show "skipped".
+                if (not patch_applied) and bool(getattr(update_res, "skipped", False)):
+                    print(
+                        f"  ⚠️ FDKA: Patch commit returned skipped ({getattr(update_res, 'reason', '')}). "
+                        f"Not counting as committed."
+                    )
+
+                # Attach audit fields from RulePool (signature/edit_key/polarity/conflict)
+                try:
+                    proposed_patch["signature"] = getattr(update_res, "signature", "") or proposed_patch.get("signature", "")
+                    proposed_patch["edit_key"] = getattr(update_res, "edit_key", "") or proposed_patch.get("edit_key", "")
+                    proposed_patch["polarity"] = getattr(update_res, "polarity", "") or proposed_patch.get("polarity", "")
+                    proposed_patch["reason"] = getattr(update_res, "reason", "") or proposed_patch.get("reason", "")
+                    proposed_patch["conflict_with"] = getattr(update_res, "conflict_with", "") or proposed_patch.get("conflict_with", "")
+                except Exception:
+                    pass
             else:
                 print(f" FDKA: ❌ Canary test failed: {canary_result.get('reason')}")
         elif guard_result['decision'] == 'request_human':
@@ -546,23 +594,59 @@ class SelfEvolveSystem:
         else:
             print(f" FDKA: ❌ Guardrails blocked patch: {guard_result.get('reason')}")
 
-        patch_id = (patch_dict or proposed_patch).get("id", f"patch-{uuid.uuid4().hex[:8]}")
-        self.provenance.log({
-            "patch_id": patch_id,
-            "task_id": task_id,
-            "applied": patch_applied,
-            "patch": patch_dict or proposed_patch
-        })
+        # Provenance: record the decision consistently (applied vs skipped vs rejected).
+        decision = "applied" if patch_applied else ("rejected" if not canary_result.get("passed") and guard_result.get("decision") == "allow" else "rejected")
+        if guard_result.get("decision") != "allow":
+            decision = "rejected"
+        if canary_result.get("passed") and (not patch_applied) and proposed_patch.get("reason") in ("duplicate_cached", "no_change_already_present"):
+            decision = "skipped"
+
+        reason = ""
+        if guard_result.get("decision") == "veto":
+            reason = guard_result.get("reason", "guard_veto")
+        elif guard_result.get("decision") == "request_human":
+            reason = guard_result.get("reason", "request_human")
+        elif guard_result.get("decision") == "allow":
+            if not canary_result.get("passed"):
+                reason = canary_result.get("reason", "canary_fail")
+            else:
+                reason = proposed_patch.get("reason", "committed" if patch_applied else "skipped")
+
+        # Write one audit record with joinable ids and key governance outcomes.
+        try:
+            self.provenance.log_patch_event(
+                proposed_patch,
+                decision=decision,
+                reason=reason,
+                trace={"trace_id": f"task-{task_id}"},
+                context={
+                    "task_id": task_id,
+                    "instruction": instruction,
+                    "scores": scores,
+                    "guard": guard_result,
+                    "canary": canary_result,
+                },
+            )
+        except Exception:
+            # Fall back to legacy log to avoid breaking runs.
+            self.provenance.log({
+                "patch_id": proposed_patch.get("id"),
+                "task_id": task_id,
+                "applied": patch_applied,
+                "patch": patch_dict or proposed_patch
+            })
+
         self.metrics.record_patch(patch_dict or proposed_patch, success=patch_applied, committed=patch_applied, scores=scores)
 
         if patch_applied:
+            patch_id = proposed_patch.get("id")
             self._last_committed_patch_id = patch_id
             self.trust_scorer.initialize_trust(patch_id)
             try:
                 self._committed_patches.append({
                     "patch_id": patch_id,
-                    "operator": patch_dict.get("operator"),
-                    "action": patch_dict.get("action"),
+                    "operator": proposed_patch.get("operator"),
+                    "action": proposed_patch.get("action"),
                     "scores": {
                         "plausibility": scores.get("plausibility"),
                         "consistency": scores.get("consistency"),

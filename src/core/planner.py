@@ -151,11 +151,29 @@ class Planner:
         """
         Minimal date extractor to reduce PlanningFailed:
         supports 'on June 7', 'around June 7', and ranges like 'June 1-3'.
-        """
-        date_match = re.search(r"(\b[A-Za-z]+\s\d{1,2}-\d{1,2}\b)", instruction)
-        if date_match:
-            return date_match.group(1).strip()
 
+        Note: for flight 'date' we prefer a single-day anchor ("on ...") over ranges.
+        """
+        # Prefer explicit single-day anchors for flight date.
+        if field_name == "date":
+            on_match = re.search(r"\bon\s([A-Za-z]+\s\d{1,2})\b", instruction, re.IGNORECASE)
+            if on_match:
+                return on_match.group(1).strip()
+
+            around_match = re.search(r"\baround\s([A-Za-z]+\s\d{1,2})\b", instruction, re.IGNORECASE)
+            if around_match:
+                return around_match.group(1).strip()
+
+        # Range like "June 1-3" or "June 1–3" (en-dash).
+        date_match = re.search(r"(\b[A-Za-z]+\s\d{1,2}\s*[–-]\s*\d{1,2}\b)", instruction)
+        if date_match:
+            rng = date_match.group(1).strip()
+            if field_name == "date":
+                # Flight APIs typically want a single date; take the start of the range.
+                return rng.replace("–", "-").split("-")[0].strip()
+            return rng.replace("–", "-")
+
+        # If not already checked above (hotel dates), look for single-day anchors.
         on_match = re.search(r"\bon\s([A-Za-z]+\s\d{1,2})\b", instruction, re.IGNORECASE)
         if on_match:
             return on_match.group(1).strip()

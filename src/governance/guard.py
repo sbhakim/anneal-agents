@@ -36,6 +36,11 @@ MINIMUM RELIABILITY UPDATES (2026-01):
 MINIMUM MANUSCRIPT/RESULTS UPDATE (2026-01):
 - Return a structured `reason_code` (stable vocabulary) in addition to free-text `reason`.
   This makes Table 4 + audit logs consistent across runs.
+
+MINIMUM FORMAL GATE UPDATE (2026-01):
+- Reuse scorer-provided Z3 verdict (no re-parsing here).
+- If enabled and verdict is UNSAT with non-trivial coverage → VETO.
+- UNKNOWN never vetoes; it is surfaced for audit and canary remains the gate.
 """
 
 from __future__ import annotations
@@ -51,6 +56,8 @@ class GuardConfig:
     enable_causal_guard: bool = True
     tau_impact: float = 0.6  # Veto if value impact >= tau_impact
     tau_ambiguity: float = 0.5  # Escalate if ambiguity >= tau_ambiguity (aka tau_conf)
+    use_z3: bool = False  # Hard veto only uses scorer verdict; guard does not run Z3.
+    z3_min_coverage: float = 0.25  # Require some extraction coverage to trust UNSAT.
 
 
 class Guard:
@@ -81,6 +88,8 @@ class Guard:
             enable_causal_guard=cfg.get("causal_guard", True),
             tau_impact=gates.get("tau_impact", 0.6),
             tau_ambiguity=gates.get("tau_conf", cfg.get("ambiguity_threshold", 0.5)),
+            use_z3=bool(gates.get("use_z3", cfg.get("use_z3", False))),
+            z3_min_coverage=float(gates.get("z3_min_coverage", cfg.get("z3_min_coverage", 0.25))),
         )
 
         # Knowledge graph integration (optional)
@@ -100,7 +109,8 @@ class Guard:
             'causal_escalations': 0,
             'allows': 0,
             'kg_checks': 0,
-            'heuristic_checks': 0
+            'heuristic_checks': 0,
+            'z3_vetoes': 0,
         }
 
         # Cache for performance
@@ -112,6 +122,7 @@ class Guard:
         print(f"  - Causal guard: {'ENABLED' if self.cfg.enable_causal_guard else 'DISABLED'}")
         print(f"  - Impact threshold (tau_impact): {self.cfg.tau_impact}")
         print(f"  - Ambiguity threshold (tau_conf): {self.cfg.tau_ambiguity}")
+        print(f"  - Z3 hard gate: {'ENABLED' if self.cfg.use_z3 else 'DISABLED'}")
         print(f"  - ValueKG: {'Available' if self.value_kg else 'Unavailable (using heuristics)'}")
         print(f"  - CausalKG: {'Available' if self.causal_kg else 'Unavailable (using heuristics)'}")
 
@@ -195,6 +206,50 @@ class Guard:
 
         return True
 
+    def _extract_z3_verdict(self, ctx: Dict[str, Any]) -> Tuple[str, Dict[str, Any], float]:
+        """
+        Reuse scorer-provided Z3 verdict; guard does not run Z3 or parse literals.
+        Returns (verdict, payload, coverage) where verdict ∈ {SAT, UNSAT, UNKNOWN, NOT_RUN}.
+        """
+        scores = ctx.get("scores", {}) or {}
+        z3_obj = None
+
+        if isinstance(scores, dict):
+            z3_obj = scores.get("z3") or scores.get("z3_result") or scores.get("z3_verdict")
+            if isinstance(z3_obj, str):
+                z3_obj = {"verdict": z3_obj}
+            if not isinstance(z3_obj, dict):
+                # Some scorers embed details inside "consistency" dict.
+                maybe = scores.get("consistency")
+                if isinstance(maybe, dict) and any(k in maybe for k in ("verdict", "status", "result")):
+                    z3_obj = maybe
+
+        if not isinstance(z3_obj, dict):
+            return "NOT_RUN", {}, 0.0
+
+        verdict = str(z3_obj.get("verdict") or z3_obj.get("status") or z3_obj.get("result") or "UNKNOWN").strip().upper()
+        if verdict not in {"SAT", "UNSAT", "UNKNOWN"}:
+            verdict = "UNKNOWN"
+
+        cov = z3_obj.get("parse_coverage", z3_obj.get("coverage", None))
+        coverage = 0.0
+        try:
+            if cov is not None:
+                coverage = float(cov)
+        except Exception:
+            coverage = 0.0
+
+        # If coverage missing, infer a conservative signal from atoms when present.
+        if coverage <= 0.0:
+            atoms = z3_obj.get("atoms", None)
+            if isinstance(atoms, (list, tuple)) and len(atoms) > 0:
+                coverage = 1.0
+
+        payload = dict(z3_obj)
+        payload["verdict"] = verdict
+        payload["parse_coverage"] = coverage
+        return verdict, payload, _clamp01(coverage)
+
     # ========================================================================
     # MAIN PUBLIC API
     # ========================================================================
@@ -205,20 +260,9 @@ class Guard:
 
         Priority order:
         1. Value guard (safety/policy/ethics) → 'veto' if high impact/risk
-        2. Causal guard (ambiguity/impact) → 'request_human' if high
-        3. Otherwise → 'allow'
-
-        Args:
-            patch: Patch or action to validate
-            context: Optional context with state, scores, KGs, trace
-
-        Returns:
-            Dictionary with:
-            - decision: 'veto' | 'request_human' | 'allow'
-            - reason_code: stable code for analysis (Table 4 / audits)
-            - reason: Human-readable explanation
-            - value: Value guard payload (impact, explanation, reason_code)
-            - causal: Causal guard payload (ambiguity, impact, explanation, reason_code)
+        2. Formal consistency gate (Z3 verdict from scorer) → 'veto' on UNSAT when enabled
+        3. Causal guard (ambiguity/impact) → 'request_human' if high
+        4. Otherwise → 'allow'
         """
         context = context or {}
         self.stats['total_checks'] += 1
@@ -244,28 +288,57 @@ class Guard:
                 },
             }
 
+        # Stage 1.5: Formal consistency gate (reuse scorer verdict; no solver work here)
+        z3_verdict, z3_payload, z3_cov = self._extract_z3_verdict(context)
+        if self.cfg.use_z3 and z3_verdict == "UNSAT" and z3_cov >= _clamp01(self.cfg.z3_min_coverage):
+            self.stats['value_vetoes'] += 1
+            self.stats['z3_vetoes'] += 1
+            return {
+                "decision": "veto",
+                "reason_code": "VALUE:Z3_UNSAT",
+                "reason": "Formal consistency check UNSAT (scorer verdict)",
+                "value": {
+                    "impact": 1.0,
+                    "reason_code": "VALUE:Z3_UNSAT",
+                    "explanation": "Z3 UNSAT from scorer; rejecting contradictory patch"
+                },
+                "causal": {
+                    "ambiguity": 0.0,
+                    "impact": 0.0,
+                    "reason_code": "CAUSAL:SKIPPED_Z3_VETO",
+                    "explanation": "Skipped due to Z3 UNSAT veto"
+                },
+                "z3": z3_payload,
+            }
+
         # Stage 2: Causal Guardrails (can REQUEST_HUMAN)
         c_decision, c_payload = self._check_causal_guardrail(patch, context)
 
         if self.cfg.enable_causal_guard and c_decision == "request_human":
             self.stats['causal_escalations'] += 1
-            return {
+            out = {
                 "decision": "request_human",
                 "reason_code": c_payload.get("reason_code", "CAUSAL:REQUEST_HUMAN"),
                 "reason": c_payload.get("explanation", "Causal guard requested human review"),
                 "value": v_payload,
                 "causal": c_payload,
             }
+            if z3_verdict != "NOT_RUN":
+                out["z3"] = z3_payload
+            return out
 
         # All guards passed
         self.stats['allows'] += 1
-        return {
+        out = {
             "decision": "allow",
             "reason_code": "ALLOW",
             "reason": "Guards passed",
             "value": v_payload,
             "causal": c_payload,
         }
+        if z3_verdict != "NOT_RUN":
+            out["z3"] = z3_payload  # audit-only (UNKNOWN does not block; canary remains the gate)
+        return out
 
     # ========================================================================
     # VALUE GUARDRAILS (Section VIII-E.1, Eq. 16)
@@ -274,21 +347,6 @@ class Guard:
     def _check_value_guardrail(self, patch: Any, ctx: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """
         Estimate the impact/risk of committing this patch under value/policy constraints.
-
-        From Eq. 16:
-        Guard_val(Δo) = {
-            veto,   ∃c ∈ KG^val : c(ψ(Δo)) = ⊥,
-            allow,  otherwise
-        }
-
-        IMPORTANT: Value vetoes are lexicographic - they override ALL utility.
-
-        Args:
-            patch: Patch to validate
-            ctx: Context with state, scores, value_kg
-
-        Returns:
-            Tuple of (decision, payload) where decision ∈ {'veto', 'allow'}
         """
         if not self.cfg.enable_value_guard:
             return "allow", {"impact": 0.0, "reason_code": "VALUE:DISABLED", "explanation": "Value guard disabled"}
@@ -353,14 +411,6 @@ class Guard:
     def _check_dangerous_patterns(self, patch: Any) -> Tuple[bool, str]:
         """
         Check for hardcoded dangerous patterns that should always be vetoed.
-
-        Patterns include:
-        - Removing security checks
-        - Disabling authentication
-        - Removing payment validation
-        - Bypassing privacy controls
-        - Removing preconditions (weakens safety)
-        - Removing negations from safety constraints
         """
         action = _get(patch, "action", "")
         details = _get(patch, "details", "").lower()
@@ -399,13 +449,6 @@ class Guard:
     def _extract_params(self, patch: Any, state: Optional[Dict]) -> Dict[str, Any]:
         """
         Extract parameters from patch for deontic checking.
-
-        Args:
-            patch: Patch with details
-            state: Current state
-
-        Returns:
-            Dictionary of parameters
         """
         params = {}
 
@@ -750,6 +793,7 @@ class Guard:
             'escalation_rate': (self.stats['causal_escalations'] / causal_checks) if causal_checks > 0 else 0.0,
             'kg_checks': self.stats['kg_checks'],
             'heuristic_checks': self.stats['heuristic_checks'],
+            'z3_vetoes': self.stats.get('z3_vetoes', 0),
             'has_value_kg': self.value_kg is not None,
             'has_causal_kg': self.causal_kg is not None,
             'cache_size': len(self.veto_cache)
@@ -831,7 +875,7 @@ if __name__ == "__main__":
     config = {
         'value_guard': True,
         'causal_guard': True,
-        'gates': {'tau_impact': 0.6, 'tau_conf': 0.5},
+        'gates': {'tau_impact': 0.6, 'tau_conf': 0.5, 'use_z3': True, 'z3_min_coverage': 0.25},
         'blackout_dates': ['April 10', 'April 11', 'April 12'],
         'corporate_card_policy': 'blocked_on_blackout_dates'
     }
@@ -846,14 +890,28 @@ if __name__ == "__main__":
         'justification': 'Payment validation'
     }
 
-    result = guard.check(safe_patch)
+    result = guard.check(safe_patch, context={"scores": {"z3": {"verdict": "SAT", "parse_coverage": 1.0}}})
     print(f"Decision: {result['decision']}")
     print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     assert result['decision'] == 'allow', "Safe patch should pass"
     print("✅ Test 1 passed")
 
-    print("\n[Test 2: Dangerous patch - removing security]")
+    print("\n[Test 2: Z3 UNSAT veto]")
+    unsat_patch = {
+        'action': 'ADD_PRECONDITION',
+        'operator': 'BookHotel',
+        'details': 'Not(ValidPayment(payment))',
+        'justification': 'Bad edit'
+    }
+    result = guard.check(unsat_patch, context={"scores": {"z3": {"verdict": "UNSAT", "parse_coverage": 1.0}}})
+    print(f"Decision: {result['decision']}")
+    print(f"ReasonCode: {result.get('reason_code')}")
+    print(f"Reason: {result['reason']}")
+    assert result['decision'] == 'veto', "UNSAT should veto"
+    print("✅ Test 2 passed")
+
+    print("\n[Test 3: Dangerous patch - removing security]")
     dangerous_patch = {
         'action': 'REFINE_EFFECT',
         'operator': 'ProcessPayment',
@@ -866,9 +924,9 @@ if __name__ == "__main__":
     print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     assert result['decision'] == 'veto', "Dangerous patch should be vetoed"
-    print("✅ Test 2 passed")
+    print("✅ Test 3 passed")
 
-    print("\n[Test 3: High-impact schema update]")
+    print("\n[Test 4: High-impact schema update]")
     high_impact_patch = {
         'action': 'UPDATE_TOOL_SCHEMA',
         'operator': 'BookingAPI',
@@ -881,9 +939,9 @@ if __name__ == "__main__":
     print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     assert result['decision'] == 'request_human', "High-impact should escalate"
-    print("✅ Test 3 passed")
+    print("✅ Test 4 passed")
 
-    print("\n[Test 4: Safety-enhancing REFINE_EFFECT]")
+    print("\n[Test 5: Safety-enhancing REFINE_EFFECT]")
     safety_patch = {
         'action': 'REFINE_EFFECT',
         'operator': 'BookFlight',
@@ -899,9 +957,9 @@ if __name__ == "__main__":
     print(f"Value impact: {result['value']['impact']:.2f}")
     assert result['decision'] == 'allow', "Safety refinement should pass"
     assert result['value']['impact'] < 0.6, "Should have low impact"
-    print("✅ Test 4 passed")
+    print("✅ Test 5 passed")
 
-    print("\n[Test 5: Causal ambiguity check]")
+    print("\n[Test 6: Causal ambiguity check]")
     ambiguous_patch = {
         'action': 'REFINE_EFFECT',
         'operator': 'SendEmail',
@@ -914,7 +972,7 @@ if __name__ == "__main__":
     print(f"ReasonCode: {result.get('reason_code')}")
     print(f"Reason: {result['reason']}")
     print(f"Causal ambiguity: {result['causal']['ambiguity']:.2f}")
-    print("✅ Test 5 passed")
+    print("✅ Test 6 passed")
 
     print("\n[Guardrail Statistics]")
     stats = guard.get_statistics()

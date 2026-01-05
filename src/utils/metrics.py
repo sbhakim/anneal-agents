@@ -43,6 +43,11 @@ MINIMUM UPDATE (recovery separation for defensibility):
     - step_success with recovered=True (recovery succeeded)
 - Report Recovery Rate separately from terminal failure rates, so "success" and
   "interventions" are not conflated.
+
+MINIMUM UPDATE (governance/patch audit joinability):
+- Record joinable patch UUIDs when available (patch["id"] / patch["patch_id"]).
+- Track patch decisions (applied/skipped/rejected) separately from "accepted" scoring.
+- Track Z3 verdict counts from scorer payload (SAT/UNSAT/UNKNOWN/NOT_RUN).
 """
 import json
 from typing import Dict, Any, List, Optional
@@ -102,6 +107,11 @@ class MetricsCollector:
         self.patch_count = 0
         self.accepted_patches = 0
         self.rejected_patches = 0
+
+        # Patch decision tracking (commit-path defensibility)
+        self.patch_decision_counts: Dict[str, int] = defaultdict(int)  # applied/skipped/rejected/proposed
+        self.patch_reject_reasons: Dict[str, int] = defaultdict(int)  # reason or reason_code
+        self.z3_verdict_counts: Dict[str, int] = defaultdict(int)  # SAT/UNSAT/UNKNOWN/NOT_RUN
 
         # Rollback tracking
         self.rollbacks: List[Dict] = []
@@ -218,22 +228,74 @@ class MetricsCollector:
         if task_id > 0 and (task_id + 1) % 10 == 0:
             print(f"METRICS: Processed {task_id + 1} tasks. Success rate: {self.get_success_rate():.1%}")
 
-    def record_patch(self, patch: Dict, success: bool, committed: bool = False,
-                     scores: Optional[Dict[str, float]] = None) -> None:
+    def _derive_patch_decision(self, patch: Dict[str, Any], success: bool, committed: bool) -> str:
+        """
+        Derive a stable patch decision label:
+        - Prefer explicit patch['decision'] when present (provenance/system).
+        - Otherwise fall back to committed/success flags.
+        """
+        decision = str(patch.get("decision", "") or "").strip().lower()
+        if decision in {"applied", "skipped", "rejected", "rollback", "proposed"}:
+            return decision
+        # Conservative fallback semantics
+        if committed and success:
+            return "applied"
+        if success and not committed:
+            return "proposed"
+        # Mark duplicates/no-ops explicitly when system attaches reasons
+        reason = str(patch.get("reason", "") or "").lower()
+        if reason in {"duplicate_cached", "no_change_already_present"}:
+            return "skipped"
+        return "rejected"
+
+    def record_patch(
+        self,
+        patch: Dict,
+        success: bool,
+        committed: bool = False,
+        scores: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Record a proposed or committed patch."""
         self.patch_count += 1
+
+        # Joinable patch id for audit (string), while keeping numeric counter for legacy scripts.
+        patch_uuid = patch.get("id") or patch.get("patch_id") or ""
+
+        decision = self._derive_patch_decision(patch, success=success, committed=committed)
+        reason = patch.get("reason_code") or patch.get("reason") or ""
+
         patch_record = {
-            "patch_id": self.patch_count,
+            "patch_id": self.patch_count,  # legacy counter
+            "patch_uuid": patch_uuid,
             "operator": patch.get("operator"),
             "action": patch.get("action"),
             "details": patch.get("details", ""),
             "accepted": success,
             "committed": committed,
+            "decision": decision,
+            "reason": reason,
+            # Optional audit join keys (when present)
+            "signature": patch.get("signature", ""),
+            "edit_key": patch.get("edit_key", ""),
+            "polarity": patch.get("polarity", ""),
+            "conflict_with": patch.get("conflict_with", ""),
             "timestamp": time.time()
         }
 
         if scores is not None:
             patch_record["scores"] = scores
+
+            # Record Z3 verdict counts for governance audit (guard reuses this payload).
+            z3 = scores.get("z3") if isinstance(scores, dict) else None
+            if isinstance(z3, dict):
+                verdict = str(z3.get("verdict", "NOT_RUN") or "NOT_RUN").upper()
+                if verdict not in {"SAT", "UNSAT", "UNKNOWN", "NOT_RUN"}:
+                    verdict = "UNKNOWN"
+                self.z3_verdict_counts[verdict] += 1
+
+        self.patch_decision_counts[decision] += 1
+        if decision in {"rejected", "rollback"} and reason:
+            self.patch_reject_reasons[str(reason)] += 1
 
         if success:
             self.accepted_patches += 1
@@ -241,7 +303,7 @@ class MetricsCollector:
             self.rejected_patches += 1
 
         self.patches.append(patch_record)
-        print(f"METRICS: Patch #{self.patch_count} {'accepted' if success else 'rejected'}")
+        print(f"METRICS: Patch #{self.patch_count} {decision}")
 
     def record_rollback(self, patch_id: int, justified: bool = True) -> None:
         """Record a patch rollback."""
@@ -355,6 +417,11 @@ class MetricsCollector:
             if total_canary > 0 else 0.0
         )
 
+        # Patch decision and Z3 audit counters (paper tables / ablations)
+        stats["patch_decisions"] = dict(self.patch_decision_counts)
+        stats["patch_reject_reasons"] = dict(self.patch_reject_reasons)
+        stats["z3_verdict_counts"] = dict(self.z3_verdict_counts)
+
         return stats
 
     def to_governance_dict(self) -> Dict[str, Any]:
@@ -362,6 +429,7 @@ class MetricsCollector:
         Compact governance view suitable for JSON sidecars or quick CSVs.
         """
         s = self.get_governance_stats()
+        z3c = s.get("z3_verdict_counts", {}) or {}
         return {
             "value_checks": s["value_checks"],
             "value_vetoes": s["value_vetoes"],
@@ -374,6 +442,11 @@ class MetricsCollector:
             "canary_fails": s["canary_fails"],
             "canary_pass_rate": s["canary_pass_rate"],
             "canary_fail_rate": s["canary_fail_rate"],
+            # Audit: formal gate signal presence
+            "z3_sat": int(z3c.get("SAT", 0)),
+            "z3_unsat": int(z3c.get("UNSAT", 0)),
+            "z3_unknown": int(z3c.get("UNKNOWN", 0)),
+            "z3_not_run": int(z3c.get("NOT_RUN", 0)),
         }
 
     # ============= METRIC CALCULATION METHODS =============
@@ -599,6 +672,12 @@ class MetricsCollector:
             "human_interventions": self.human_interventions,
             "failure_classes": {k: len(v) for k, v in self.failure_classes.items()},
             "failure_event_counts": dict(self.failure_event_counts),
+
+            # Audit extras
+            "patch_decisions": dict(self.patch_decision_counts),
+            "patch_reject_reasons": dict(self.patch_reject_reasons),
+            "z3_verdict_counts": dict(self.z3_verdict_counts),
+
             "elapsed_time_seconds": elapsed_time,
             "tasks_per_second": self.task_count / elapsed_time if elapsed_time > 0 else 0,
             "governance_stats": self.get_governance_stats(),
@@ -632,6 +711,13 @@ class MetricsCollector:
         print(f"  Patches Proposed: {summary['patches_proposed']}")
         print(f"  Patches Accepted: {summary['patches_accepted']}")
         print(f"  Acceptance Rate: {summary['acceptance_rate']:.1%}")
+        if summary.get("patch_decisions"):
+            pdn = summary["patch_decisions"]
+            print(f"  Decisions: applied={pdn.get('applied', 0)}, skipped={pdn.get('skipped', 0)}, rejected={pdn.get('rejected', 0)}")
+
+        z3c = summary.get("z3_verdict_counts") or {}
+        if z3c:
+            print(f"  Z3 verdicts: SAT={z3c.get('SAT', 0)}, UNSAT={z3c.get('UNSAT', 0)}, UNKNOWN={z3c.get('UNKNOWN', 0)}, NOT_RUN={z3c.get('NOT_RUN', 0)}")
 
         print(f"\n[Primary Metrics]")
         print(f"  Repeat Failure Rate (Observed): {summary['observed_rfr']:.1%}")
@@ -814,20 +900,26 @@ class MetricsCollector:
         """
         if not self.patches:
             return pd.DataFrame(columns=[
-                'patch_id', 'operator', 'action', 'details', 'accepted', 'committed',
-                'plausibility', 'consistency', 'utility', 'risk', 'aggregate', 'timestamp'
+                'patch_id', 'patch_uuid', 'operator', 'action', 'details', 'accepted', 'committed',
+                'decision', 'reason',
+                'plausibility', 'consistency', 'utility', 'risk', 'aggregate',
+                'z3_verdict', 'timestamp'
             ])
         rows: List[Dict[str, Any]] = []
         for p in self.patches:
             row = {
                 'patch_id': p.get('patch_id'),
+                'patch_uuid': p.get('patch_uuid'),
                 'operator': p.get('operator'),
                 'action': p.get('action'),
                 'details': p.get('details'),
                 'accepted': p.get('accepted'),
                 'committed': p.get('committed'),
+                'decision': p.get('decision'),
+                'reason': p.get('reason'),
                 'timestamp': p.get('timestamp'),
-                'plausibility': None, 'consistency': None, 'utility': None, 'risk': None, 'aggregate': None
+                'plausibility': None, 'consistency': None, 'utility': None, 'risk': None, 'aggregate': None,
+                'z3_verdict': None,
             }
             if isinstance(p.get('scores'), dict):
                 sc = p['scores']
@@ -838,6 +930,9 @@ class MetricsCollector:
                     'risk': sc.get('risk'),
                     'aggregate': sc.get('aggregate'),
                 })
+                z3 = sc.get("z3")
+                if isinstance(z3, dict):
+                    row["z3_verdict"] = z3.get("verdict")
             rows.append(row)
         return pd.DataFrame(rows)
 
@@ -964,21 +1059,25 @@ if __name__ == "__main__":
     print("\n[Simulating patches with scores and LLM calls...]")
     for i in range(5):
         patch = {
+            "id": f"patch-test-{i}",
             "operator": "BookHotel",
-            "action": "ADD_PRECONDITION"
+            "action": "ADD_PRECONDITION",
+            "decision": "applied",
+            "reason": "committed",
         }
         scores = {
             "plausibility": 0.8,
             "consistency": 1.0,
             "utility": 0.7,
             "risk": 0.2,
-            "aggregate": 0.78
+            "aggregate": 0.78,
+            "z3": {"verdict": "SAT", "parse_coverage": 1.0, "atoms": ["ValidPayment"]},
         }
         metrics.record_patch(patch, success=True, committed=True, scores=scores)
         metrics.record_llm_call(tokens=1200, latency_sec=2.5, model='deepseek-chat')
 
     print("\n[Simulating governance checks...]")
-    metrics.record_value_check(vetoed=True, reason="Deontic violation")
+    metrics.record_value_check(vetoed=True, reason="VALUE:DEONTIC")
     metrics.record_causal_check(escalated=False)
     metrics.record_canary_test(passed=True)
     metrics.record_canary_test(passed=True)
