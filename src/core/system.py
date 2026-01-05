@@ -72,6 +72,16 @@ from ..scenarios.test_cases import (
 )
 
 
+class _NoOpProvenance:
+    """No-op provenance sink (used when governance.provenance.enable is false)."""
+
+    def log(self, provenance_tuple: Dict):
+        return
+
+    def log_patch_event(self, *args, **kwargs):
+        return
+
+
 class SelfEvolveSystem:
     """
     Main SELFEVOLVE system orchestrator that integrates all components.
@@ -87,8 +97,31 @@ class SelfEvolveSystem:
         # Reproducibility: stable run identifier for manifests + artifacts
         self.run_id: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
 
+        # Normalize potentially-mis-typed config blocks (some runners set booleans for ablations)
+        fdka_cfg = config.get("fdka", {})
+        if not isinstance(fdka_cfg, dict):
+            fdka_cfg = {}
+        gov_cfg = config.get("governance", {})
+        if not isinstance(gov_cfg, dict):
+            gov_cfg = {}
+
         # Metrics first so we can wire it into dependent subsystems (FDKA)
         self.metrics = MetricsCollector()
+
+        # Attach minimal run metadata for defensible multi-LLM attribution (saved in metrics.json)
+        pe_cfg = (fdka_cfg.get("propose_edit", {}) or {}) if isinstance(fdka_cfg, dict) else {}
+        scenario_cfg = config.get("scenario", {}) or {}
+        self.metrics.set_run_metadata({
+            "run_id": self.run_id,
+            "results_dir": (config.get("output", {}) or {}).get("results_dir"),
+            "difficulty": scenario_cfg.get("difficulty"),
+            "seed": scenario_cfg.get("failure_injector_seed"),
+            "num_tasks": scenario_cfg.get("num_tasks"),
+            "llm_provider": pe_cfg.get("llm_provider"),
+            "model": pe_cfg.get("model"),
+            "fdka_enabled": bool(fdka_cfg.get("enabled", True)),
+            "fdka_threshold": float(fdka_cfg.get("threshold", 0.5)),
+        })
 
         self.state = SymbolicState()
         self.rule_pool = RulePool(config['knowledge']['rule_pool_path'])
@@ -108,16 +141,24 @@ class SelfEvolveSystem:
         )
 
         # Pass metrics collector to FDKA to capture efficiency stats from LLM calls
-        self.fdka = FDKAPipeline(config['fdka'], metrics_collector=self.metrics)
-        self.scorer = Scorer(config['fdka'], experience_pool=self.experience_pool)
-        self.guard = Guard(config.get('governance', {}))
-        self.provenance = ProvenanceTracker(config['governance']['provenance'])
-        self.trust_scorer = TrustScorer(config['governance']['trust'])
-        self.canary_runner = CanaryRunner(config.get('governance', {}).get('canary', {}))
+        self.fdka = FDKAPipeline(fdka_cfg, metrics_collector=self.metrics)
+        self.scorer = Scorer(fdka_cfg, experience_pool=self.experience_pool)
+        self.guard = Guard(gov_cfg)
+
+        # Provenance can be disabled in ablations; keep a no-op sink to avoid None checks everywhere.
+        prov_cfg = (gov_cfg.get("provenance", {}) or {}) if isinstance(gov_cfg, dict) else {}
+        if bool(prov_cfg.get("enable", True)):
+            self.provenance = ProvenanceTracker(prov_cfg)
+        else:
+            self.provenance = _NoOpProvenance()
+
+        trust_cfg = (gov_cfg.get("trust", {}) or {}) if isinstance(gov_cfg, dict) else {}
+        self.trust_scorer = TrustScorer(trust_cfg)
+        self.canary_runner = CanaryRunner((gov_cfg.get('canary', {}) or {}) if isinstance(gov_cfg, dict) else {})
 
         # Explicit enable flag; threshold is for accept gating only
-        self.fdka_enabled: bool = bool(config.get('fdka', {}).get('enabled', True))
-        self.fdka_threshold: float = float(config.get('fdka', {}).get('threshold', 0.5))
+        self.fdka_enabled: bool = bool(fdka_cfg.get('enabled', True))
+        self.fdka_threshold: float = float(fdka_cfg.get('threshold', 0.5))
 
         self._last_committed_patch_id: Optional[str] = None
 
@@ -135,10 +176,9 @@ class SelfEvolveSystem:
         )
 
         # Log effective runtime switches for diagnosability
-        pe = (config.get('fdka', {}) or {}).get('propose_edit', {}) or {}
         self.logger.info(f"Run ID: {self.run_id}")
         self.logger.info(f"FDKA enabled: {self.fdka_enabled}  | threshold: {self.fdka_threshold:.3f}")
-        self.logger.info(f"FDKA provider/model: {pe.get('llm_provider', 'N/A')} / {pe.get('model', 'N/A')}")
+        self.logger.info(f"FDKA provider/model: {pe_cfg.get('llm_provider', 'N/A')} / {pe_cfg.get('model', 'N/A')}")
         self.logger.info("✅ SELFEVOLVE system ready")
         self.logger.info("=" * 70)
 
@@ -166,6 +206,8 @@ class SelfEvolveSystem:
         scenario_cfg = self.config.get("scenario", {}) or {}
         output_cfg = self.config.get("output", {}) or {}
         fdka_cfg = self.config.get("fdka", {}) or {}
+        if not isinstance(fdka_cfg, dict):
+            fdka_cfg = {}
         pe = (fdka_cfg.get("propose_edit", {}) or {})
 
         manifest = {
@@ -201,6 +243,8 @@ class SelfEvolveSystem:
             "counts": {
                 "committed_patches": len(self._committed_patches),
             },
+            # Keep a compact copy of run attribution so manifest and metrics.json align.
+            "run_metadata": (self.metrics.get_run_metadata() if hasattr(self.metrics, "get_run_metadata") else {}),
         }
 
         try:
@@ -379,7 +423,10 @@ class SelfEvolveSystem:
 
                 # Optional: trigger FDKA even on success when executor flags repeated recoveries
                 # NOTE: do not wrap config in bool(); we need the mapping for .get(...)
-                if (self.config.get("fdka") or {}).get("enable_on_instability", True):
+                fdka_cfg = self.config.get("fdka", {})
+                if not isinstance(fdka_cfg, dict):
+                    fdka_cfg = {}
+                if fdka_cfg.get("enable_on_instability", True):
                     hint = self._find_instability_hint(task_trace_for_metrics)
                     if hint:
                         print("🧠 Instability hint detected (recoveries repeated). Escalating to FDKA (soft) ...")

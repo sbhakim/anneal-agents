@@ -49,6 +49,11 @@ class FullEvaluationRunner:
         self.data_root = Path("data/results")
         self.start_time = time.time()
 
+        # Stable orchestration run id (keeps logs + manifests joinable)
+        self.run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+        self.run_dir = self.results_root / "full_runs" / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
         # Track experiment results
         self.experiment_results = {
             "baseline_comparison": {"status": "not_run", "duration": 0, "error": None},
@@ -79,10 +84,61 @@ class FullEvaluationRunner:
         print("FULL EVALUATION FOR ACM MANUSCRIPT")
         print("=" * 70)
         print(f"Mode: {'QUICK TEST' if quick_mode else 'FULL EVALUATION'}")
+        print(f"Run ID: {self.run_id}")
         print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Results Directory: {self.results_root}")
+        print(f"Orchestration Run Dir: {self.run_dir}")
         print("=" * 70)
         print()
+
+    def _read_json_if_exists(self, path: Path):
+        """Best-effort JSON loader for manifests; returns None when missing/unreadable."""
+        try:
+            if path.exists():
+                return json.loads(path.read_text())
+        except Exception:
+            return None
+        return None
+
+    def _write_experiment_summary(self) -> None:
+        """
+        Persist orchestration-level summary for reviewer auditability.
+        - Includes status/duration/errors + pointers to demo run manifests if present.
+        """
+        total_duration = time.time() - self.start_time
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        demo_dir = self.run_dir / "demo"
+        demo_manifest = self._read_json_if_exists(demo_dir / "run_manifest.json")
+        demo_config = self._read_json_if_exists(demo_dir / "config_resolved.json")
+
+        summary = {
+            "run_id": self.run_id,
+            "timestamp": now,
+            "quick_mode": bool(self.quick_mode),
+            "total_duration_seconds": total_duration,
+            "experiments": self.experiment_results,
+            "paths": {
+                "orchestration_run_dir": str(self.run_dir),
+                "experiments_results_root": str(self.results_root),
+                "data_results_root": str(self.data_root),
+                "demo_results_dir": str(demo_dir),
+                "demo_run_manifest": str(demo_dir / "run_manifest.json"),
+                "demo_config_resolved": str(demo_dir / "config_resolved.json"),
+            },
+            # Inline the demo run manifest snapshots when available (small + helpful for debugging).
+            "demo_snapshot": {
+                "run_manifest": demo_manifest,
+                "config_resolved": demo_config,
+            },
+        }
+
+        out_path = self.run_dir / "experiment_summary.json"
+        try:
+            out_path.write_text(json.dumps(summary, indent=2))
+            print(f"\n💾 Wrote orchestration summary: {out_path}")
+        except Exception as e:
+            print(f"\n⚠️ Failed to write orchestration summary ({out_path}): {e}")
 
     def run_baseline_comparison(self) -> bool:
         """
@@ -137,6 +193,9 @@ class FullEvaluationRunner:
     def run_demo(self) -> bool:
         """
         Run demo mode for detailed per-failure analysis (Tables 3-5).
+
+        NOTE: We isolate demo output under experiments/results/full_runs/<run_id>/demo
+        so it never overwrites other runs (or prior demo results).
         """
         print("\n" + "=" * 70)
         print("🎯 EXPERIMENT 3: DEMO RUN (Tables 3-5)")
@@ -151,8 +210,25 @@ class FullEvaluationRunner:
             if self.quick_mode:
                 config['scenario']['num_tasks'] = 10
 
+            # Per-run isolation: demo writes its own metrics/manifests/log/provenance.
+            demo_dir = self.run_dir / "demo"
+            demo_dir.mkdir(parents=True, exist_ok=True)
+
+            config.setdefault("output", {})
+            config["output"]["results_dir"] = str(demo_dir)
+            config["output"]["plots_dir"] = str(demo_dir / "plots")
+
+            config.setdefault("logging", {})
+            config["logging"]["log_file"] = str(demo_dir / "selfevolve.log")
+
+            gov = config.setdefault("governance", {})
+            prov = gov.setdefault("provenance", {})
+            if prov.get("enable", True):
+                prov["log_path"] = str(demo_dir / "provenance.jsonl")
+
             system = SelfEvolveSystem(config)
             system.run_evaluation()
+
             self.experiment_results["demo_run"]["status"] = "success"
             return True
 
@@ -220,6 +296,7 @@ class FullEvaluationRunner:
                     self.experiment_results["demo_run"]["status"] = "skipped"
 
             self.generate_summary()
+            self._write_experiment_summary()
 
             # Success if every tracked experiment either succeeded or was intentionally skipped
             if all(r["status"] in ["success", "skipped"] for r in self.experiment_results.values()):
@@ -229,7 +306,17 @@ class FullEvaluationRunner:
 
         except KeyboardInterrupt:
             print("\n\n⚠️ Evaluation interrupted by user")
+            self.experiment_results["baseline_comparison"]["status"] = (
+                self.experiment_results["baseline_comparison"]["status"] if self.experiment_results["baseline_comparison"]["status"] != "running" else "interrupted"
+            )
+            self.experiment_results["ablation_study"]["status"] = (
+                self.experiment_results["ablation_study"]["status"] if self.experiment_results["ablation_study"]["status"] != "running" else "interrupted"
+            )
+            self.experiment_results["demo_run"]["status"] = (
+                self.experiment_results["demo_run"]["status"] if self.experiment_results["demo_run"]["status"] != "running" else "interrupted"
+            )
             self.generate_summary()
+            self._write_experiment_summary()
             return 130
 
         except Exception as e:
@@ -237,6 +324,7 @@ class FullEvaluationRunner:
             import traceback
             traceback.print_exc()
             self.generate_summary()
+            self._write_experiment_summary()
             return 1
 
 

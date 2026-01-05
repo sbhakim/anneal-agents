@@ -185,6 +185,14 @@ class AblationStudy:
         print(f"Debug mode: {'ENABLED' if debug_mode else 'DISABLED'}")
         print()
 
+    def _run_output_dir(self, ablation_name: str, seed: int, difficulty: str) -> Path:
+        """
+        Per-run output dir to avoid overwriting data/results across ablations.
+        Keeps paths deterministic for easy aggregation.
+        """
+        safe_name = ablation_name.replace(" ", "_").replace("/", "_")
+        return self.results_dir / "runs" / safe_name / difficulty / f"seed{seed}"
+
     def get_ablation_configs(self) -> Dict[str, Dict]:
         """
         Define ablation configurations.
@@ -203,8 +211,16 @@ class AblationStudy:
                     "governance": {
                         "provenance": {"enable": False},
                         "trust": {"alpha": 1, "beta": 1},
-                        "gates": {"tau_impact": 999.0, "tau_conf": 0.0},
-                        "canary": {"num_tests": 0}
+                        "gates": {
+                            # keep legacy knobs for backwards-compat, but explicitly disable hard gates
+                            "tau_impact": 999.0,
+                            "tau_conf": 0.0,
+                            "use_z3": False,
+                            "z3_min_coverage": 1.0,
+                            "z3_unknown_policy": "allow",
+                        },
+                        "canary": {"num_tests": 0},
+                        "rollback": {"enable": False},
                     }
                 }
             },
@@ -284,6 +300,24 @@ class AblationStudy:
         experiment_config['scenario']['failure_injector_seed'] = seed
         experiment_config['logging']['level'] = 'WARNING'
 
+        # Per-run isolation: avoid overwriting data/results and mixing provenance across ablations
+        run_dir = self._run_output_dir(ablation_name, seed, difficulty)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        experiment_config.setdefault("output", {})
+        experiment_config["output"]["results_dir"] = str(run_dir)
+        # Keep plots under the same run dir (if consumed by code)
+        experiment_config["output"]["plots_dir"] = str(run_dir / "plots")
+
+        # Isolate log file per run for auditability
+        experiment_config.setdefault("logging", {})
+        experiment_config["logging"]["log_file"] = str(run_dir / "selfevolve.log")
+
+        # Isolate provenance log per run when enabled
+        gov = experiment_config.setdefault("governance", {})
+        prov = gov.setdefault("provenance", {})
+        if prov.get("enable", True):
+            prov["log_path"] = str(run_dir / "provenance.jsonl")
+
         start_time = time.time()
         try:
             system = SelfEvolveSystem(experiment_config)
@@ -293,7 +327,7 @@ class AblationStudy:
             result = {
                 "ablation": ablation_name, "seed": seed, "difficulty": difficulty,
                 "elapsed_time": elapsed, "metrics": summary, "config": config,
-                "timestamp": time.time()
+                "timestamp": time.time(), "run_dir": str(run_dir)
             }
             print(f"\n✓ Completed in {elapsed:.1f}s")
             print(f"  Success Rate: {summary['success_rate']:.1%}")
@@ -308,7 +342,7 @@ class AblationStudy:
             return {
                 "ablation": ablation_name, "seed": seed, "difficulty": difficulty,
                 "error": str(e), "traceback": traceback.format_exc(),
-                "timestamp": time.time()
+                "timestamp": time.time(), "run_dir": str(run_dir)
             }
 
     def run_all_ablations(self) -> Dict[str, List[Dict]]:

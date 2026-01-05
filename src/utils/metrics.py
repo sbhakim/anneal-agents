@@ -48,6 +48,10 @@ MINIMUM UPDATE (governance/patch audit joinability):
 - Record joinable patch UUIDs when available (patch["id"] / patch["patch_id"]).
 - Track patch decisions (applied/skipped/rejected) separately from "accepted" scoring.
 - Track Z3 verdict counts from scorer payload (SAT/UNSAT/UNKNOWN/NOT_RUN).
+
+MINIMUM UPDATE (run attribution / multi-LLM defensibility):
+- Allow the system/orchestrator to attach run metadata (ablation name, seeds, provider/model, flags).
+- Persist that metadata into metrics.json so results cannot be misattributed.
 """
 import json
 from typing import Dict, Any, List, Optional
@@ -77,6 +81,9 @@ class MetricsCollector:
 
     def __init__(self):
         """Initialize metrics collector."""
+        # Run attribution metadata (e.g., ablation/model/provider/seeds); set by orchestrator/system.
+        self.run_metadata: Dict[str, Any] = {}
+
         # Task-level tracking
         self.tasks: List[Dict] = []
         self.task_count = 0
@@ -151,6 +158,37 @@ class MetricsCollector:
         self.start_time = time.time()
 
         print("METRICS: Collector initialized with enhanced tracking.")
+
+    # ============= RUN METADATA (ATTRIBUTION) =============
+
+    def set_run_metadata(self, metadata: Dict[str, Any]) -> None:
+        """
+        Attach run attribution metadata for auditability (ablation/model/provider/seed/etc).
+        Keep it JSON-safe; non-serializables are stringified.
+        """
+        if not isinstance(metadata, dict) or not metadata:
+            return
+        for k, v in metadata.items():
+            self.run_metadata[str(k)] = self._json_safe(v)
+
+    def get_run_metadata(self) -> Dict[str, Any]:
+        """Return a shallow copy of run attribution metadata."""
+        return dict(self.run_metadata)
+
+    def _json_safe(self, obj: Any) -> Any:
+        """Best-effort conversion to JSON-serializable values (only used for run metadata)."""
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, (list, tuple)):
+            return [self._json_safe(x) for x in obj]
+        if isinstance(obj, dict):
+            return {str(k): self._json_safe(v) for k, v in obj.items()}
+        # Fallback for objects (e.g., enums, custom classes)
+        return str(obj)
 
     # ============= TASK & PATCH RECORDING =============
 
@@ -639,6 +677,9 @@ class MetricsCollector:
         recovery_rate = self.calculate_recovery_rate()
 
         summary = {
+            # Run attribution (kept small; full config is stored elsewhere)
+            "run_metadata": dict(self.run_metadata),
+
             "total_tasks": self.task_count,
             "successes": self.success_count,
             "failures": self.failure_count,
@@ -694,6 +735,17 @@ class MetricsCollector:
         print("\n" + "=" * 60)
         print("📊 SELFEVOLVE METRICS SUMMARY")
         print("=" * 60)
+
+        rm = summary.get("run_metadata") or {}
+        if rm:
+            # Minimal, reviewer-friendly attribution line (avoid dumping full config).
+            parts = []
+            for k in ("ablation", "baseline", "difficulty", "seed", "llm_provider", "model", "fdka_enabled"):
+                if k in rm:
+                    parts.append(f"{k}={rm.get(k)}")
+            if parts:
+                print("\n[Run Metadata]")
+                print("  " + " | ".join(parts))
 
         print(f"\n[Task Statistics]")
         print(f"  Total Tasks: {summary['total_tasks']}")
@@ -765,6 +817,7 @@ class MetricsCollector:
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
+            "run_metadata": dict(self.run_metadata),
             "summary": self.get_summary(),
             "tasks": self.tasks,
             "patches": self.patches,
@@ -1040,6 +1093,14 @@ if __name__ == "__main__":
     print("=" * 60)
 
     metrics = MetricsCollector()
+    metrics.set_run_metadata({
+        "ablation": "SelfEvolve-Full",
+        "difficulty": "hard",
+        "seed": 42,
+        "llm_provider": "openai",
+        "model": "gpt-4o-mini",
+        "fdka_enabled": True,
+    })
 
     print("\n[Simulating tasks...]")
     for i in range(30):

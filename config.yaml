@@ -45,13 +45,13 @@ fdka:
 
   propose_edit:
     # Provider options: "transformers", "openai", "deepseek", "mock"
-    llm_provider: "transformers"
+    # llm_provider: "transformers"
 
     # -------------------------------------------------------------------------
     # Local / offline Transformers (HF) model selection
     # -------------------------------------------------------------------------
     # Active local model (Gemma-2 Instruct).
-    model: "google/gemma-2-9b-it"
+    # model: "google/gemma-2-9b-it"
 
     # Other local/offline options (uncomment + set model accordingly):
     # model: "mistralai/Mistral-7B-Instruct-v0.2"
@@ -84,9 +84,9 @@ fdka:
     # model: "gpt-4o-mini"
 
     # DeepSeek (OpenAI-compatible endpoint):
-    # llm_provider: "deepseek"
-    # model: "deepseek-chat"
-    # base_url: "https://api.deepseek.com"
+    llm_provider: "deepseek"
+    model: "deepseek-chat"
+    base_url: "https://api.deepseek.com"
 
     # Mock (offline deterministic testing):
     # llm_provider: "mock"
