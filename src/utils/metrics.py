@@ -30,6 +30,19 @@ MINIMUM FIX (paper-facing metric semantics):
   A single task can contain repeated error entries (retries, multi-attempt traces). We keep:
     - failure_event_counts: raw event count (for audit / intensity)
     - failure_event_classes: per-task timeline (deduped per task) for RFR/TTA/adaptation
+
+MINIMAL UPDATE (paper-facing clarity):
+- Report BOTH:
+    - observed_rfr: based on recovered+unrecovered failure events (task-level)
+    - terminal_rfr: based only on terminal task failures
+  This prevents summaries like "100% success" seeming to contradict a high RFR.
+
+MINIMUM UPDATE (recovery separation for defensibility):
+- Track recoveries explicitly via trace semantics:
+    - event_type == "verify_failed" (preconditions failed)
+    - step_success with recovered=True (recovery succeeded)
+- Report Recovery Rate separately from terminal failure rates, so "success" and
+  "interventions" are not conflated.
 """
 import json
 from typing import Dict, Any, List, Optional
@@ -74,7 +87,15 @@ class MetricsCollector:
         self.failure_events_observed: int = 0
         self.failure_event_counts: Dict[str, int] = defaultdict(int)  # failure_key -> raw event count
         self.failure_event_classes: Dict[str, List[int]] = defaultdict(list)  # failure_key -> [task_ids] (deduped per task)
-        self.recovery_tasks: int = 0  # tasks that succeeded after >=1 observed failure event
+
+        # Recovery tracking (explicit recoveries for paper-facing clarity)
+        # - recovery_task_count: succeeded tasks that required at least one recovery
+        # - recovered_failure_classes: maps failure_key -> task_ids where it was recovered (task-level)
+        self.recovery_task_count: int = 0
+        self.recovered_failure_classes: Dict[str, List[int]] = defaultdict(list)
+
+        # Backwards-compatible name used in earlier outputs/scripts
+        self.recovery_tasks: int = 0
 
         # Patch tracking
         self.patches: List[Dict] = []
@@ -148,6 +169,10 @@ class MetricsCollector:
                     self.first_failure[fk] = task_id
                     print(f"METRICS: First observed failure event '{fk}' at task {task_id}")
 
+        # Explicit recovery markers (do not conflate with terminal failures)
+        recovered_failure_keys = self._extract_recovered_failure_keys(trace)
+        recovered_failure_keys_unique = sorted(set(recovered_failure_keys))
+
         task_record = {
             "task_id": task_id,
             "success": success,
@@ -155,13 +180,26 @@ class MetricsCollector:
             "trace_length": len(trace),
             "observed_failure_events": len(observed_failure_keys),
             "observed_failure_classes": len(observed_failure_keys_unique),
+            "recovered_failure_classes": len(recovered_failure_keys_unique),
         }
 
         if success:
             self.success_count += 1
+
+            # Backwards-compatible: a "recovery task" means success after any observed failure event.
             if observed_failure_keys:
                 self.recovery_tasks += 1
                 task_record["recovered"] = True
+
+            # Paper-facing: explicit recovery markers (verify_failed and/or recovered=True)
+            if recovered_failure_keys_unique:
+                self.recovery_task_count += 1
+                task_record["recovered_explicit"] = True
+                task_record["recovered_from"] = recovered_failure_keys_unique
+
+                for fk in recovered_failure_keys_unique:
+                    self.recovered_failure_classes[fk].append(task_id)
+
         else:
             self.failure_count += 1
             failure_info = self._extract_failure_info(trace)
@@ -345,12 +383,20 @@ class MetricsCollector:
         Check if the system has adapted to a failure class.
 
         Adaptation is defined as RFR < 5% in a recent window.
-        For recovered runs, we measure RFR on observed failure-events (task-level), not raw event count.
+
+        Semantics:
+        - Prefer terminal failure timelines when the class has terminal instances.
+        - Otherwise fall back to observed events (recovered or not).
         """
         if window_size is None:
             window_size = min(20, max(10, self.task_count // 2))
 
-        classes = self.failure_event_classes if self.failure_event_classes else self.failure_classes
+        # Prefer terminal when available for that key; otherwise use observed.
+        if failure_key in self.failure_classes and len(self.failure_classes[failure_key]) > 0:
+            classes = self.failure_classes
+        else:
+            classes = self.failure_event_classes if self.failure_event_classes else self.failure_classes
+
         if failure_key not in classes:
             return False
 
@@ -377,24 +423,20 @@ class MetricsCollector:
                 tta_results[failure_key] = None
         return tta_results
 
-    def calculate_rfr(self, window_size: int = 100) -> float:
+    def _calculate_rfr_from_classes(self, classes: Dict[str, List[int]], window_size: int = 100) -> float:
         """
-        Calculate overall Repeat Failure Rate.
-
-        Definition used here (task-level):
-        - For each failure class, count how many distinct tasks contained it.
+        RFR helper (task-level):
+        - For each failure class, count how many distinct tasks contained it in the window.
         - Repeat failures = sum(max(0, n_tasks_with_class - 1)) across classes
         - Normalize by window size (tasks)
         """
         if self.task_count == 0:
             return 0.0
 
-        classes = self.failure_event_classes if self.failure_event_classes else self.failure_classes
         window = min(window_size, self.task_count)
         if window <= 0:
             return 0.0
 
-        # Compute repeat failures over the last `window` tasks.
         start = max(0, self.task_count - window)
         repeat_failures = 0
 
@@ -404,6 +446,33 @@ class MetricsCollector:
                 repeat_failures += (len(uniq) - 1)
 
         return repeat_failures / window
+
+    def calculate_observed_rfr(self, window_size: int = 100) -> float:
+        """RFR over observed failure events (includes recovered tasks)."""
+        return self._calculate_rfr_from_classes(self.failure_event_classes, window_size=window_size)
+
+    def calculate_terminal_rfr(self, window_size: int = 100) -> float:
+        """RFR over terminal failures only (task ended in failure)."""
+        return self._calculate_rfr_from_classes(self.failure_classes, window_size=window_size)
+
+    def calculate_rfr(self, window_size: int = 100) -> float:
+        """
+        Backwards-compatible: overall RFR defaults to observed RFR when available,
+        otherwise falls back to terminal RFR.
+        """
+        if self.failure_event_classes:
+            return self.calculate_observed_rfr(window_size=window_size)
+        return self.calculate_terminal_rfr(window_size=window_size)
+
+    def calculate_recovery_rate(self) -> float:
+        """
+        Recovery Rate (paper-facing):
+        Fraction of tasks that succeeded but required at least one recovery
+        (verify_failed and/or recovered=True in trace).
+        """
+        if self.task_count == 0:
+            return 0.0
+        return self.recovery_task_count / self.task_count
 
     def calculate_csr(self) -> float:
         """Calculate Constraint Satisfaction Rate."""
@@ -438,6 +507,7 @@ class MetricsCollector:
         Notes:
         - "total_instances" = terminal failures (task ended in failure)
         - "observed_events" = raw error entries seen in traces (may be recovered)
+        - "recovered_tasks" = tasks that recovered from the class (success with recovery markers)
         - "final_rfr" = fraction of tasks in last 20 that contained the class (task-level)
         """
         analysis: Dict[str, Dict[str, Any]] = {}
@@ -446,12 +516,14 @@ class MetricsCollector:
             set(self.failure_classes.keys())
             | set(self.failure_event_counts.keys())
             | set(self.failure_event_classes.keys())
+            | set(self.recovered_failure_classes.keys())
         )
 
         for failure_key in sorted(all_keys):
             operator_name = failure_key.split(':')[0]
             fail_tasks_terminal = self.failure_classes.get(failure_key, [])
             fail_tasks_observed = self.failure_event_classes.get(failure_key, [])
+            recovered_tasks = self.recovered_failure_classes.get(failure_key, [])
 
             operator_patches = [
                 p for p in self.patches
@@ -471,6 +543,7 @@ class MetricsCollector:
                 "total_instances": len(set(fail_tasks_terminal)),
                 "observed_events": int(self.failure_event_counts.get(failure_key, 0)),
                 "observed_tasks": len(set(fail_tasks_observed)),
+                "recovered_tasks": len(set(recovered_tasks)),
                 "adapted_at": self.adapted_at.get(failure_key),
                 "tta": tta,
                 "patches_proposed": len(operator_patches),
@@ -488,6 +561,10 @@ class MetricsCollector:
         """Get comprehensive metrics summary."""
         elapsed_time = time.time() - self.start_time
 
+        observed_rfr = self.calculate_observed_rfr()
+        terminal_rfr = self.calculate_terminal_rfr()
+        recovery_rate = self.calculate_recovery_rate()
+
         summary = {
             "total_tasks": self.task_count,
             "successes": self.success_count,
@@ -495,13 +572,26 @@ class MetricsCollector:
             "success_rate": self.get_success_rate(),
 
             "failure_events_observed": self.failure_events_observed,
+
+            # Backwards-compatible
             "recovery_tasks": self.recovery_tasks,
+
+            # Paper-facing (explicit recovery markers)
+            "recovery_tasks_explicit": self.recovery_task_count,
+            "recovery_rate": recovery_rate,
 
             "patches_proposed": self.patch_count,
             "patches_accepted": self.accepted_patches,
             "patches_rejected": self.rejected_patches,
             "acceptance_rate": self.accepted_patches / self.patch_count if self.patch_count > 0 else 0,
+
+            # Backwards-compatible key used by older scripts (observed when available).
             "repeat_failure_rate": self.calculate_rfr(),
+
+            # Clear paper-facing semantics.
+            "observed_rfr": observed_rfr,
+            "terminal_rfr": terminal_rfr,
+
             "constraint_satisfaction_rate": self.calculate_csr(),
             "time_to_adapt": self.calculate_tta(),
             "rollback_frequency": self.calculate_rollback_frequency(),
@@ -534,7 +624,9 @@ class MetricsCollector:
 
         print(f"\n[Observed Failures & Recoveries]")
         print(f"  Failure Events Observed: {summary['failure_events_observed']}")
-        print(f"  Recovery Tasks: {summary['recovery_tasks']}")
+        print(f"  Recovery Tasks (legacy): {summary['recovery_tasks']}")
+        print(f"  Recovery Tasks (explicit): {summary['recovery_tasks_explicit']}")
+        print(f"  Recovery Rate: {summary['recovery_rate']:.1%}")
 
         print(f"\n[Patch Statistics]")
         print(f"  Patches Proposed: {summary['patches_proposed']}")
@@ -542,7 +634,8 @@ class MetricsCollector:
         print(f"  Acceptance Rate: {summary['acceptance_rate']:.1%}")
 
         print(f"\n[Primary Metrics]")
-        print(f"  Repeat Failure Rate: {summary['repeat_failure_rate']:.1%}")
+        print(f"  Repeat Failure Rate (Observed): {summary['observed_rfr']:.1%}")
+        print(f"  Repeat Failure Rate (Terminal): {summary['terminal_rfr']:.1%}")
         print(f"  Constraint Satisfaction: {summary['constraint_satisfaction_rate']:.1%}")
         print(f"  Rollback Frequency: {summary['rollback_frequency']:.1f} per 1000")
         print(f"  Rollback Precision: {summary['rollback_precision']:.1%}")
@@ -616,8 +709,8 @@ class MetricsCollector:
         if not analysis:
             pd.DataFrame(columns=[
                 'Failure_Class', 'Operator', 'Error_Type', 'First_Task',
-                'Observed_Events', 'Observed_Tasks', 'Total_Instances', 'TTA',
-                'Patches_Proposed', 'Patches_Accepted', 'Final_RFR'
+                'Observed_Events', 'Observed_Tasks', 'Recovered_Tasks',
+                'Total_Instances', 'TTA', 'Patches_Proposed', 'Patches_Accepted', 'Final_RFR'
             ]).to_csv(filepath, index=False)
             print(f"   ⚠️ Table 3: No failure data")
             return
@@ -631,6 +724,7 @@ class MetricsCollector:
                 'First_Task': metrics['first_occurrence'],
                 'Observed_Events': metrics.get('observed_events', 0),
                 'Observed_Tasks': metrics.get('observed_tasks', 0),
+                'Recovered_Tasks': metrics.get('recovered_tasks', 0),
                 'Total_Instances': metrics['total_instances'],
                 'TTA': f"{metrics['tta']}" if metrics['tta'] is not None else "∞",
                 'Patches_Proposed': metrics['patches_proposed'],
@@ -770,6 +864,10 @@ class MetricsCollector:
         Trace format is not uniform:
         - some entries use 'error'
         - some use 'error_type'
+
+        IMPORTANT:
+        This function intentionally treats any entry carrying error/error_type as an observed failure event.
+        Non-failure annotations should not populate these keys (executor avoids doing so).
         """
         keys: List[str] = []
         for entry in trace or []:
@@ -786,6 +884,36 @@ class MetricsCollector:
             op = self._norm_operator(entry.get("operator", "UNKNOWN"))
             er = self._norm_error(err)
             keys.append(f"{op}:{er}")
+        return keys
+
+    def _extract_recovered_failure_keys(self, trace: List[Dict]) -> List[str]:
+        """
+        Extract failure classes that were explicitly recovered (paper-facing).
+
+        Sources:
+        - event_type == "verify_failed" (precondition failure was encountered)
+        - step_success with recovered=True (a recovery succeeded)
+        """
+        keys: List[str] = []
+        for entry in trace or []:
+            if not isinstance(entry, dict):
+                continue
+
+            et = entry.get("event_type")
+
+            if et == "verify_failed":
+                op = self._norm_operator(entry.get("operator", "UNKNOWN"))
+                err = entry.get("error_type") or entry.get("error") or "PreconditionUnmet"
+                keys.append(f"{op}:{self._norm_error(err)}")
+                continue
+
+            if et == "step_success" and bool(entry.get("recovered")):
+                op = self._norm_operator(entry.get("step") or entry.get("operator", "UNKNOWN"))
+                recovered_from = entry.get("recovered_from") or entry.get("error_type") or entry.get("error")
+                # If not specified (e.g., tool retry), default to ToolError for bookkeeping.
+                err = recovered_from or "ToolError"
+                keys.append(f"{op}:{self._norm_error(err)}")
+
         return keys
 
     def _norm_operator(self, op: Any) -> str:

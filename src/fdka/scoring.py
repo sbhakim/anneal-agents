@@ -18,6 +18,10 @@ MINIMUM SMT (Z3) IMPLEMENTATION (2026-01):
 - This is intentionally narrow: it detects logical inconsistency like asserting both
   ValidPayment and Not(ValidPayment), BlockedCard and Not(BlockedCard), etc.
 - Fallback remains the symbolic heuristic when z3 is unavailable or parsing yields no atoms.
+
+MINIMUM TOOL-DRIFT ACCEPTANCE (2026-01):
+- In low-data regimes, allow UPDATE_TOOL_SCHEMA when trace evidence indicates tool drift
+  (e.g., deprecated v1 endpoint). Canary still gates commit.
 """
 from typing import Dict, Any, List, Tuple
 import math
@@ -81,6 +85,35 @@ class Scorer:
         print(f"SCORER: Initialized with weights -> {self.weights}")
         print(f"SCORER: LLM provider={self.llm_provider}, SAT solver={'Z3' if self.use_z3 else 'Symbolic Heuristic'}")
 
+    def _trace_evidence_text(self, trace: List) -> str:
+        parts = []
+        for e in trace or []:
+            if not isinstance(e, dict):
+                continue
+            for k in ("message", "policy_ref", "violated", "details", "reason"):
+                v = e.get(k)
+                if isinstance(v, str) and v.strip():
+                    parts.append(v.strip())
+        return " | ".join(parts).lower()
+
+    def _is_tool_drift_context(self, trace: List) -> bool:
+        ev = self._trace_evidence_text(trace)
+        if not ev:
+            return False
+        markers = (
+            "deprecated",
+            "deprecation",
+            "/v1/",
+            "v1/book",
+            "use /v2",
+            "use v2",
+            "no longer supported",
+            "unsupported endpoint",
+            "endpoint changed",
+            "moved to",
+        )
+        return any(m in ev for m in markers)
+
     def _is_timeout_retry_effect(self, patch: Dict[str, Any], trace: List) -> bool:
         """
         Narrow cold-start exception:
@@ -94,13 +127,11 @@ class Scorer:
         failure_info = self._extract_failure_info(trace)
         err = str(failure_info.get("error", ""))
 
-        # Accept only tool/runtime transient class (avoid policy/semantic edits)
         if "ToolError" not in err and "RuntimeError" not in err:
             return False
 
         details = str(patch.get("details", "")).lower()
 
-        # Must look like a retry/timeout guard, not a general effect rewrite.
         timeout_markers = (
             "timeout",
             "apitimeoutretry",
@@ -115,14 +146,14 @@ class Scorer:
         return any(m in details for m in timeout_markers)
 
     def _allow_low_data_patch(self, patch: Dict[str, Any], total_traces: int, reason: str, trace: List = None) -> bool:
-        """Low-data policy: allow only monotonic-safe edits, plus a narrow timeout-retry exception."""
+        """Low-data policy: allow only monotonic-safe edits, plus narrow ToolError recovery exceptions."""
         action = str(patch.get("action", ""))
         risk = self._score_risk(patch)
 
-        # Minimal, surgical exception: allow REFINE_EFFECT only for timeout-retry ToolError recovery.
         timeout_retry_ok = bool(trace) and self._is_timeout_retry_effect(patch, trace)
+        tool_drift_ok = bool(trace) and action == "UPDATE_TOOL_SCHEMA" and self._is_tool_drift_context(trace)
 
-        if action not in self._low_data_allowed_actions and not timeout_retry_ok:
+        if action not in self._low_data_allowed_actions and not timeout_retry_ok and not tool_drift_ok:
             print(
                 f"  ❌ Probabilistic Filter (low-data): {reason}. "
                 f"Only allowing {sorted(self._low_data_allowed_actions)} during cold start; got '{action}'."
@@ -139,6 +170,8 @@ class Scorer:
         allowed_action_label = action
         if timeout_retry_ok and action not in self._low_data_allowed_actions:
             allowed_action_label = f"{action} (timeout-retry exception)"
+        if tool_drift_ok and action not in self._low_data_allowed_actions:
+            allowed_action_label = f"{action} (tool-drift exception)"
 
         print(
             f"  ✅ Probabilistic Filter (low-data): {reason}. "
@@ -154,6 +187,7 @@ class Scorer:
         MINIMUM ROBUSTNESS UPDATE:
         - Removes unconditional cold-start allowance.
         - In low-data regimes, allows only monotonic-safe, low-risk edits.
+        - Adds a narrow tool-drift exception for UPDATE_TOOL_SCHEMA so canary can run.
         """
         if not self.experience_pool:
             print("  ⚠️ Probabilistic Filter: No experience pool, skipping check.")
@@ -178,7 +212,6 @@ class Scorer:
 
         blocked_traces = self.experience_pool.retrieve_similar(failure_info, k=self.k_similar)
         if not blocked_traces:
-            # No evidence either way: fall back to low-data policy (even though total_traces is sufficient).
             return self._allow_low_data_patch(
                 patch,
                 total_traces=total_traces,
@@ -333,35 +366,23 @@ class Scorer:
 
         return score
 
-    # ---------------------------
-    # Minimal SMT-backed consistency check (Eq. 10)
-    # ---------------------------
     def _extract_smt_literals(self, details: str) -> List[Tuple[str, bool]]:
-        """
-        Extract a small set of boolean literals from a patch string.
-
-        Returns: list of (atom_name, polarity) where polarity=True means asserted,
-                 polarity=False means negated (e.g., Not(BlockedCard(...))).
-        """
         if not details:
             return []
 
         lits: List[Tuple[str, bool]] = []
         txt = str(details)
 
-        # Detect negated atoms: Not(AtomName(...))
         for atom in self._smt_atoms.keys():
             neg_pat = rf"Not\(\s*{re.escape(atom)}\s*\("
             if re.search(neg_pat, txt):
                 lits.append((atom, False))
 
-        # Detect positive atoms: AtomName(...)
         for atom in self._smt_atoms.keys():
             pos_pat = rf"{re.escape(atom)}\s*\("
             if re.search(pos_pat, txt):
                 lits.append((atom, True))
 
-        # De-dup exact literals
         out = []
         seen = set()
         for a, pol in lits:
@@ -372,17 +393,9 @@ class Scorer:
         return out
 
     def _z3_consistency_check(self, patch: Dict[str, Any]) -> float:
-        """
-        Minimal Z3 SMT check:
-        - Build boolean vars for a tiny predicate vocabulary found in patch details.
-        - Add asserted/negated literals from the patch.
-        - Add a couple of domain axioms (small, safe, and explainable).
-        - SAT => 1.0, UNSAT => 0.0, Unknown/empty => fallback heuristic.
-        """
         details = str(patch.get('details', '') or '')
         lits = self._extract_smt_literals(details)
 
-        # If we didn't extract any atoms, SMT has nothing to prove; use heuristic.
         if not lits:
             print("        ℹ️ Z3: No parsable SMT atoms in patch; using heuristic fallback")
             return self._symbolic_consistency_check(patch)
@@ -396,27 +409,19 @@ class Scorer:
         try:
             s = Solver()
 
-            # Create Bool vars only for atoms that appear
             atoms_in_patch = sorted({a for a, _ in lits})
             vars_ = {a: Bool(self._smt_atoms[a]) for a in atoms_in_patch}
 
-            # Add literals from patch
             for a, pol in lits:
                 if a not in vars_:
                     continue
                 s.add(vars_[a] if pol else Not(vars_[a]))
 
-            # Minimal domain axioms (keep tiny; expand only if needed)
-            # - ExpiredPayment -> InvalidPayment
             if "ExpiredPayment" in vars_ and "InvalidPayment" in vars_:
                 s.add(Implies(vars_["ExpiredPayment"], vars_["InvalidPayment"]))
 
-            # - InvalidPayment -> Not(ValidPayment)
             if "InvalidPayment" in vars_ and "ValidPayment" in vars_:
                 s.add(Implies(vars_["InvalidPayment"], Not(vars_["ValidPayment"])))
-
-            # NOTE: We intentionally do NOT assert BlockedCard -> InvalidPayment.
-            # BlockedCard is policy-based, not necessarily "invalid".
 
             res = s.check()
             if res == sat:
@@ -453,6 +458,10 @@ class Scorer:
 
         if action == 'ADD_PRECONDITION':
             print("        ✓ Precondition addition (monotonic strengthening)")
+            return 1.0
+
+        if action == 'UPDATE_TOOL_SCHEMA':
+            print("        ✓ Schema update (non-logical edit)")
             return 1.0
 
         print("        ✓ No contradictions detected")
@@ -495,7 +504,12 @@ class Scorer:
     def _extract_failure_info(self, trace: List) -> Dict[str, Any]:
         for entry in reversed(trace or []):
             if isinstance(entry, dict) and 'error' in entry:
-                return {'operator': entry.get('operator'), 'error': entry.get('error')}
+                return {
+                    'operator': entry.get('operator'),
+                    'error': entry.get('error'),
+                    'message': entry.get('message'),
+                    'policy_ref': entry.get('policy_ref'),
+                }
         return {}
 
     def _would_prevent_failure(self, patch: Dict, trace_record: Dict) -> bool:

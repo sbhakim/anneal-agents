@@ -15,10 +15,14 @@ MINIMUM RELIABILITY UPDATE (2026-01):
   across retries/attempts within a run while allowing different cards to experience
   different injected failures.
 
+MINIMUM RECOVERY UPDATE (2026-01):
+- One-shot ToolError injection per (task, operator, category) so in-task retry can succeed.
+  Applies to: api_timeout and api_schema_change.
+
 MINIMUM MANUSCRIPT/RESULTS UPDATE (2026-01):
 - Normalize failure labeling with a small, fixed vocabulary:
     error_type: {"ToolError","PreconditionUnmet","PolicyViolation","PlanningFailed"}
-    policy_ref: stable IDs (e.g., "API-503","PAY-401","H-23")
+    policy_ref: stable IDs (e.g., "API-503","PAY-401","H-23","API-V2")
 - Ensure both 'error' and 'error_type' are present for downstream metrics robustness.
 """
 from typing import Dict, Any, List, Set, Optional, Tuple
@@ -60,6 +64,9 @@ class FailureInjector:
         # Cache stable failure details for consistency across attempts.
         # Keyed by (task, operator, payment_key) where payment_key is specific when possible.
         self._failure_cache: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+
+        # One-shot ToolError injections (enables "recoverable within task" retries)
+        self._one_shot_fired: Set[Tuple[int, str, str]] = set()  # (task_id, op_name, category)
 
         # Precompute failing tasks
         self.failing_tasks = self._select_failing_tasks()
@@ -146,21 +153,33 @@ class FailureInjector:
         allow_invalid_payment = (payment_key == "CorporateCard:CC-5512")
 
         r = self._rng.random()
-        if r < 0.50:
+
+        # Keep overall distribution close to prior behavior; reserve a small tail for schema drift on flights.
+        if r < 0.45:
             error_type = "PreconditionUnmet"
             message = "Corporate cards blocked for reservations during blackout dates"
             policy_ref = "H-23"
             category = "blackout_blocked_card"
-        elif allow_invalid_payment and r < 0.75:
+        elif allow_invalid_payment and r < 0.70:
             error_type = "PreconditionUnmet"
             message = "Payment method is invalid or expired"
             policy_ref = "PAY-401"
             category = "invalid_payment"
-        else:
+        elif r < 0.88:
             error_type = "ToolError"
             message = "Booking API timeout"
             policy_ref = "API-503"
             category = "api_timeout"
+        else:
+            error_type = "ToolError"
+            if "Flight" in op_name:
+                message = "Endpoint /v1/book deprecated; use /v2/book"
+                policy_ref = "API-V2"
+                category = "api_schema_change"
+            else:
+                message = "Booking API timeout"
+                policy_ref = "API-503"
+                category = "api_timeout"
 
         # Apply policy flip: expand blackout dates post-flip (only meaningful for blackout failures).
         if task_id >= self.policy_flip_at and category == "blackout_blocked_card":
@@ -190,6 +209,7 @@ class FailureInjector:
         - Backward compatible (params/state optional).
         - Conditional: failures depend on payment identity so local repair can recover.
         - Deterministic: selection is driven by the injector's own RNG (seeded in __init__).
+        - One-shot ToolError injection for retryable categories.
         """
         if op_name in self.patched_operators:
             return False
@@ -200,15 +220,25 @@ class FailureInjector:
         p_key = self._payment_key(params, state)
         info = self._cached_failure(task_id, op_name, p_key)
 
+        # One-shot ToolError failures so a retry/repair loop can succeed within the task.
+        cat = str(info.get("category", "") or "")
+        if cat in ("api_timeout", "api_schema_change"):
+            one_shot_key = (task_id, op_name, cat)
+            if one_shot_key in self._one_shot_fired:
+                return False
+
         # Blackout-blocked corporate cards should not fail once payment is non-corporate.
-        if info.get("category") == "blackout_blocked_card":
+        if cat == "blackout_blocked_card":
             if self._payment_kind(p_str) != "corporate":
                 return False
 
         # Invalid-payment failures should ONLY target the baseline corporate card.
-        if info.get("category") == "invalid_payment":
+        if cat == "invalid_payment":
             if p_key != "CorporateCard:CC-5512":
                 return False
+
+        if cat in ("api_timeout", "api_schema_change"):
+            self._one_shot_fired.add((task_id, op_name, cat))
 
         return True
 

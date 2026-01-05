@@ -13,28 +13,28 @@ CRITICAL BEHAVIORAL GUARANTEE (Reliability):
   We only mark it patched AFTER observing real success post-patch.
   This prevents inflated results due to failure-injector disabling.
 
-MINIMUM PLANNING NORMALIZATION:
-- Normalize task-transient state before planning/replanning to prevent
-  "(invalid) (invalid)" leakage into params/state and compiled plans.
-
-MINIMUM METRICS CORRECTNESS:
-- Aggregate traces across execution attempts so recovered failures are still visible to metrics/canary.
-  Without this, "success after retries" can look like "no failures observed".
-
-MINIMUM METRICS SEMANTICS:
-- Never call metrics.record_task() twice for the same task_id.
-  Planning can fail and later succeed after a patch; we treat the planning failure as an
-  observed failure event inside the aggregated trace, but we record the task outcome once.
 
 MINIMUM SMT/DEMO WIRING (2026-01):
 - Pass synthetic SMT sanity patches into canary_context when available so CanaryRunner can
   log SAT/UNSAT evidence (consistency-only) without affecting the main canary decision.
+
+INTEGRATION NOTE (2026-01):
+- Executor now owns Verify→Repair (h=1–2). System-level local precondition repair is optional and
+  gated behind config to avoid competing repair controllers.
+
+MINIMUM REPRODUCIBILITY BUNDLE (2026-01):
+- Emit a run_manifest.json + config_resolved.json capturing seeds, config snapshot, environment,
+  and output paths for auditability and exact reruns.
 """
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import uuid
 import json
 from copy import deepcopy
+import sys
+import platform
+import subprocess
+from datetime import datetime, timezone
 
 # Core components
 from .state import SymbolicState
@@ -84,6 +84,9 @@ class SelfEvolveSystem:
         self.logger.info("Initializing SELFEVOLVE system...")
         self.logger.info("=" * 70)
 
+        # Reproducibility: stable run identifier for manifests + artifacts
+        self.run_id: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+
         # Metrics first so we can wire it into dependent subsystems (FDKA)
         self.metrics = MetricsCollector()
 
@@ -130,10 +133,89 @@ class SelfEvolveSystem:
 
         # Log effective runtime switches for diagnosability
         pe = (config.get('fdka', {}) or {}).get('propose_edit', {}) or {}
+        self.logger.info(f"Run ID: {self.run_id}")
         self.logger.info(f"FDKA enabled: {self.fdka_enabled}  | threshold: {self.fdka_threshold:.3f}")
         self.logger.info(f"FDKA provider/model: {pe.get('llm_provider', 'N/A')} / {pe.get('model', 'N/A')}")
         self.logger.info("✅ SELFEVOLVE system ready")
         self.logger.info("=" * 70)
+
+    # ---------------------------------------------------------------------
+    # Reproducibility helpers
+    # ---------------------------------------------------------------------
+
+    def _get_git_commit(self) -> Optional[str]:
+        """Best-effort git commit hash for provenance; returns None when unavailable."""
+        try:
+            out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+            return out if out else None
+        except Exception:
+            return None
+
+    def _write_run_bundle(self, results_dir: Path) -> None:
+        """
+        Emit a minimal run bundle to support exact reruns and reviewer audit.
+        Writes:
+        - run_manifest.json
+        - config_resolved.json
+        """
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        scenario_cfg = self.config.get("scenario", {}) or {}
+        output_cfg = self.config.get("output", {}) or {}
+        fdka_cfg = self.config.get("fdka", {}) or {}
+        pe = (fdka_cfg.get("propose_edit", {}) or {})
+
+        manifest = {
+            "run_id": self.run_id,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "agent": "selfevolve",
+            "python_version": sys.version.split(" ")[0],
+            "platform": platform.platform(),
+            "git_commit": self._get_git_commit(),
+            "trace_schema_version": 1,
+            "scenario": {
+                "difficulty": getattr(self.scenario, "difficulty", scenario_cfg.get("difficulty")),
+                "num_tasks": getattr(self.scenario, "num_tasks", scenario_cfg.get("num_tasks")),
+                "failure_rate": getattr(self.scenario, "failure_rate", scenario_cfg.get("failure_rate")),
+                "task_generation_seed": getattr(self.scenario, "task_seed", scenario_cfg.get("task_generation_seed")),
+                "failure_injector_seed": getattr(self.scenario, "failure_seed", scenario_cfg.get("failure_injector_seed")),
+            },
+            "fdka": {
+                "enabled": self.fdka_enabled,
+                "threshold": self.fdka_threshold,
+                "provider": pe.get("llm_provider"),
+                "model": pe.get("model"),
+            },
+            "outputs": {
+                "results_dir": str(results_dir),
+                "metrics_json": str(results_dir / "metrics.json"),
+                "experience_pool_json": str(results_dir / "experience_pool.json"),
+                "patches_committed_json": str(results_dir / "patches_committed.json"),
+                "governance_summary_json": str(results_dir / "governance_summary.json"),
+                "table3_per_failure_csv": str(results_dir / "table3_per_failure.csv"),
+                "table4_governance_csv": str(results_dir / "table4_governance.csv"),
+            },
+            "counts": {
+                "committed_patches": len(self._committed_patches),
+            },
+        }
+
+        try:
+            (results_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
+        except Exception as e:
+            self.logger.info(f"⚠️ Failed to write run_manifest.json: {e}")
+
+        # Save the resolved config as executed (single-file snapshot).
+        try:
+            (results_dir / "config_resolved.json").write_text(json.dumps(self.config, indent=2))
+        except Exception as e:
+            self.logger.info(f"⚠️ Failed to write config_resolved.json: {e}")
+
+        # Convenience pointer for quick copying into manuscripts.
+        try:
+            (results_dir / "run_id.txt").write_text(self.run_id + "\n")
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------------
     # State normalization / resets
@@ -202,12 +284,7 @@ class SelfEvolveSystem:
     def run_task(self, task_id: int, instruction: str):
         print(f"\n{'=' * 70}\nTask {task_id + 1}: {instruction}\n{'=' * 70}")
 
-        # Aggregate trace across the entire task lifecycle (planning + attempts).
-        # This is what we pass to metrics so recovered failures remain visible.
         aggregated_trace: list = []
-
-        # Track operators whose patches were committed during this task;
-        # only mark as patched upon observed post-patch success.
         pending_patched_operators: set[str] = set()
 
         self.state.update_from_instruction(instruction)
@@ -216,8 +293,6 @@ class SelfEvolveSystem:
 
         plan = self.planner.compile(instruction, self.state.to_dict())
 
-        # Treat planning failure as learnable and route through FDKA.
-        # IMPORTANT: do NOT record_task() here; a planning failure may be recovered later.
         if not plan:
             print("PLANNER: ❌ Plan compilation failed.")
             planning_trace = [{"error": "PlanningFailed", "operator": "PLANNER", "instruction": instruction}]
@@ -226,7 +301,6 @@ class SelfEvolveSystem:
             print("🧠 Escalating to FDKA for governed self-edit (PlanningFailed)...")
             patch_applied, committed_patch = self._handle_failure(planning_trace, task_id, instruction)
 
-            # Defer mark_operator_patched until success
             if patch_applied and committed_patch:
                 op = committed_patch.get("operator")
                 if op:
@@ -259,6 +333,9 @@ class SelfEvolveSystem:
 
         max_attempts = 3
         final_trace = []
+
+        # Optional legacy controller; keep off by default so executor Repair loop is authoritative.
+        enable_local_repair = bool((self.config.get("system", {}) or {}).get("enable_local_repair", False))
         did_local_repair = False
 
         for attempt in range(max_attempts):
@@ -267,7 +344,6 @@ class SelfEvolveSystem:
 
             trace, success, failure_type = self.executor.execute(plan, self.state, task_id)
 
-            # Preserve per-attempt trace and keep an aggregated trace for this task.
             if trace:
                 aggregated_trace.extend(trace)
             final_trace = trace or final_trace
@@ -275,7 +351,6 @@ class SelfEvolveSystem:
             if success:
                 print("✅ Task Succeeded on this attempt.")
 
-                # Record the whole task lifecycle (including earlier failed attempts).
                 task_trace_for_metrics = aggregated_trace or trace
                 self.metrics.record_task(task_id, True, task_trace_for_metrics)
                 self.experience_pool.add_trace(
@@ -284,7 +359,6 @@ class SelfEvolveSystem:
                     metadata={'instruction': instruction, 'task_id': task_id}
                 )
 
-                # ✅ RELIABILITY: only now mark patched operators as "patched" (disables future injection honestly)
                 if pending_patched_operators:
                     for op_name in sorted(pending_patched_operators):
                         self.scenario.mark_operator_patched(op_name)
@@ -311,14 +385,13 @@ class SelfEvolveSystem:
 
             print(f"⚠️ Execution failed with type: {failure_type}")
 
-            # Local repair first for precondition failures (e.g., invalid payment).
-            if failure_type == "PreconditionUnmet" and not did_local_repair:
+            # Optional: legacy local repair controller. Prefer executor Repair loop; keep off by default.
+            if enable_local_repair and failure_type == "PreconditionUnmet" and not did_local_repair:
                 before_sig = self._plan_signature(plan)
                 repaired_plan = self.planner.replan(instruction, self.state.to_dict(), plan)
                 after_sig = self._plan_signature(repaired_plan)
 
                 if after_sig != before_sig:
-                    # Ensure state reflects repaired payment identity and clear injected invalid flags.
                     try:
                         for st in repaired_plan:
                             p = (st.get("params") or {}).get("payment")
@@ -338,7 +411,6 @@ class SelfEvolveSystem:
                 print("🧠 Escalating to FDKA for governed self-edit...")
                 patch_applied, committed_patch = self._handle_failure(trace, task_id, instruction)
 
-                # Defer mark_operator_patched until success
                 if patch_applied and committed_patch:
                     operator_name = committed_patch.get("operator")
                     if operator_name:
@@ -360,7 +432,6 @@ class SelfEvolveSystem:
             self.trust_scorer.update_trust_score(self._last_committed_patch_id, success=False)
         self._last_committed_patch_id = None
 
-        # If we failed, keep the fullest trace we have.
         task_trace_for_metrics = aggregated_trace or final_trace
         self.metrics.record_task(task_id, False, task_trace_for_metrics)
 
@@ -381,7 +452,6 @@ class SelfEvolveSystem:
     # ---------------------------------------------------------------------
 
     def _handle_failure(self, trace: list, task_id: int, instruction: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        # Explicit boolean gate, not threshold-as-off.
         if not self.fdka_enabled:
             print("  DEBUG_FDKA: disabled by config. Skipping self-edit.")
             return False, None
@@ -397,32 +467,26 @@ class SelfEvolveSystem:
                 'operator': failure_info.get('operator'),
                 'error_type': failure_info.get('error'),
             }
-            # Always add the failure trace so utility/pre-filter can query it
             self.experience_pool.add_trace(trace, False, metadata=metadata)
             print(f"  📝 Added failure trace to experience pool (operator={metadata['operator']})")
 
-        # Propose a candidate patch (Stage 2)
         proposed_patch = self.fdka.propose_edit(trace, self.rule_pool) or {}
 
-        # Guard against provider/LLM failures returning non-dict/empty payloads
         if not isinstance(proposed_patch, dict) or not proposed_patch:
             print(" FDKA: ❌ No patch proposed (provider error or empty response).")
             self.metrics.record_value_check(vetoed=False, reason="no_patch_proposed")
             self.metrics.record_causal_check(escalated=False, reason="no_patch_proposed")
             return False, None
 
-        # Rejected during schema/typing validation
         if proposed_patch.get("action") == "REJECTED":
             print(f" FDKA: ❌ Patch rejected during validation: {proposed_patch.get('details')}")
             self.metrics.record_value_check(vetoed=False, reason="validation_reject")
             self.metrics.record_causal_check(escalated=False, reason="validation_reject")
             return False, None
 
-        # Score (plausibility/consistency/utility/risk) + budget penalties
         scores = self.scorer.score(proposed_patch, trace) or {}
         agg_score = scores.get("aggregate", 0.0)
 
-        # Accept score gate before governance/canary
         if agg_score < self.fdka_threshold:
             print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold:.2f}. Patch rejected.")
             self.metrics.record_patch(proposed_patch, success=False, committed=False, scores=scores)
@@ -430,7 +494,6 @@ class SelfEvolveSystem:
             self.metrics.record_causal_check(escalated=False, reason="below_threshold")
             return False, None
 
-        # Governance: value + causal + invariants
         guard_result = self.guard.check(
             proposed_patch,
             context={
@@ -440,7 +503,6 @@ class SelfEvolveSystem:
             }
         )
 
-        # Governance metrics
         self.metrics.record_value_check(
             vetoed=(guard_result['decision'] == 'veto'),
             reason=guard_result.get('reason', '')
@@ -456,11 +518,8 @@ class SelfEvolveSystem:
             op_name = proposed_patch.get("operator")
             fail_examples = self.experience_pool.get_failure_traces(operator=op_name) or []
             succ_examples = self.experience_pool.get_success_traces(operator=op_name) or []
-            # Canary should see both “what broke” and “what previously worked” for regression sensitivity.
             examples = (fail_examples[-5:] + succ_examples[-5:]) or self.experience_pool.traces[-10:]
 
-            # Synthetic SMT sanity patches are opt-in evidence:
-            # they should not change the accept/reject decision unless canary_context requests it.
             canary_context = {
                 "rule_pool": self.rule_pool,
                 "stage_fn": self.rule_pool.update_operator,
@@ -532,7 +591,6 @@ class SelfEvolveSystem:
         sim_state = SymbolicState()
         sim_state.update_from_instruction(instruction)
 
-        # Compile with the patched rule pool (otherwise canary can test the wrong behavior).
         sim_planner = Planner(self.config['planner'], patched_rule_pool)
         sim_plan = sim_planner.compile(instruction, sim_state.to_dict())
         if not sim_plan:
@@ -583,10 +641,11 @@ class SelfEvolveSystem:
 
         results_dir = Path(self.config['output']['results_dir'])
         results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save core artifacts
         self.metrics.save(results_dir / "metrics.json")
         self.experience_pool.save(results_dir / "experience_pool.json")
 
-        # Write a compact list of committed patches
         try:
             (results_dir / "patches_committed.json").write_text(
                 json.dumps(self._committed_patches, indent=2)
@@ -594,7 +653,6 @@ class SelfEvolveSystem:
         except Exception:
             pass
 
-        # Write a minimal guardrail summary
         try:
             guard_summary = self.guard.get_statistics()
             (results_dir / "governance_summary.json").write_text(
@@ -615,6 +673,9 @@ class SelfEvolveSystem:
             print(f"   ✅ Table 4: {results_dir / 'table4_governance.csv'}")
         except Exception as e:
             print(f"   ⚠️ Table 4 export failed: {e}")
+
+        # Reproducibility bundle (manifest + config snapshot)
+        self._write_run_bundle(results_dir)
 
         print(f"\n💾 Results saved to: {results_dir}")
         return self.metrics

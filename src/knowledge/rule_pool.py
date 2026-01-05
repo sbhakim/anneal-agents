@@ -38,7 +38,6 @@ def is_card_valid(state: SymbolicState, params: Dict[str, Any]) -> bool:
     if payment is None or payment == "" or payment == "None":
         return False
 
-    # Honor explicit state flags used by the executor/injector.
     if state.get("payment_invalid") is True:
         return False
     if state.get("payment_valid") is False:
@@ -48,7 +47,6 @@ def is_card_valid(state: SymbolicState, params: Dict[str, Any]) -> bool:
     if "(invalid)" in p.lower():
         return False
 
-    # Lightweight safety: common invalid markers (kept minimal).
     invalid_markers = ("expired", "blocked", "declined", "suspended")
     if any(m in p.lower() for m in invalid_markers):
         return False
@@ -107,7 +105,6 @@ def check_valid_payment(state: SymbolicState, params: Dict[str, Any]) -> bool:
     """
     Learned predicate for: ValidPayment(payment).
     """
-    # Honor explicit state flags first (used by injector/executor).
     if state.get("payment_invalid") is True:
         print("PRECONDITION CHECK: ❌ ValidPayment - State marked payment_invalid=True")
         return False
@@ -117,25 +114,21 @@ def check_valid_payment(state: SymbolicState, params: Dict[str, Any]) -> bool:
 
     payment = params.get("payment", state.get("payment_method", ""))
 
-    # Check 1: Payment method must exist
     if not payment or payment == "None" or payment == "":
         print("PRECONDITION CHECK: ❌ ValidPayment - No payment method provided")
         return False
 
     payment_str = str(payment)
 
-    # Check 2: Must contain "Card" to be a valid payment method
     if "Card" not in payment_str:
         print(f"PRECONDITION CHECK: ❌ ValidPayment - Invalid format: {payment_str}")
         return False
 
-    # Check 3: Must not contain invalid/expired markers
     invalid_markers = ["expired", "invalid", "blocked", "declined", "suspended"]
     if any(marker in payment_str.lower() for marker in invalid_markers):
         print(f"PRECONDITION CHECK: ❌ ValidPayment - Payment marked as invalid: {payment_str}")
         return False
 
-    # Check 4: Optional - Verify payment method is in known valid formats
     valid_formats = ["CorporateCard:", "PersonalCard:", "DebitCard:", "CreditCard:"]
     has_valid_format = any(fmt in payment_str for fmt in valid_formats)
 
@@ -158,11 +151,9 @@ class PredicateFactory:
         details_clean = (details or "").strip()
         details_l = details_clean.lower()
 
-        # Handler 1: Not(BlockedCard(...)) - Blackout date validation (case-insensitive)
         if "not(blockedcard" in details_l:
             return check_not_blocked_card
 
-        # Handler 2: NetworkAvailable() - Network connectivity check (case-insensitive)
         if "networkavailable" in details_l:
             def check_network_available(state: SymbolicState, params: Dict) -> bool:
                 network_ok = state.get("network_available", True)
@@ -172,11 +163,9 @@ class PredicateFactory:
             check_network_available.__name__ = "check_network_available"
             return check_network_available
 
-        # Handler 3: ValidPayment(...) - Payment method validation (case-insensitive)
         if "validpayment" in details_l:
             return check_valid_payment
 
-        # Handler 4: Simple predicate names without arguments (e.g., 'is_flight_available')
         if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', details_clean):
             if details_clean in globals() and callable(globals()[details_clean]):
                 print(f"  ✅ PREDICATE FACTORY: Matched existing predicate '{details_clean}'.")
@@ -184,14 +173,14 @@ class PredicateFactory:
             predicate_name = details_clean
 
             def generic_simple_check(state: SymbolicState, params: Dict) -> bool:
-                result = state.get(predicate_name, True)
+                # Fail-closed: unknown predicates must not silently pass if the state doesn't define them.
+                result = state.get(predicate_name, False)
                 print(f"PRECONDITION CHECK: {'✅' if result else '❌'} {predicate_name} (generic)")
                 return result
 
             generic_simple_check.__name__ = predicate_name
             return generic_simple_check
 
-        # Handler 5: Generic predicate pattern Predicate(args)
         match = re.search(r'([A-Z][a-zA-Z]+)\s*\(', details_clean)
         if match:
             predicate_name = match.group(1)
@@ -202,7 +191,8 @@ class PredicateFactory:
                 return check_not_blocked_card
 
             def generic_check(state: SymbolicState, params: Dict) -> bool:
-                result = state.get(f"{predicate_name.lower()}_ok", True)
+                # Fail-closed: unknown predicates must not silently pass if the state doesn't define them.
+                result = state.get(f"{predicate_name.lower()}_ok", False)
                 print(f"PRECONDITION CHECK: {'✅' if result else '❌'} {predicate_name} (generic)")
                 return result
 
@@ -221,7 +211,6 @@ class EffectFactory:
         details_clean = (details or "").strip()
         details_l = details_clean.lower()
 
-        # Handler 1: Conditional effects with network check (case-insensitive)
         if "ifthen" in details_l and "networkavailable" in details_l:
             def conditional_booking_effect(state: SymbolicState, params: Dict) -> SymbolicState:
                 if not state.get("network_available", True):
@@ -236,10 +225,7 @@ class EffectFactory:
             conditional_booking_effect.__name__ = "conditional_effect_network_booking"
             return conditional_booking_effect
 
-        # Handler 2: API Timeout Retry logic (FDKA evolved pattern) (case-insensitive)
-        # Recognizes: IfThen(ApiTimeoutRetry(api), ExecuteTool())
-        #
-        # IMPORTANT: This is a recovery-only MARKER (no-op). The executor owns retry semantics.
+        # Recovery-only marker; executor owns retry semantics.
         if "apitimeoutretry" in details_l or "timeoutretry" in details_l:
             def timeout_retry_effect(state: SymbolicState, params: Dict) -> SymbolicState:
                 print(f"EFFECT: Triggering evolution logic -> {details_clean}")
@@ -251,7 +237,6 @@ class EffectFactory:
             setattr(timeout_retry_effect, "__details__", details_clean)
             return timeout_retry_effect
 
-        # Handler 3: Simple state updates (original regex)
         match = re.match(r"(\w+)\((\w+)\)", details_clean)
         if match:
             pred, target = match.groups()
@@ -309,21 +294,31 @@ class RulePool:
         self.load_operators()
 
     def load_operators(self):
+        hotel_effects = [book_hotel_effect]
+        timeout_marker_hotel = self.effect_factory.create_effect("ApiTimeoutRetry(api)", "BookHotel")
+        if timeout_marker_hotel:
+            hotel_effects = [timeout_marker_hotel] + hotel_effects
+
         book_hotel_op = Operator(
             "BookHotel",
             ["location", "dates", "payment"],
             [is_card_valid, is_hotel_available],
-            [book_hotel_effect]
+            hotel_effects
         )
         book_hotel_op.metadata = {"version": "1.0"}
         self.operators[book_hotel_op.name] = book_hotel_op
         self._snapshot_operator(book_hotel_op.name)
 
+        flight_effects = [book_flight_effect]
+        timeout_marker_flight = self.effect_factory.create_effect("ApiTimeoutRetry(api)", "BookFlight")
+        if timeout_marker_flight:
+            flight_effects = [timeout_marker_flight] + flight_effects
+
         book_flight_op = Operator(
             "BookFlight",
             ["origin", "destination", "date"],
             [is_card_valid, is_flight_available],
-            [book_flight_effect]
+            flight_effects
         )
         book_flight_op.metadata = {"version": "1.0"}
         self.operators[book_flight_op.name] = book_flight_op
@@ -429,7 +424,6 @@ class RulePool:
             skipped = False
 
         if success and skipped:
-            # De-dup future identical attempts, but do NOT count this as an applied patch.
             self._patch_signature_cache.add(sig)
             print(f"  ℹ️ RULE_POOL: Patch {patch_id} made no changes (already present). Not counting as applied.")
             return PatchUpdateResult(
@@ -494,7 +488,6 @@ class RulePool:
 
         effect_name = getattr(new_eff, "__name__", "anon_eff")
 
-        # Safety: ensure timeout retry effects are tagged recovery-only even if factories drift.
         if ("timeout" in effect_name.lower() or "retry" in effect_name.lower()) and getattr(new_eff, "__recovery_only__", None) is None:
             setattr(new_eff, "__recovery_only__", True)
 

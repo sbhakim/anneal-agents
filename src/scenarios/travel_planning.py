@@ -51,7 +51,10 @@ class TravelPlanningScenario:
         self.difficulty_config = DIFFICULTY_CONFIGS.get(self.difficulty, DIFFICULTY_CONFIGS['normal'])
 
         self.num_tasks = config.get('num_tasks', 50)
-        self.failure_rate = self.difficulty_config['failure_rate']
+
+        # Respect an explicit scenario failure_rate override when provided; otherwise fall back to difficulty defaults.
+        cfg_failure_rate = config.get('failure_rate', None)
+        self.failure_rate = float(cfg_failure_rate) if cfg_failure_rate is not None else self.difficulty_config['failure_rate']
 
         self.min_failures_in_prefix = config.get('min_failures_in_prefix', 3)
         self.prefix_len = config.get('prefix_len', min(10, self.num_tasks))
@@ -102,21 +105,24 @@ class TravelPlanningScenario:
         tasks = []
         destinations = ["San Francisco", "New York", "Chicago", "Seattle", "Boston"]
         origins = ["Newark", "Baltimore", "Philadelphia", "Washington DC"]
-        random.seed(seed)
+
+        # Use a local RNG for reproducible task generation without mutating global random state.
+        rng = random.Random(seed)
+
         for i in range(self.num_tasks):
-            task_type = random.choice(["hotel_only", "flight_only", "combined"])
-            dest, origin = random.choice(destinations), random.choice(origins)
-            month, start_day = random.choice(["April", "May", "June"]), random.randint(1, 25)
-            end_day = start_day + random.randint(1, 5)
+            task_type = rng.choice(["hotel_only", "flight_only", "combined"])
+            dest, origin = rng.choice(destinations), rng.choice(origins)
+            month, start_day = rng.choice(["April", "May", "June"]), rng.randint(1, 25)
+            end_day = start_day + rng.randint(1, 5)
 
             if self.difficulty in ['hard', 'adversarial'] and i % 4 == 0:
-                budget = random.randint(400, 700)
+                budget = rng.randint(400, 700)
                 adversarial_templates = [
                     f"URGENT: Book a hotel in {dest} for {month} {start_day}-{end_day} using a new corporate account.",
                     f"Find the cheapest travel option to {dest} from {origin} around {month} {start_day}. Budget is ${budget}.",
                     f"Book a non-refundable flight from {origin} to {dest} on {month} {start_day}, and also book a hotel that must be fully refundable."
                 ]
-                task = random.choice(adversarial_templates)
+                task = rng.choice(adversarial_templates)
             else:
                 if task_type == "hotel_only":
                     task = f"Book a hotel in {dest} for {month} {start_day}-{end_day}"
@@ -152,7 +158,9 @@ class FailureInjector:
     MINIMUM RELIABILITY UPDATES (2026-01):
     1) Cache intended failure so should_fail() and get_failure_details() are consistent.
     2) Make ToolError timeouts recoverable within a task by injecting at most once per
-       (task_id, operator, payment_key) (lets retry logic demonstrate value).
+       (task_id, operator, payment_key, policy_ref) (lets retry logic demonstrate value).
+    3) Treat API schema drift (API-V2) as one-shot recoverable as well.
+    4) Use a local RNG to avoid global seeding side effects and improve run reproducibility.
     """
 
     def __init__(self, failure_rate: float, horizon: int,
@@ -169,17 +177,19 @@ class FailureInjector:
         self.patched_operators: Set[str] = set()
         self._patch_successes: Dict[str, int] = {}
 
+        # Local RNG: deterministic without mutating global random state.
+        self.rng = random.Random(self.seed)
+
         # Cache key includes payment identity so switching cards can change injected outcomes.
         self._intended_failure_cache: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
-        self._task_op_injection_counts: Dict[Tuple[int, str, str], int] = {}
+        self._task_op_injection_counts: Dict[Tuple[int, str, str, str], int] = {}
 
         self.policy_flip_points = self._get_event_points('policy_flips')
         self.schema_change_points = self._get_event_points('schema_changes')
 
-        random.seed(self.seed)
         total_fail = max(0, int(round(self.horizon * self.failure_rate)))
         base_pool = list(range(self.horizon))
-        self.failing_tasks = set(random.sample(base_pool, total_fail)) if total_fail > 0 else set()
+        self.failing_tasks = set(self.rng.sample(base_pool, total_fail)) if total_fail > 0 else set()
 
         self.failure_classes = {
             "blocked_card": {"operator": "BookHotel", "error_type": "PreconditionUnmet",
@@ -228,7 +238,6 @@ class FailureInjector:
         return any(b in str(state.get("travel_dates", "")) for b in self.blackout_dates)
 
     def _is_recoverable_timeout(self, failure_info: Dict[str, Any]) -> bool:
-        """True if this failure is a ToolError timeout suitable for one-shot injection."""
         if not isinstance(failure_info, dict):
             return False
         if failure_info.get("error_type") != "ToolError":
@@ -236,6 +245,15 @@ class FailureInjector:
         msg = str(failure_info.get("message", "")).lower()
         pref = str(failure_info.get("policy_ref", "")).upper()
         return ("timeout" in msg) or (pref == "API-503")
+
+    def _is_recoverable_schema_change(self, failure_info: Dict[str, Any]) -> bool:
+        if not isinstance(failure_info, dict):
+            return False
+        if failure_info.get("error_type") != "ToolError":
+            return False
+        msg = str(failure_info.get("message", "")).lower()
+        pref = str(failure_info.get("policy_ref", "")).upper()
+        return (pref == "API-V2") or ("/v1/book" in msg) or ("deprecated" in msg) or ("use /v2" in msg) or ("use v2" in msg)
 
     def should_fail(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                     state: Optional[Any] = None) -> bool:
@@ -261,9 +279,15 @@ class FailureInjector:
         if intended_failure.get("policy_ref") == "PAY-401":
             return self._is_corporate_card(params, state)
 
-        # For ToolError timeouts, inject at most once per task/operator/payment to allow recovery/retry
-        if self._is_recoverable_timeout(intended_failure):
-            key = (int(task_id), str(op_name), self._payment_key(params, state))
+        # If the agent has migrated to v2, don't keep injecting v1 deprecation.
+        if self._is_recoverable_schema_change(intended_failure):
+            if state and hasattr(state, "get") and str(state.get("api_version", "")).lower() == "v2":
+                return False
+
+        # For retryable ToolError classes, inject at most once per task/operator/payment/policy
+        if self._is_recoverable_timeout(intended_failure) or self._is_recoverable_schema_change(intended_failure):
+            pref = str(intended_failure.get("policy_ref", "") or "")
+            key = (int(task_id), str(op_name), self._payment_key(params, state), pref)
             count = self._task_op_injection_counts.get(key, 0)
             if count >= 1:
                 return False
@@ -295,7 +319,7 @@ class FailureInjector:
             elif task_id in self.policy_flip_points and op_name == "BookHotel":
                 failure_class = "blocked_card"
             else:
-                failure_class = "api_timeout" if random.random() < 0.5 else "invalid_payment"
+                failure_class = "api_timeout" if self.rng.random() < 0.5 else "invalid_payment"
         elif task_id in self.schema_change_points and op_name == "BookFlight":
             failure_class = "api_schema_change"
         elif task_id in self.policy_flip_points and op_name == "BookHotel":

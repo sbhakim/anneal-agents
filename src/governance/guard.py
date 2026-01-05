@@ -170,6 +170,31 @@ class Guard:
             # Leave existing ValueKG as-is on error
             pass
 
+    def _is_low_risk_tool_schema_drift(self, patch: Any) -> bool:
+        action = str(_get(patch, "action", "") or "")
+        if action != "UPDATE_TOOL_SCHEMA":
+            return False
+
+        details = str(_get(patch, "details", "") or "")
+        d = details.lower()
+
+        # Endpoint/version drift patterns (keep narrow).
+        has_endpoint_drift = ("/v1/" in d and "/v2/" in d) or ("v1/book" in d and "v2/book" in d) or ("deprecated" in d)
+
+        if not has_endpoint_drift:
+            return False
+
+        # Escalate if this touches sensitive surfaces.
+        sensitive = (
+            "auth", "oauth", "token", "key", "secret", "credential",
+            "payment", "card", "security", "privacy", "pii", "encrypt",
+            "signature", "jwt", "mfa", "permission",
+        )
+        if any(s in d for s in sensitive):
+            return False
+
+        return True
+
     # ========================================================================
     # MAIN PUBLIC API
     # ========================================================================
@@ -443,6 +468,15 @@ class Guard:
         explanation = ""
         reason_code = "CAUSAL:ALLOW"
 
+        # Low-risk tool drift schema updates should reach canary instead of human escalation.
+        if self._is_low_risk_tool_schema_drift(patch):
+            return "allow", {
+                "ambiguity": 0.0,
+                "impact": 0.2,
+                "reason_code": "CAUSAL:ALLOW_TOOL_DRIFT_SCHEMA",
+                "explanation": "Allowing endpoint drift schema update (low causal impact); canary will gate"
+            }
+
         # Try CausalKG if available (preferred)
         if causal_kg and hasattr(causal_kg, "assess_trace"):
             try:
@@ -585,6 +619,8 @@ class Guard:
                     return True, f"High-impact operation: {operation}"
 
         if action == 'UPDATE_TOOL_SCHEMA':
+            if self._is_low_risk_tool_schema_drift(patch):
+                return False, "Tool schema drift update (low risk)"
             return True, "Tool schema changes affect multiple operators"
 
         if causal_kg and hasattr(causal_kg, 'get_intervention_effects'):
@@ -677,6 +713,8 @@ class Guard:
         details = _get(patch, "details", "")
 
         if action == 'UPDATE_TOOL_SCHEMA':
+            if self._is_low_risk_tool_schema_drift(patch):
+                return 0.1
             return 0.5
 
         generic_markers = ['Valid', 'Check', 'Safe', 'Allow', 'Verify']

@@ -93,26 +93,43 @@ CANARY_SUITE: List[Dict[str, Any]] = [
 # Synthetic SMT sanity patches (opt-in; does not affect standard canary suite)
 # ---------------------------------------------------------------------
 
-# Intentionally tiny: one SAT-ish patch and one explicit contradiction to demonstrate UNSAT.
-# CanaryRunner will run scorer._score_consistency(...) over these when the caller passes them
-# as `synthetic_patches` in the canary context.
+# Four tiny patches to surface SAT/UNSAT deterministically:
+# - SAT: single-atom claim
+# - UNSAT: direct contradiction (P ∧ ¬P)
+# - UNSAT: contradiction via axioms (ExpiredPayment -> InvalidPayment -> ¬ValidPayment)
+# - SAT: consistent trio (ExpiredPayment ∧ InvalidPayment ∧ ¬ValidPayment)
 SMT_SANITY_PATCHES: List[Dict[str, Any]] = [
     {
         "id": "SMT-SAT-01",
         "operator": "BookHotel",
         "action": "ADD_PRECONDITION",
-        # Single-atom claim: Z3 SAT is expected; this mainly proves the Z3 path runs.
-        "details": "Precondition: NetworkAvailable(request) must hold. NetworkAvailable(request).",
+        "details": "Precondition: NetworkAvailable(request). NetworkAvailable(request).",
     },
     {
         "id": "SMT-UNSAT-01",
         "operator": "BookHotel",
         "action": "ADD_PRECONDITION",
-        # Explicit contradiction: ValidPayment and Not(ValidPayment) on the same symbolic token.
-        # This should be UNSAT under the minimal Z3 encoding in src/fdka/scoring.py.
         "details": (
-            "Precondition: ValidPayment(payment) and Not(ValidPayment(payment)) must both hold. "
+            "Precondition: ValidPayment(payment) and Not(ValidPayment(payment)). "
             "ValidPayment(payment). Not(ValidPayment(payment))."
+        ),
+    },
+    {
+        "id": "SMT-UNSAT-02",
+        "operator": "BookHotel",
+        "action": "ADD_PRECONDITION",
+        "details": (
+            "Precondition: ExpiredPayment(payment), InvalidPayment(payment), and ValidPayment(payment). "
+            "ExpiredPayment(payment). InvalidPayment(payment). ValidPayment(payment)."
+        ),
+    },
+    {
+        "id": "SMT-SAT-02",
+        "operator": "BookHotel",
+        "action": "ADD_PRECONDITION",
+        "details": (
+            "Precondition: ExpiredPayment(payment), InvalidPayment(payment), and Not(ValidPayment(payment)). "
+            "ExpiredPayment(payment). InvalidPayment(payment). Not(ValidPayment(payment))."
         ),
     },
 ]

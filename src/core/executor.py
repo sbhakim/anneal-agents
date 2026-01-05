@@ -29,6 +29,24 @@ MINIMUM UPDATE (2026-01):
 - Mirror failure class into BOTH `error` and `error_type` in emitted trace events.
   Traces in this repo are not fully uniform; metrics now supports either key,
   but emitting both removes schema ambiguity for Table 3 and RFR/TTA.
+
+MINIMUM VERIFY→REPAIR LOOP (2026-01):
+- On Verify-Before-Act failure, attempt up to h=2 small, template repairs and re-verify.
+- Keeps repair scope local (params/state normalization) to avoid surprising semantics.
+
+MINIMUM TOOL-SCHEMA PATCH EXECUTION (2026-01):
+- If an UPDATE_TOOL_SCHEMA patch was committed (stored in op.metadata['schema_update']),
+  reflect it into runtime state/params so environment + tool dispatch can observe it.
+
+MINIMUM TRACE SEMANTICS FIX (2026-01):
+- Add `event_type` for trace entries and avoid emitting `error`/`error_type` for
+  non-failure annotations (e.g., pre-verify constraint injections that are later repaired).
+  This prevents metrics from counting "failures" when the step ultimately succeeds.
+
+MINIMUM OBSERVED-FAILURE SEMANTICS (2026-01):
+- Emit a `verify_failed` event (with error/error_type) ONLY when verification actually fails.
+- Mark `step_success` as recovered when a verify failure was repaired, so metrics can count
+  constraint recoveries without introducing phantom failures.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import time
@@ -86,6 +104,10 @@ class Executor:
             # Network is used by some patches/predicates; keep a sensible default when missing.
             if "network_available" in defaults and state.get("network_available") is None:
                 state.set("network_available", defaults["network_available"])
+
+            # API version baseline.
+            if "api_version" in defaults and state.get("api_version") is None:
+                state.set("api_version", defaults["api_version"])
         except Exception:
             pass
 
@@ -104,9 +126,6 @@ class Executor:
     def _sync_payment_from_params(self, params: Dict[str, Any], state: SymbolicState) -> None:
         """
         Keep payment identity consistent across params/state AND prevent "sticky" invalid flags.
-
-        Key bug fixed: if a prior attempt injected payment_invalid=True, and a later attempt
-        switches to a clean payment method, the old flags must not continue to poison Verify.
         """
         if "payment" not in params or params["payment"] is None:
             return
@@ -119,11 +138,133 @@ class Executor:
             state.set("payment_invalid", True)
             state.set("payment_valid", False)
         else:
-            # Clear transient invalid markers when a clean payment is provided.
             if state.get("payment_invalid") is True:
                 state.set("payment_invalid", False)
             if state.get("payment_valid") is False:
                 state.set("payment_valid", True)
+
+    def _apply_tool_schema_update_hint(self, op: Any, params: Dict[str, Any], state: SymbolicState) -> None:
+        """
+        Reflect committed UPDATE_TOOL_SCHEMA metadata into runtime state/params.
+        This is intentionally conservative: only version/endpoint drift hints are applied.
+        """
+        try:
+            meta = getattr(op, "metadata", {}) or {}
+            su = meta.get("schema_update") or ""
+            if not isinstance(su, str) or not su.strip():
+                return
+
+            s = su.lower()
+            if ("/v2/" in s) or ("use /v2" in s) or ("use v2" in s) or ("api-v2" in s) or ("v2/book" in s):
+                if str(state.get("api_version") or "").lower() != "v2":
+                    state.set("api_version", "v2")
+                params.setdefault("api_version", "v2")
+
+                if "/v2/book" in s or "v2/book" in s:
+                    state.set("booking_endpoint", "/v2/book")
+                    params.setdefault("endpoint", "/v2/book")
+        except Exception:
+            return
+
+    # ---------------------------
+    # Verify→Repair (h=1–2) templates
+    # ---------------------------
+    def _repair_clear_invalid_marker(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        p = params.get("payment")
+        if not p or not isinstance(p, str) or "(invalid)" not in p.lower():
+            return False
+        cleaned = p.replace("(invalid)", "").replace("(INVALID)", "").strip()
+        if cleaned == p:
+            return False
+        params["payment"] = cleaned
+        state.set("payment_method", cleaned)
+        state.set("payment_invalid", False)
+        state.set("payment_valid", True)
+        return True
+
+    def _repair_switch_to_personal_payment(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        cur = params.get("payment", state.get("payment_method"))
+        cur_s = str(cur or "")
+        if not cur_s:
+            return False
+
+        candidates = []
+        for k in ("personal_payment_method", "backup_payment_method", "alt_payment_method"):
+            v = state.get(k)
+            if isinstance(v, str) and v.strip():
+                candidates.append(v.strip())
+
+        candidates.append("PersonalCard:PC-1134")
+
+        if "personalcard" in cur_s.lower():
+            return False
+
+        new_p = candidates[0]
+        params["payment"] = new_p
+        state.set("payment_method", new_p)
+        state.set("payment_invalid", False)
+        state.set("payment_valid", True)
+        return True
+
+    def _repair_reground_params_from_state(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        changed = False
+
+        def _fill(key: str, fallbacks: List[str]) -> None:
+            nonlocal changed
+            v = params.get(key)
+            if v is not None and (not isinstance(v, str) or v.strip() != ""):
+                return
+            for sk in fallbacks:
+                sv = state.get(sk)
+                if sv is None:
+                    continue
+                if isinstance(sv, str) and sv.strip() == "":
+                    continue
+                params[key] = sv
+                changed = True
+                return
+
+        _fill("dates", ["travel_dates", "date", "travel_date"])
+        _fill("date", ["travel_date", "travel_dates", "dates"])
+        _fill("location", ["travel_location", "destination", "travel_destination", "city"])
+        _fill("destination", ["travel_destination", "travel_location", "location"])
+        _fill("origin", ["travel_origin"])
+
+        if params.get("payment") in (None, "", "None"):
+            pm = state.get("payment_method")
+            if pm not in (None, "", "None"):
+                params["payment"] = pm
+                changed = True
+
+        return changed
+
+    def _repair_backoff_and_refresh(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        time.sleep(float(self.config.get("repair_backoff_s", 0.03)))
+        self._apply_world_defaults(state)
+        return True
+
+    def _select_repair_action(
+            self,
+            violated: Optional[str],
+            injected_error_info: Optional[Dict[str, Any]],
+            params: Dict[str, Any],
+            state: SymbolicState
+    ) -> Optional[Tuple[str, Any]]:
+        v = (violated or "").lower()
+        msg = str((injected_error_info or {}).get("message", "") or "").lower()
+
+        if "payment" in v or "card" in v or "blocked" in v:
+            if self._repair_clear_invalid_marker(params, state):
+                return "CLEAR_INVALID_PAYMENT_MARKER", lambda: True
+            return "SWITCH_TO_PERSONAL_PAYMENT", lambda: self._repair_switch_to_personal_payment(params, state)
+
+        if "network" in v or "timeout" in msg:
+            return "RETRY_BACKOFF_REFRESH", lambda: self._repair_backoff_and_refresh(params, state)
+
+        if violated in (None, "", "anonymous"):
+            return "REGROUND_PARAMS_FROM_STATE", lambda: self._repair_reground_params_from_state(params, state)
+
+        return "RETRY_BACKOFF_REFRESH", lambda: self._repair_backoff_and_refresh(params, state)
 
     # ---------------------------
     # Failure injector compatibility + patchable constraint injection
@@ -161,15 +302,11 @@ class Executor:
                                             state: SymbolicState) -> None:
         """
         Minimum, safe mutations so constraint injections are caught by Verify-Before-Act.
-
-        Critical: mutate BOTH state and params for payment constraints. Some predicates read params,
-        others read state; if only one is tainted, Verify can miss injected failures.
         """
         msg = str(error_info.get("message", "") or "")
         policy_ref = str(error_info.get("policy_ref", "") or "")
         category = str(error_info.get("category", "") or "")
 
-        # 1) Invalid/expired payment (PAY-401): taint state+params + set structured flags.
         if "invalid or expired" in msg.lower() or "pay-401" in policy_ref.lower() or "invalid_payment" in category.lower():
             payment = params.get("payment", state.get("payment_method"))
             if payment is not None:
@@ -180,18 +317,16 @@ class Executor:
             state.set("payment_invalid", True)
             state.set("payment_valid", False)
 
-        # 2) Corporate blackout blocked card (H-23): ensure policy+blackout context is present.
         if "blackout" in msg.lower() or "blocked" in msg.lower() or policy_ref.strip() == "H-23":
             state.set("corporate_card_policy", "blocked_on_blackout_dates")
             if not state.get("blackout_dates"):
                 state.set("blackout_dates", ["June 1", "June 2"])
 
-        # 3) Network constraint (if present)
         if "network" in msg.lower() and ("unavailable" in msg.lower() or "down" in msg.lower()):
             state.set("network_available", False)
 
     # ---------------------------
-    # Effect execution with minimal gating (prevents recovery-only effects firing on clean success)
+    # Effect execution with minimal gating
     # ---------------------------
     def _apply_effects(self, op: Any, state: SymbolicState, params: Dict[str, Any], *, recovery: bool) -> SymbolicState:
         """
@@ -208,7 +343,6 @@ class Executor:
                     continue
                 state = eff(state, params)
             except Exception:
-                # Preserve baseline behavior: a bad effect should surface as an execution failure.
                 raise
         return state
 
@@ -218,7 +352,6 @@ class Executor:
     def _operator_has_timeout_retry(self, op: Any) -> bool:
         """
         True if the operator appears to have a learned timeout-retry recovery effect.
-        We use function-name heuristics to avoid deeper coupling to patch schemas.
         """
         try:
             for eff in getattr(op, "effects", []) or []:
@@ -249,64 +382,86 @@ class Executor:
 
         self._apply_world_defaults(state)
 
-        # 1. Metacognitive Arbitration (Monitor-Evaluate-Regulate)
         u = self.signal_gen.compute_uncertainty(plan)
         p_viol = self.signal_gen.predict_violation_probability(plan, state)
         budget = self.config.get('budget_ms', 2000)
         pathway = self.arbitrator.arbitrate(u, p_viol, budget)
         print(f"EXECUTOR: Arbitrated pathway -> {pathway}")
-        trace.append({"pathway": pathway, "signals": {"u": u, "p_viol": p_viol}})
+        trace.append({"event_type": "meta", "pathway": pathway, "signals": {"u": u, "p_viol": p_viol}})
 
-        # 2. Act based on the chosen pathway
         if pathway == "DEFER":
             print("EXECUTOR: ⏸️ Execution deferred due to budget constraints.")
-            trace.append({"error": "Deferred", "error_type": "Deferred", "operator": "SYSTEM", "reason": "Budget exceeded"})
+            trace.append({
+                "event_type": "step_failure",
+                "error": "Deferred",
+                "error_type": "Deferred",
+                "operator": "SYSTEM",
+                "reason": "Budget exceeded"
+            })
             return trace, False, "Deferred"
 
         if pathway == "S2":
             print("EXECUTOR: 🤔 S2 (Slow Path) - Performing extra deliberation.")
             time.sleep(0.1)
-            trace.append({"deliberation": "Simulated deep verification (S2 path)"})
+            trace.append({"event_type": "deliberation", "detail": "Simulated deep verification (S2 path)"})
         elif pathway == "VERIFY_S1":
             print("EXECUTOR: ✓ VERIFY→S1 - Proceeding with standard verified execution.")
         else:
             print("EXECUTOR: ⚡ S1 (Fast Path) - Proceeding with standard execution.")
 
-        # 3. Main Execution Loop
+        max_repairs = int(self.config.get("repair_hops", 2))
+        enable_repair = bool(self.config.get("enable_repair", True))
+
         for step in plan:
             op = step["operator"]
             params = step.get("params", {}) or {}
             print(f"EXECUTOR: Executing step -> {op.name}")
 
             self._apply_world_defaults(state)
-
-            # Sync state for predicate evaluation (and clear sticky invalid flags on clean payment)
             self._sync_payment_from_params(params, state)
+            self._apply_tool_schema_update_hint(op, params, state)
 
-            trace.append({"step": op.name, "state_before": state.to_dict()})
+            trace.append({"event_type": "step_start", "step": op.name, "state_before": state.to_dict()})
 
-            # ---- Controlled Failure Injection (PATCHABLE constraints BEFORE Verify) ----
             injected_error_info: Optional[Dict[str, Any]] = None
             if self._injector_should_fail(task_id, op.name, params, state):
                 error_info = self._injector_failure_details(task_id, op.name, params, state)
 
-                # Normalize injected class label for downstream consumers.
                 err_cls = error_info.get("error") or error_info.get("error_type") or "ToolError"
                 injected_error_info = dict(error_info)
                 injected_error_info["error"] = err_cls
                 injected_error_info["error_type"] = err_cls
                 injected_error_info.setdefault("operator", op.name)
 
+                # For constraint-style injections, mutate state/params so Verify-Before-Act can catch them.
+                # IMPORTANT: Do NOT emit `error`/`error_type` here; it may be repaired and should not be
+                # counted as a failure event unless verification actually fails.
                 if err_cls != "ToolError":
                     self._apply_constraint_injection_to_state(injected_error_info, params, state)
-                    trace.append({"injected": True, "phase": "pre-verify", **injected_error_info})
+                    trace.append({
+                        "event_type": "fault_injected",
+                        "injected": True,
+                        "phase": "pre-verify",
+                        "operator": op.name,
+                        "fault_class": err_cls,
+                        "message": injected_error_info.get("message"),
+                        "policy_ref": injected_error_info.get("policy_ref"),
+                        "category": injected_error_info.get("category"),
+                        "task_id": injected_error_info.get("task_id"),
+                        "trace_id": injected_error_info.get("trace_id"),
+                    })
 
-            # ---- Verify-Before-Act ----
+            # Track whether this step had a real verify failure that was later repaired.
+            had_verify_failure = False
+            verify_failed_violated = None
+
             ok, violated = self._verify_preconditions(op, params, state)
             if not ok:
-                print(f"EXECUTOR: ❌ Verify-Before-Act failed for {op.name}. Halting.")
-
+                had_verify_failure = True
+                verify_failed_violated = violated
+                # This is a real failure signal (verification failed). Metrics should count it even if repaired.
                 payload = {
+                    "event_type": "verify_failed",
                     "error": "PreconditionUnmet",
                     "error_type": "PreconditionUnmet",
                     "operator": op.name,
@@ -314,28 +469,69 @@ class Executor:
                 }
                 if injected_error_info and injected_error_info.get("error") != "ToolError":
                     payload["injected_constraint"] = True
-                    # Keep policy_ref/category/message if present; metrics uses operator+error(_type)
+                    payload.update({k: v for k, v in injected_error_info.items() if k not in payload})
+                trace.append(payload)
+
+            if not ok and enable_repair:
+                v = violated
+                for attempt in range(1, max_repairs + 1):
+                    sel = self._select_repair_action(v, injected_error_info, params, state)
+                    if not sel:
+                        break
+                    repair_name, repair_fn = sel
+                    trace.append({
+                        "event_type": "repair_attempt",
+                        "repair": repair_name,
+                        "attempt": attempt,
+                        "operator": op.name,
+                        "violated": v
+                    })
+                    try:
+                        applied = bool(repair_fn())
+                    except Exception:
+                        applied = False
+                    if not applied:
+                        break
+                    self._sync_payment_from_params(params, state)
+                    self._apply_tool_schema_update_hint(op, params, state)
+                    ok, v = self._verify_preconditions(op, params, state)
+                    if ok:
+                        violated = None
+                        break
+                violated = v if not ok else None
+
+            if not ok:
+                print(f"EXECUTOR: ❌ Verify-Before-Act failed for {op.name}. Halting.")
+                payload = {
+                    "event_type": "step_failure",
+                    "error": "PreconditionUnmet",
+                    "error_type": "PreconditionUnmet",
+                    "operator": op.name,
+                    "violated": violated
+                }
+                if injected_error_info and injected_error_info.get("error") != "ToolError":
+                    payload["injected_constraint"] = True
                     payload.update({k: v for k, v in injected_error_info.items() if k not in payload})
                 trace.append(payload)
                 return trace, False, "PreconditionUnmet"
 
-            # ---- Controlled Failure Injection (runtime/tool faults AFTER Verify) ----
             if injected_error_info and injected_error_info.get("error") == "ToolError":
                 print(f"EXECUTOR: ❌ Injected Failure -> {injected_error_info.get('message', 'tool error')}")
-                trace.append({"injected": True, "phase": "post-verify", **injected_error_info})
+                trace.append({"event_type": "fault_injected", "injected": True, "phase": "post-verify", **injected_error_info})
 
                 if self._is_timeout_tool_error(injected_error_info) and self._operator_has_timeout_retry(op):
-                    trace.append({"recovery": "ApiTimeoutRetry", "attempt": 1, "operator": op.name})
+                    trace.append({"event_type": "recovery_retry", "recovery": "ApiTimeoutRetry", "attempt": 1, "operator": op.name})
                     print("EXECUTOR: 🔁 Detected timeout + retry-capable operator. Attempting one recovery retry...")
                     time.sleep(0.05)
 
                     try:
                         state = self._apply_effects(op, state, params, recovery=True)
-                        trace.append({"step": op.name, "state_after": state.to_dict(), "recovered": True})
+                        trace.append({"event_type": "step_success", "step": op.name, "state_after": state.to_dict(), "recovered": True})
                         print(f"EXECUTOR: ✅ Recovery retry succeeded for {op.name}.")
                         continue
                     except Exception as e:
                         trace.append({
+                            "event_type": "step_failure",
                             "error": "ToolError",
                             "error_type": "ToolError",
                             "operator": op.name,
@@ -346,6 +542,7 @@ class Executor:
                         return trace, False, "ToolError"
 
                 trace.append({
+                    "event_type": "step_failure",
                     "error": "ToolError",
                     "error_type": "ToolError",
                     "operator": op.name,
@@ -354,11 +551,11 @@ class Executor:
                 })
                 return trace, False, "ToolError"
 
-            # ---- Apply Effects on Success ----
             try:
                 state = self._apply_effects(op, state, params, recovery=False)
             except Exception as e:
                 trace.append({
+                    "event_type": "step_failure",
                     "error": "ToolError",
                     "error_type": "ToolError",
                     "operator": op.name,
@@ -368,7 +565,12 @@ class Executor:
                 print(f"EXECUTOR: ❌ Exception during {op.name} effects.")
                 return trace, False, "ToolError"
 
-            trace.append({"step": op.name, "state_after": state.to_dict()})
+            success_event = {"event_type": "step_success", "step": op.name, "state_after": state.to_dict()}
+            if had_verify_failure:
+                success_event["recovered"] = True
+                success_event["recovered_from"] = "PreconditionUnmet"
+                success_event["violated_initial"] = verify_failed_violated
+            trace.append(success_event)
             print(f"EXECUTOR: ✅ Step {op.name} successful.")
 
         print("EXECUTOR: ✅ Plan execution complete.")

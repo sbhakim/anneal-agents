@@ -14,6 +14,10 @@ UPDATED:
 MINIMUM MANUSCRIPT/RESULTS UPDATE (2026-01):
 - Add privacy-safe provenance hooks: hash of (system+user prompt) + hash of raw model text.
   This makes runs auditable/reproducible without logging the raw prompt/response.
+
+MINIMUM TOOL-DRIFT UPDATE (2026-01):
+- Allow UPDATE_TOOL_SCHEMA patches without predicate/guard.
+- Deterministic router for deprecation/version drift signals (v1→v2) so canary/commit can trigger.
 """
 
 from typing import List, Dict, Any, Optional
@@ -63,6 +67,40 @@ def _hash_text(x: Any) -> str:
         return hashlib.sha256(repr(x).encode("utf-8")).hexdigest()
 
 
+def _is_tool_drift(evidence: str) -> bool:
+    ev = (evidence or "").lower()
+    drift_markers = (
+        "deprecated",
+        "deprecation",
+        "/v1/",
+        "v1/book",
+        "use /v2",
+        "use v2",
+        "moved to",
+        "endpoint changed",
+        "no longer supported",
+        "unsupported endpoint",
+    )
+    return any(m in ev for m in drift_markers)
+
+
+def _build_tool_drift_patch(operator_name: str, evidence: str) -> Dict[str, Any]:
+    ev = (evidence or "").lower()
+    # Keep details as a string because RulePool stores schema updates as metadata text.
+    if "/v1/" in ev or "v1/book" in ev:
+        details = "Switch tool endpoint from /v1/book to /v2/book (deprecation/tool-drift)."
+    else:
+        details = "Update tool schema/endpoint to the latest supported version (tool-drift)."
+    return {
+        "action": "UPDATE_TOOL_SCHEMA",
+        "operator": operator_name,
+        "patch": {
+            "schema_update": details,
+            "justification": f"Observed tool/endpoint drift: {evidence[:120]}",
+        },
+    }
+
+
 # ---------------------------
 # Templates for mock fallback
 # ---------------------------
@@ -79,6 +117,13 @@ PATCH_TEMPLATES = {
         "patch": {
             "predicate": "ValidPayment(payment)",
             "justification": "Payment method validation to prevent API rejection"
+        }
+    },
+    ("ToolError", ("deprecated", "/v1", "v1/book", "use /v2", "use v2")): {
+        "action": "UPDATE_TOOL_SCHEMA",
+        "patch": {
+            "schema_update": "Switch tool endpoint from /v1/book to /v2/book (deprecation/tool-drift).",
+            "justification": "Fix endpoint deprecation by migrating to v2."
         }
     },
     ("ToolError", ("timeout", "api", "network")): {
@@ -263,6 +308,7 @@ class FDKAPipeline:
             fi = self._extract_failure_info(trace)
             op_name = self._localize(fi)
             print(f"FDKA: [1/3] Fault localized -> '{op_name}'")
+
             patch = self._propose_edit_three_stage(fi, trace, rule_pool)
             patch.setdefault("operator", op_name)
             patch.setdefault("id", f"patch-{uuid.uuid4().hex[:8]}")
@@ -285,7 +331,6 @@ class FDKAPipeline:
             print("--- FDKA PROPOSAL COMPLETED ---")
             return patch
         except Exception as e:
-            # Fail-soft: never crash the evaluation loop due to a malformed patch
             msg = f"propose_edit_error: {e.__class__.__name__}: {e}"
             print(f"FDKA: ❌ {msg}")
             return {
@@ -318,6 +363,13 @@ class FDKAPipeline:
         print("  🔧 ProposeEdit: Starting 3-stage pipeline...")
         prompt = self._stage1_serialize(fi, trace, rule_pool)
         print("  📝 Stage 1: Serialized trace.")
+
+        # Deterministic router for common tool-drift (prevents "no provable improvement" dead-ends).
+        evidence = (prompt.get("error", {}).get("evidence", "") or "")
+        op_name = (prompt.get("operator", {}) or {}).get("name", fi.get("operator", "Unknown"))
+        if fi.get("error") == "ToolError" and _is_tool_drift(evidence):
+            return self._stage3_validate(_build_tool_drift_patch(op_name, evidence), rule_pool)
+
         raw_patch_json = self._stage2_generate(prompt)
         if isinstance(raw_patch_json, dict) and raw_patch_json.get("action") == "REJECTED":
             return raw_patch_json
@@ -378,7 +430,6 @@ class FDKAPipeline:
         elif self.llm_provider_type == 'transformers':
             return self._generate_with_transformers(prompt_dict)
         else:
-            # mock path expects the same structure as serialized_prompt
             return self._mock_llm_generate(serialized_prompt)
 
     @timeout(seconds=60)
@@ -395,7 +446,7 @@ class FDKAPipeline:
 
         prompt_hash = prompt_dict.get("prompt_hash") or _hash_text([m.get("role") + ":" + m.get("content", "") for m in messages])
 
-        for attempt in range(2):  # Try up to 2 times
+        for attempt in range(2):
             t0 = time.time()
             result = self.llm.generate(messages=messages)
             latency = max(0.0, time.time() - t0)
@@ -429,7 +480,6 @@ class FDKAPipeline:
                 }
                 return parsed
 
-            # retry prompt to fix JSON
             print(f"  ⚠️ Attempt {attempt + 1}: Could not parse JSON. Retrying with correction prompt...")
             messages = [
                 {"role": "system",
@@ -454,7 +504,6 @@ class FDKAPipeline:
 
             cfg = self.config.get('transformers_config', self.config) or {}
 
-            # time the call for latency
             t0 = time.time()
             out = self.llm_pipeline(
                 full_prompt,
@@ -472,7 +521,6 @@ class FDKAPipeline:
 
             parsed = self._extract_json_from_text(txt)
 
-            # estimate tokens (best-effort) using tokenizer
             try:
                 tokens_used = len(self.llm_pipeline.tokenizer.encode(full_prompt)) + \
                               len(self.llm_pipeline.tokenizer.encode(txt))
@@ -510,18 +558,15 @@ class FDKAPipeline:
         """Extract a single JSON object from free text or fenced blocks."""
         if not text:
             return None
-        # try fenced ```json ... ```
         m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
         if m:
             try:
                 return json.loads(m.group(1))
             except json.JSONDecodeError:
                 pass
-        # try any single top-level {...}
         start = text.find('{')
         end = text.rfind('}')
         if start != -1 and end != -1 and end > start:
-            # attempt bracket balancing
             bal = 0
             last = start
             for i, ch in enumerate(text[start:end + 1], start=start):
@@ -567,6 +612,7 @@ RULES:
 - For invalid/expired payment: {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "ValidPayment(payment)"}}}}
 - For blocked card/blackout: {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "Not(BlockedCard(payment, dates))"}}}}
 - For network/timeout: {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())"}}}}
+- For deprecation/tool drift (e.g., /v1 → /v2): {{"action": "UPDATE_TOOL_SCHEMA", "operator": "{operator_name}", "patch": {{"schema_update": "Switch endpoint from /v1/book to /v2/book"}}}}
 
 Return only the JSON object, no prose."""
         return {
@@ -581,6 +627,17 @@ Return only the JSON object, no prose."""
         ev = (sp.get("error", {}).get("evidence", "") or "").lower()
         operator_name = sp.get("operator", {}).get("name", "Unknown")
         prompt_hash = _hash_text(sp)
+
+        if error == "ToolError" and _is_tool_drift(ev):
+            out = _build_tool_drift_patch(operator_name, ev)
+            out["usage"] = {"tokens_used": 0, "latency_sec": 0.0, "model": "mock"}
+            out["llm_trace"] = {
+                "provider": "mock",
+                "model": "mock",
+                "prompt_hash": prompt_hash,
+                "response_hash": _hash_text(out),
+            }
+            return out
 
         print(f"  🎯 Mock template matching: error={error}, evidence='{ev[:50]}...'")
         for k, t in PATCH_TEMPLATES.items():
@@ -613,29 +670,20 @@ Return only the JSON object, no prose."""
     def _stage3_validate(self, raw, rp):
         """Stage 3: Deterministic validation + normalization."""
         try:
-            # Defensive: ensure dict
             if not isinstance(raw, dict):
                 raw = {"action": "REJECTED", "details": "non_dict_patch"}
                 return raw
 
-            # Normalize action before validation
             act = _normalize_action(raw.get("action", ""))
             raw["action"] = act
 
-            # If operator missing, attempt to infer from serialized prompt (no-op here)
             if not raw.get("operator"):
                 raw["operator"] = (rp and getattr(rp, "last_operator", None)) or "Unknown"
 
-            # Schema checks
             self._validate_schema(raw)
-
-            # Typing/semantic hints (non-fatal)
             self._validate_typing_and_semantics(raw, rp)
-
-            # Normalize final patch (preserve optional usage + llm_trace)
             return self._normalize_patch(raw)
         except Exception as e:
-            # Fail-soft: preserve audit metadata if present
             return {
                 "action": "REJECTED",
                 "details": f"validation_error: {e}",
@@ -648,35 +696,62 @@ Return only the JSON object, no prose."""
             raise ValueError(f"Invalid patch structure: {p}")
         if p["action"] not in ALLOWED_ACTIONS:
             raise ValueError(f"Invalid action '{p['action']}', must be one of {sorted(ALLOWED_ACTIONS)}")
-        # basic patch content presence
         if not isinstance(p["patch"], dict):
             raise ValueError("Patch 'patch' must be a JSON object")
-        if not any(k in p["patch"] for k in ("predicate", "guard")):
-            raise ValueError("Patch must include either 'predicate' or 'guard'")
+
+        if p["action"] == "UPDATE_TOOL_SCHEMA":
+            if not any(k in p["patch"] for k in ("schema_update", "schema", "tool_schema", "endpoint", "update")):
+                raise ValueError("UPDATE_TOOL_SCHEMA requires 'schema_update' (or equivalent) in patch")
+        else:
+            if not any(k in p["patch"] for k in ("predicate", "guard")):
+                raise ValueError("Patch must include either 'predicate' or 'guard'")
+
         print("  ✓ Schema OK")
 
     def _validate_typing_and_semantics(self, p, rp):
-        d = p["patch"].get("predicate") or p["patch"].get("guard", "")
-        if d and not any(pred in d for pred in self.KNOWN_PREDICATES):
+        act = p.get("action", "")
+        if act == "UPDATE_TOOL_SCHEMA":
+            d = (
+                p["patch"].get("schema_update")
+                or p["patch"].get("schema")
+                or p["patch"].get("tool_schema")
+                or p["patch"].get("endpoint")
+                or ""
+            )
+        else:
+            d = p["patch"].get("predicate") or p["patch"].get("guard", "")
+
+        if d and act != "UPDATE_TOOL_SCHEMA" and not any(pred in d for pred in self.KNOWN_PREDICATES):
             print(f"  ⚠️ Unknown predicate in '{d}'. This may cause issues.")
         print("  ✓ Type OK")
 
     def _normalize_patch(self, p):
         """Normalize patch to a standard internal format for downstream scoring/governance."""
+        act = p["action"]
+
+        if act == "UPDATE_TOOL_SCHEMA":
+            details = (
+                p["patch"].get("schema_update")
+                or p["patch"].get("schema")
+                or p["patch"].get("tool_schema")
+                or p["patch"].get("endpoint")
+                or ""
+            )
+        else:
+            details = p["patch"].get("predicate") or p["patch"].get("guard", "")
+
         norm = {
-            "action": p["action"],
+            "action": act,
             "operator": p["operator"],
-            "details": p["patch"].get("predicate") or p["patch"].get("guard", ""),
+            "details": details,
             "justification": p["patch"].get("justification", "Generated by FDKA")
         }
         content_str = f"{norm['operator']}:{norm['action']}:{norm['details']}"
         norm["content_hash"] = hashlib.sha256(content_str.encode()).hexdigest()[:12]
 
-        # preserve optional usage payload for external logging/CSV
         if isinstance(p, dict) and "usage" in p:
             norm["usage"] = p["usage"]
 
-        # preserve prompt/response hashes (privacy-safe provenance)
         if isinstance(p, dict) and "llm_trace" in p and isinstance(p["llm_trace"], dict):
             norm["llm_trace"] = p["llm_trace"]
 
