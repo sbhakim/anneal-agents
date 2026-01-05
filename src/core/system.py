@@ -27,7 +27,7 @@ MINIMUM REPRODUCIBILITY BUNDLE (2026-01):
   and output paths for auditability and exact reruns.
 """
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List, Set
 import uuid
 import json
 from copy import deepcopy
@@ -122,7 +122,10 @@ class SelfEvolveSystem:
         self._last_committed_patch_id: Optional[str] = None
 
         # In-memory record of committed patches for downstream analysis
-        self._committed_patches: list[Dict[str, Any]] = []
+        self._committed_patches: List[Dict[str, Any]] = []
+
+        # Operators committed but not yet validated by a real post-patch success
+        self._pending_patch_success_ops: Set[str] = set()
 
         self.reflection = Reflection(
             config['metacognition'],
@@ -277,6 +280,13 @@ class SelfEvolveSystem:
             sig.append((name, items))
         return tuple(sig)
 
+    def _find_instability_hint(self, trace: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Return instability hint payload when executor flags repeated recoveries."""
+        for entry in reversed(trace or []):
+            if isinstance(entry, dict) and entry.get("event_type") == "instability_hint" and entry.get("suggest_fdka") is True:
+                return entry
+        return None
+
     # ---------------------------------------------------------------------
     # Task runner
     # ---------------------------------------------------------------------
@@ -284,8 +294,8 @@ class SelfEvolveSystem:
     def run_task(self, task_id: int, instruction: str):
         print(f"\n{'=' * 70}\nTask {task_id + 1}: {instruction}\n{'=' * 70}")
 
-        aggregated_trace: list = []
-        pending_patched_operators: set[str] = set()
+        aggregated_trace: List[Dict[str, Any]] = []
+        pending_patched_operators: Set[str] = set()
 
         self.state.update_from_instruction(instruction)
         self._reset_world_for_task()
@@ -359,10 +369,31 @@ class SelfEvolveSystem:
                     metadata={'instruction': instruction, 'task_id': task_id}
                 )
 
-                if pending_patched_operators:
-                    for op_name in sorted(pending_patched_operators):
+                # Mark operators patched only after observing success post-commit
+                pending = set(pending_patched_operators) | set(self._pending_patch_success_ops)
+                if pending:
+                    for op_name in sorted(pending):
                         self.scenario.mark_operator_patched(op_name)
                     pending_patched_operators.clear()
+                    self._pending_patch_success_ops.clear()
+
+                # Optional: trigger FDKA even on success when executor flags repeated recoveries
+                # NOTE: do not wrap config in bool(); we need the mapping for .get(...)
+                if (self.config.get("fdka") or {}).get("enable_on_instability", True):
+                    hint = self._find_instability_hint(task_trace_for_metrics)
+                    if hint:
+                        print("🧠 Instability hint detected (recoveries repeated). Escalating to FDKA (soft) ...")
+                        patch_applied, committed_patch = self._handle_failure(
+                            task_trace_for_metrics,
+                            task_id,
+                            instruction,
+                            record_failure_trace=False  # do not label success-run trace as terminal failure
+                        )
+                        if patch_applied and committed_patch:
+                            op = committed_patch.get("operator")
+                            if op:
+                                # validate on next real success (do not mark patched now)
+                                self._pending_patch_success_ops.add(op)
 
                 if task_id > 0 and task_id % 5 == 0:
                     print(f"  🔍 Checking adaptation progress at task {task_id}...")
@@ -451,7 +482,13 @@ class SelfEvolveSystem:
     # FDKA handling
     # ---------------------------------------------------------------------
 
-    def _handle_failure(self, trace: list, task_id: int, instruction: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    def _handle_failure(
+        self,
+        trace: list,
+        task_id: int,
+        instruction: str,
+        record_failure_trace: bool = True
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         if not self.fdka_enabled:
             print("  DEBUG_FDKA: disabled by config. Skipping self-edit.")
             return False, None
@@ -459,16 +496,18 @@ class SelfEvolveSystem:
         patch_applied = False
         patch_dict: Optional[Dict[str, Any]] = None
 
-        failure_info = self._extract_failure_info(trace)
-        if failure_info:
-            metadata = {
-                'instruction': instruction,
-                'task_id': task_id,
-                'operator': failure_info.get('operator'),
-                'error_type': failure_info.get('error'),
-            }
-            self.experience_pool.add_trace(trace, False, metadata=metadata)
-            print(f"  📝 Added failure trace to experience pool (operator={metadata['operator']})")
+        # Only persist as a failure example when the task truly failed (avoid poisoning with recovered runs)
+        if record_failure_trace:
+            failure_info = self._extract_failure_info(trace)
+            if failure_info:
+                metadata = {
+                    'instruction': instruction,
+                    'task_id': task_id,
+                    'operator': failure_info.get('operator'),
+                    'error_type': failure_info.get('error'),
+                }
+                self.experience_pool.add_trace(trace, False, metadata=metadata)
+                print(f"  📝 Added failure trace to experience pool (operator={metadata['operator']})")
 
         proposed_patch = self.fdka.propose_edit(trace, self.rule_pool) or {}
 
@@ -595,9 +634,7 @@ class SelfEvolveSystem:
             print(f" FDKA: ❌ Guardrails blocked patch: {guard_result.get('reason')}")
 
         # Provenance: record the decision consistently (applied vs skipped vs rejected).
-        decision = "applied" if patch_applied else ("rejected" if not canary_result.get("passed") and guard_result.get("decision") == "allow" else "rejected")
-        if guard_result.get("decision") != "allow":
-            decision = "rejected"
+        decision = "applied" if patch_applied else "rejected"
         if canary_result.get("passed") and (not patch_applied) and proposed_patch.get("reason") in ("duplicate_cached", "no_change_already_present"):
             decision = "skipped"
 
@@ -653,6 +690,7 @@ class SelfEvolveSystem:
                         "utility": scores.get("utility"),
                         "risk": scores.get("risk"),
                         "aggregate": scores.get("aggregate"),
+                        "z3": scores.get("z3"),  # keep for audit joins
                     }
                 })
             except Exception:

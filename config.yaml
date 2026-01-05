@@ -21,6 +21,10 @@ executor:
   max_retries: 2
   timeout_seconds: 30
   enable_verification: true
+  # Minimal: make repeated recoveries observable and eligible for FDKA trigger.
+  enable_repair: true
+  repair_hops: 2
+  recovered_failure_alert_threshold: 2
 
 metacognition:
   tau_u: 0.25          # uncertainty threshold for S1/S2 arbitration
@@ -115,6 +119,10 @@ governance:
   gates:
     tau_impact: 0.6
     tau_conf: 0.5
+    # Minimal: promote solver UNSAT to a hard veto when scorer provides verdict.
+    use_z3: true
+    z3_min_coverage: 0.2  # require non-trivial extraction before hard veto
+    z3_unknown_policy: "allow"  # UNKNOWN never vetoes; canary remains empirical gate
 
   canary:
     # Canary uses either retrieved examples and/or a deterministic suite (when wired).

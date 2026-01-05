@@ -26,6 +26,11 @@ MINIMUM TOOL-DRIFT ACCEPTANCE (2026-01):
 MINIMUM DEFENSIBILITY UPDATE (2026-01):
 - Emit a structured Z3 verdict payload in returned scores under key "z3".
   Guard/provenance can reuse this (no duplicate parsing in guard).
+
+MINIMUM RELIABILITY UPDATE (2026-01):
+- Treat "no parsable atoms" as NOT_RUN (not UNKNOWN) to avoid implying solver uncertainty.
+- Slightly broaden literal extraction to handle bare atoms without parentheses while
+  avoiding double-counting atoms inside Not(...).
 """
 from typing import Dict, Any, List, Tuple
 import math
@@ -384,23 +389,37 @@ class Scorer:
         return score
 
     def _extract_smt_literals(self, details: str) -> List[Tuple[str, bool]]:
+        """
+        Extract a small set of boolean literals from patch details.
+        Minimal broadening:
+        - allow bare atoms ("ValidPayment") as well as atom(...)
+        - avoid counting atoms occurring inside Not(...) as positive literals
+        """
         if not details:
             return []
 
-        lits: List[Tuple[str, bool]] = []
         txt = str(details)
+        lits: List[Tuple[str, bool]] = []
 
+        # 1) Negative literals: Not(Atom ... ) or Not( Atom )
         for atom in self._smt_atoms.keys():
-            neg_pat = rf"Not\(\s*{re.escape(atom)}\s*\("
+            neg_pat = rf"Not\(\s*{re.escape(atom)}\b"
             if re.search(neg_pat, txt):
                 lits.append((atom, False))
 
+        # 2) Positive literals: Atom(...) or bare Atom (but not inside Not(...))
         for atom in self._smt_atoms.keys():
-            pos_pat = rf"{re.escape(atom)}\s*\("
-            if re.search(pos_pat, txt):
+            pos_pat = rf"\b{re.escape(atom)}\b"
+            for m in re.finditer(pos_pat, txt):
+                start = m.start()
+                # Look back a small window; if it ends with 'Not(' after stripping spaces, skip.
+                prefix = txt[max(0, start - 10):start]
+                if prefix.replace(" ", "").replace("\t", "").endswith("Not("):
+                    continue
                 lits.append((atom, True))
 
-        out = []
+        # Unique in stable order
+        out: List[Tuple[str, bool]] = []
         seen = set()
         for a, pol in lits:
             key = (a, pol)
@@ -419,10 +438,11 @@ class Scorer:
         if not lits:
             print("        ℹ️ Z3: No parsable SMT atoms in patch; using heuristic fallback")
             score = self._symbolic_consistency_check(patch)
+            # IMPORTANT: "no atoms" is NOT solver uncertainty; mark as NOT_RUN for audit.
             return score, {
-                "verdict": "UNKNOWN",
-                "parse_coverage": coverage,
-                "atoms": atoms_in_patch,
+                "verdict": "NOT_RUN",
+                "parse_coverage": 0.0,
+                "atoms": [],
                 "solver": "z3",
                 "note": "no_atoms_fallback",
             }
@@ -543,11 +563,15 @@ class Scorer:
             return score
 
     def _extract_failure_info(self, trace: List) -> Dict[str, Any]:
+        # Traces in this repo are not uniform: accept error_type when error is absent.
         for entry in reversed(trace or []):
-            if isinstance(entry, dict) and 'error' in entry:
+            if not isinstance(entry, dict):
+                continue
+            if 'error' in entry or 'error_type' in entry:
+                err = entry.get('error', entry.get('error_type'))
                 return {
                     'operator': entry.get('operator'),
-                    'error': entry.get('error'),
+                    'error': err,
                     'message': entry.get('message'),
                     'policy_ref': entry.get('policy_ref'),
                 }

@@ -15,29 +15,6 @@ MINIMUM RELIABILITY FIX (2026-01):
 - Call failure injector with (task_id, op_name, params, state) when supported,
   while remaining backward compatible with older injectors.
 
-MINIMUM RETRY-SEMANTICS FIX (2026-01):
-- If a ToolError timeout is injected, attempt a single recovery retry ONLY when
-  the operator contains a learned timeout-retry effect (e.g., ApiTimeoutRetry).
-  This prevents "retry" hooks from firing after a clean success and makes the
-  recovery behavior observable under fault injection.
-
-MINIMUM METRICS COMPATIBILITY FIX (2026-01):
-- Ensure every failure path emits a trace entry with {error|error_type, operator}.
-  This keeps event-based metrics reliable even when tasks ultimately succeed.
-
-MINIMUM UPDATE (2026-01):
-- Mirror failure class into BOTH `error` and `error_type` in emitted trace events.
-  Traces in this repo are not fully uniform; metrics now supports either key,
-  but emitting both removes schema ambiguity for Table 3 and RFR/TTA.
-
-MINIMUM VERIFY→REPAIR LOOP (2026-01):
-- On Verify-Before-Act failure, attempt up to h=2 small, template repairs and re-verify.
-- Keeps repair scope local (params/state normalization) to avoid surprising semantics.
-
-MINIMUM TOOL-SCHEMA PATCH EXECUTION (2026-01):
-- If an UPDATE_TOOL_SCHEMA patch was committed (stored in op.metadata['schema_update']),
-  reflect it into runtime state/params so environment + tool dispatch can observe it.
-
 MINIMUM TRACE SEMANTICS FIX (2026-01):
 - Add `event_type` for trace entries and avoid emitting `error`/`error_type` for
   non-failure annotations (e.g., pre-verify constraint injections that are later repaired).
@@ -47,9 +24,14 @@ MINIMUM OBSERVED-FAILURE SEMANTICS (2026-01):
 - Emit a `verify_failed` event (with error/error_type) ONLY when verification actually fails.
 - Mark `step_success` as recovered when a verify failure was repaired, so metrics can count
   constraint recoveries without introducing phantom failures.
+
+MINIMUM DEFENSIBILITY UPDATE (2026-01):
+- Emit a recovery summary + optional instability hint (no error/error_type) when a task succeeds
+  but required repeated recoveries. This supports analysis and can drive later escalation.
 """
 from typing import List, Dict, Any, Tuple, Optional
 import time
+from collections import defaultdict
 from ..core.state import SymbolicState
 from ..knowledge.rule_pool import RulePool
 from ..metacognition.signals import SignalGenerator
@@ -380,6 +362,9 @@ class Executor:
         print("EXECUTOR: Starting plan execution...")
         trace: List[Dict[str, Any]] = []
 
+        # Track recoveries for analysis (does not affect success/failure semantics).
+        recovered_counts: Dict[str, int] = defaultdict(int)
+
         self._apply_world_defaults(state)
 
         u = self.signal_gen.compute_uncertainty(plan)
@@ -412,7 +397,7 @@ class Executor:
         max_repairs = int(self.config.get("repair_hops", 2))
         enable_repair = bool(self.config.get("enable_repair", True))
 
-        for step in plan:
+        for step_idx, step in enumerate(plan):
             op = step["operator"]
             params = step.get("params", {}) or {}
             print(f"EXECUTOR: Executing step -> {op.name}")
@@ -421,7 +406,12 @@ class Executor:
             self._sync_payment_from_params(params, state)
             self._apply_tool_schema_update_hint(op, params, state)
 
-            trace.append({"event_type": "step_start", "step": op.name, "state_before": state.to_dict()})
+            trace.append({
+                "event_type": "step_start",
+                "step": op.name,
+                "step_idx": step_idx,
+                "state_before": state.to_dict()
+            })
 
             injected_error_info: Optional[Dict[str, Any]] = None
             if self._injector_should_fail(task_id, op.name, params, state):
@@ -443,6 +433,7 @@ class Executor:
                         "injected": True,
                         "phase": "pre-verify",
                         "operator": op.name,
+                        "step_idx": step_idx,
                         "fault_class": err_cls,
                         "message": injected_error_info.get("message"),
                         "policy_ref": injected_error_info.get("policy_ref"),
@@ -465,6 +456,7 @@ class Executor:
                     "error": "PreconditionUnmet",
                     "error_type": "PreconditionUnmet",
                     "operator": op.name,
+                    "step_idx": step_idx,
                     "violated": violated
                 }
                 if injected_error_info and injected_error_info.get("error") != "ToolError":
@@ -484,6 +476,7 @@ class Executor:
                         "repair": repair_name,
                         "attempt": attempt,
                         "operator": op.name,
+                        "step_idx": step_idx,
                         "violated": v
                     })
                     try:
@@ -507,6 +500,7 @@ class Executor:
                     "error": "PreconditionUnmet",
                     "error_type": "PreconditionUnmet",
                     "operator": op.name,
+                    "step_idx": step_idx,
                     "violated": violated
                 }
                 if injected_error_info and injected_error_info.get("error") != "ToolError":
@@ -517,16 +511,38 @@ class Executor:
 
             if injected_error_info and injected_error_info.get("error") == "ToolError":
                 print(f"EXECUTOR: ❌ Injected Failure -> {injected_error_info.get('message', 'tool error')}")
-                trace.append({"event_type": "fault_injected", "injected": True, "phase": "post-verify", **injected_error_info})
+                trace.append({
+                    "event_type": "fault_injected",
+                    "injected": True,
+                    "phase": "post-verify",
+                    "step_idx": step_idx,
+                    **injected_error_info
+                })
 
                 if self._is_timeout_tool_error(injected_error_info) and self._operator_has_timeout_retry(op):
-                    trace.append({"event_type": "recovery_retry", "recovery": "ApiTimeoutRetry", "attempt": 1, "operator": op.name})
+                    trace.append({
+                        "event_type": "recovery_retry",
+                        "recovery": "ApiTimeoutRetry",
+                        "attempt": 1,
+                        "operator": op.name,
+                        "step_idx": step_idx
+                    })
                     print("EXECUTOR: 🔁 Detected timeout + retry-capable operator. Attempting one recovery retry...")
                     time.sleep(0.05)
 
                     try:
                         state = self._apply_effects(op, state, params, recovery=True)
-                        trace.append({"event_type": "step_success", "step": op.name, "state_after": state.to_dict(), "recovered": True})
+                        # NOTE: recovered marker without error/error_type avoids phantom failure events.
+                        trace.append({
+                            "event_type": "step_success",
+                            "step": op.name,
+                            "step_idx": step_idx,
+                            "state_after": state.to_dict(),
+                            "recovered": True,
+                            "recovered_from": "ToolError",
+                            "recovery": "ApiTimeoutRetry"
+                        })
+                        recovered_counts[f"{op.name}:ToolError"] += 1
                         print(f"EXECUTOR: ✅ Recovery retry succeeded for {op.name}.")
                         continue
                     except Exception as e:
@@ -535,6 +551,7 @@ class Executor:
                             "error": "ToolError",
                             "error_type": "ToolError",
                             "operator": op.name,
+                            "step_idx": step_idx,
                             "message": "Recovery retry failed",
                             "exception": str(e)[:120]
                         })
@@ -546,6 +563,7 @@ class Executor:
                     "error": "ToolError",
                     "error_type": "ToolError",
                     "operator": op.name,
+                    "step_idx": step_idx,
                     "message": injected_error_info.get("message", "Injected tool error"),
                     "policy_ref": injected_error_info.get("policy_ref"),
                 })
@@ -559,19 +577,41 @@ class Executor:
                     "error": "ToolError",
                     "error_type": "ToolError",
                     "operator": op.name,
+                    "step_idx": step_idx,
                     "message": "Exception during effect application",
                     "exception": str(e)[:120],
                 })
                 print(f"EXECUTOR: ❌ Exception during {op.name} effects.")
                 return trace, False, "ToolError"
 
-            success_event = {"event_type": "step_success", "step": op.name, "state_after": state.to_dict()}
+            success_event = {"event_type": "step_success", "step": op.name, "step_idx": step_idx, "state_after": state.to_dict()}
             if had_verify_failure:
                 success_event["recovered"] = True
                 success_event["recovered_from"] = "PreconditionUnmet"
                 success_event["violated_initial"] = verify_failed_violated
+                recovered_counts[f"{op.name}:PreconditionUnmet"] += 1
             trace.append(success_event)
             print(f"EXECUTOR: ✅ Step {op.name} successful.")
+
+        # Audit-only: summarize recoveries (does not change success semantics).
+        if recovered_counts and bool(self.config.get("emit_recovery_summary", True)):
+            trace.append({
+                "event_type": "recovery_summary",
+                "task_id": task_id,
+                "recovered_counts": dict(recovered_counts)
+            })
+
+            # Optional analysis hook: repeated recoveries indicate instability (useful for later escalation).
+            thr = int(self.config.get("recovered_failure_alert_threshold", 2))
+            hot = sorted([k for k, c in recovered_counts.items() if c >= thr])
+            if hot:
+                trace.append({
+                    "event_type": "instability_hint",
+                    "task_id": task_id,
+                    "threshold": thr,
+                    "hot_failure_keys": hot,
+                    "suggest_fdka": True
+                })
 
         print("EXECUTOR: ✅ Plan execution complete.")
         return trace, True, None
