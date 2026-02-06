@@ -510,7 +510,8 @@ class AblationStudy:
                 writer = csv.writer(f)
                 writer.writerow([
                     "Configuration", "Difficulty", "Success_Rate_Mean", "Success_Rate_Std",
-                    "RFR_Mean", "RFR_Std", "TTA_Mean", "TTA_Std",
+                    "RFR_Mean", "RFR_Std", "RFR_Observed_Mean", "RFR_Observed_Std",
+                    "RFR_Terminal_Mean", "RFR_Terminal_Std", "TTA_Mean", "TTA_Std",
                     "Patches_Accepted", "Rollbacks", "Component_Removed"
                 ])
                 for ablation_name, results in all_results.items():
@@ -521,6 +522,22 @@ class AblationStudy:
                         sr_std = self._safe_std([r['metrics']['success_rate'] for r in valid_runs])
                         rfr_mean = self._safe_mean([r['metrics']['repeat_failure_rate'] for r in valid_runs])
                         rfr_std = self._safe_std([r['metrics']['repeat_failure_rate'] for r in valid_runs])
+                        rfr_obs_mean = self._safe_mean([
+                            r['metrics'].get('observed_rfr', r['metrics'].get('repeat_failure_rate', 0.0))
+                            for r in valid_runs
+                        ])
+                        rfr_obs_std = self._safe_std([
+                            r['metrics'].get('observed_rfr', r['metrics'].get('repeat_failure_rate', 0.0))
+                            for r in valid_runs
+                        ])
+                        rfr_term_mean = self._safe_mean([
+                            r['metrics'].get('terminal_rfr', 0.0)
+                            for r in valid_runs
+                        ])
+                        rfr_term_std = self._safe_std([
+                            r['metrics'].get('terminal_rfr', 0.0)
+                            for r in valid_runs
+                        ])
                         tta_mean = self._compute_mean_tta(valid_runs)
                         tta_std = self._compute_std_tta(valid_runs)
                         patches = self._safe_mean([r['metrics'].get('patches_accepted', 0) for r in valid_runs])
@@ -528,7 +545,8 @@ class AblationStudy:
                         component = ablation_name.replace("No-", "").replace("SelfEvolve-Full", "None")
                         writer.writerow([
                             ablation_name, difficulty, f"{sr_mean:.3f}", f"{sr_std:.3f}", f"{rfr_mean:.3f}",
-                            f"{rfr_std:.3f}", f"{tta_mean:.1f}" if tta_mean != float('inf') else "∞",
+                            f"{rfr_std:.3f}", f"{rfr_obs_mean:.3f}", f"{rfr_obs_std:.3f}",
+                            f"{rfr_term_mean:.3f}", f"{rfr_term_std:.3f}", f"{tta_mean:.1f}" if tta_mean != float('inf') else "∞",
                             f"{tta_std:.1f}" if tta_std != float('inf') else "∞", f"{patches:.1f}",
                             f"{rollbacks:.1f}", component
                         ])

@@ -4,6 +4,14 @@ __pycache__/
 # Exclude specific file extensions
 *.txt
 *.sh
+*.bak
+*.backup
+*~
+
+# Backup variants created during experiments/config tuning
+*_backup
+*_backup.*
+*_phase1_backup
 
 # Virtual environments
 venv/
@@ -27,3 +35,5 @@ experiments/
 
 # specific .py files
 test_canary.py
+
+experiments/run_one_llm.py

@@ -146,6 +146,14 @@ class MetricsCollector:
             "canary_fails": 0
         }
 
+        # Governance audit counters (reason codes + modes + pipeline rejects)
+        self.guard_reason_code_counts: Dict[str, int] = defaultdict(int)
+        self.value_veto_reason_counts: Dict[str, int] = defaultdict(int)
+        self.causal_escalation_reason_counts: Dict[str, int] = defaultdict(int)
+        self.canary_mode_counts: Dict[str, int] = defaultdict(int)
+        self.canary_fail_reason_counts: Dict[str, int] = defaultdict(int)
+        self.pipeline_rejection_counts: Dict[str, int] = defaultdict(int)
+
         # Efficiency tracking for Table 5
         self.efficiency = {
             'total_llm_calls': 0,
@@ -368,23 +376,58 @@ class MetricsCollector:
 
     # ============= GOVERNANCE & EFFICIENCY TRACKING =============
 
-    def record_value_check(self, vetoed: bool = False, reason: str = "") -> None:
+    def record_pipeline_rejection(self, reason_code: str) -> None:
+        """Record a pre-guard pipeline rejection (e.g., no patch, below threshold)."""
+        rc = self._coerce_reason_code(reason_code, "", "PIPELINE:UNKNOWN")
+        self.pipeline_rejection_counts[rc] += 1
+
+    def record_value_check(
+        self,
+        vetoed: bool = False,
+        reason: str = "",
+        reason_code: str = "",
+        count_check: bool = True
+    ) -> None:
         """Record a value guard check."""
-        self.governance_stats["value_checks"] += 1
+        if count_check:
+            self.governance_stats["value_checks"] += 1
+
+        rc_default = "VALUE:VETO" if vetoed else "VALUE:ALLOW"
+        rc = self._coerce_reason_code(reason_code, reason, rc_default)
+
+        if count_check:
+            self.guard_reason_code_counts[rc] += 1
+
         if vetoed:
             self.governance_stats["value_vetoes"] += 1
             if reason:
                 self.governance_stats["value_veto_reasons"].append(reason)
+            self.value_veto_reason_counts[rc] += 1
 
-    def record_causal_check(self, escalated: bool = False, reason: str = "") -> None:
+    def record_causal_check(
+        self,
+        escalated: bool = False,
+        reason: str = "",
+        reason_code: str = "",
+        count_check: bool = True
+    ) -> None:
         """Record a causal guard check."""
-        self.governance_stats["causal_checks"] += 1
+        if count_check:
+            self.governance_stats["causal_checks"] += 1
+
+        rc_default = "CAUSAL:REQUEST_HUMAN" if escalated else "CAUSAL:ALLOW"
+        rc = self._coerce_reason_code(reason_code, reason, rc_default)
+
+        if count_check:
+            self.guard_reason_code_counts[rc] += 1
+
         if escalated:
             self.governance_stats["causal_escalations"] += 1
             if reason:
                 self.governance_stats["causal_escalation_reasons"].append(reason)
+            self.causal_escalation_reason_counts[rc] += 1
 
-    def record_canary_test(self, passed: bool) -> None:
+    def record_canary_test(self, passed: bool, mode: str = "", reason: str = "") -> None:
         """
         Record a canary test result.
 
@@ -396,6 +439,11 @@ class MetricsCollector:
             self.governance_stats["canary_passes"] += 1
         else:
             self.governance_stats["canary_fails"] += 1
+            rc = self._coerce_reason_code(reason, "", "CANARY:FAIL")
+            self.canary_fail_reason_counts[rc] += 1
+
+        mode_key = str(mode).strip() if mode else "unknown"
+        self.canary_mode_counts[mode_key] += 1
 
     def record_llm_call(self, tokens: int, latency_sec: float, model: str = 'mistral') -> None:
         """
@@ -459,6 +507,12 @@ class MetricsCollector:
         stats["patch_decisions"] = dict(self.patch_decision_counts)
         stats["patch_reject_reasons"] = dict(self.patch_reject_reasons)
         stats["z3_verdict_counts"] = dict(self.z3_verdict_counts)
+        stats["guard_reason_code_counts"] = dict(self.guard_reason_code_counts)
+        stats["value_veto_reason_counts"] = dict(self.value_veto_reason_counts)
+        stats["causal_escalation_reason_counts"] = dict(self.causal_escalation_reason_counts)
+        stats["canary_mode_counts"] = dict(self.canary_mode_counts)
+        stats["canary_fail_reason_counts"] = dict(self.canary_fail_reason_counts)
+        stats["pipeline_rejection_counts"] = dict(self.pipeline_rejection_counts)
 
         return stats
 
@@ -480,6 +534,7 @@ class MetricsCollector:
             "canary_fails": s["canary_fails"],
             "canary_pass_rate": s["canary_pass_rate"],
             "canary_fail_rate": s["canary_fail_rate"],
+            "pipeline_rejections": sum((s.get("pipeline_rejection_counts") or {}).values()),
             # Audit: formal gate signal presence
             "z3_sat": int(z3c.get("SAT", 0)),
             "z3_unsat": int(z3c.get("UNSAT", 0)),
@@ -839,6 +894,7 @@ class MetricsCollector:
 
         self.export_failure_analysis_csv(output_dir / "table3_per_failure.csv")
         self.export_governance_csv(output_dir / "table4_governance.csv")
+        self.export_governance_detail_csv(output_dir / "table4_governance_detail.csv")
         self.export_efficiency_csv(output_dir / "table5_efficiency.csv")
 
     def export_failure_analysis_csv(self, filepath: Path) -> None:
@@ -917,6 +973,33 @@ class MetricsCollector:
         df = pd.DataFrame(rows)
         df.to_csv(filepath, index=False)
         print(f"   ✅ Table 4: {filepath.name}")
+
+    def export_governance_detail_csv(self, filepath: Path) -> None:
+        """Export detailed governance audit counters (reason codes, modes, pipeline rejects)."""
+        stats = self.get_governance_stats()
+
+        rows = []
+
+        for key, label in (
+            ("guard_reason_code_counts", "guard_reason_code"),
+            ("value_veto_reason_counts", "value_veto_reason"),
+            ("causal_escalation_reason_counts", "causal_escalation_reason"),
+            ("canary_mode_counts", "canary_mode"),
+            ("canary_fail_reason_counts", "canary_fail_reason"),
+            ("pipeline_rejection_counts", "pipeline_rejection"),
+            ("z3_verdict_counts", "z3_verdict"),
+        ):
+            counts = stats.get(key, {}) or {}
+            for k, v in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+                rows.append({"Category": label, "Key": k, "Count": v})
+
+        if not rows:
+            pd.DataFrame(columns=["Category", "Key", "Count"]).to_csv(filepath, index=False)
+            print(f"   ⚠️ Table 4 detail: No governance audit data")
+            return
+
+        pd.DataFrame(rows).to_csv(filepath, index=False)
+        print(f"   ✅ Table 4 detail: {filepath.name}")
 
     def export_efficiency_csv(self, filepath: Path) -> None:
         """Export efficiency data to CSV (Table 5)."""
@@ -1063,6 +1146,18 @@ class MetricsCollector:
                 keys.append(f"{op}:{self._norm_error(err)}")
 
         return keys
+
+    def _coerce_reason_code(self, reason_code: str, reason: str, default: str) -> str:
+        """
+        Normalize reason codes for audit counters.
+        Prefer explicit reason_code, then fallback to reason, then default.
+        """
+        rc = str(reason_code or "").strip()
+        if not rc:
+            rc = str(reason or "").strip()
+        if not rc:
+            rc = str(default or "UNKNOWN").strip()
+        return rc
 
     def _norm_operator(self, op: Any) -> str:
         if op is None:

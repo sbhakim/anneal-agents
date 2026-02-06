@@ -65,6 +65,26 @@ class FullEvaluationRunner:
         self.baseline_runner = BaselineComparison()
         self.ablation_runner = AblationStudy()
 
+        # ------------------------------------------------------------------
+        # Per-orchestration isolation
+        # ------------------------------------------------------------------
+        # BaselineComparison and AblationStudy default to shared global folders under
+        # experiments/results/*. That makes repeated runs overwrite/mix artifacts and
+        # (for baselines) may also write logs/provenance to shared paths.
+        # We re-root both experiments under this orchestration run directory so
+        # every run is self-contained and auditable.
+
+        self.baseline_dir = self.run_dir / "baseline_comparison"
+        self.ablation_dir = self.run_dir / "ablations"
+        self.baseline_dir.mkdir(parents=True, exist_ok=True)
+        self.ablation_dir.mkdir(parents=True, exist_ok=True)
+
+        # Re-root experiment-level result aggregation outputs (JSON/CSV).
+        self.baseline_runner.results_dir = self.baseline_dir
+        self.baseline_runner.results_dir.mkdir(parents=True, exist_ok=True)
+        self.ablation_runner.results_dir = self.ablation_dir
+        self.ablation_runner.results_dir.mkdir(parents=True, exist_ok=True)
+
         if self.quick_mode:
             print("⚡ QUICK MODE: Modifying experiment settings for a fast run.")
             # Baselines
@@ -88,6 +108,8 @@ class FullEvaluationRunner:
         print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Results Directory: {self.results_root}")
         print(f"Orchestration Run Dir: {self.run_dir}")
+        print(f"Baseline Artifacts Dir: {self.baseline_dir}")
+        print(f"Ablation Artifacts Dir: {self.ablation_dir}")
         print("=" * 70)
         print()
 
@@ -99,6 +121,86 @@ class FullEvaluationRunner:
         except Exception:
             return None
         return None
+
+    def _baseline_run_output_dir(self, system_name: str, seed: int) -> Path:
+        """Per-run output dir for baseline runs (prevents overwrite across seeds/systems)."""
+        safe_name = system_name.replace(" ", "_").replace("/", "_")
+        return self.baseline_dir / "runs" / safe_name / f"seed{seed}"
+
+    def _prepare_baseline_base_config_for_run(self, run_dir: Path) -> None:
+        """
+        Mutate BaselineComparison.base_config so each run writes logs/metrics/provenance
+        into the given run_dir. BaselineComparison.run_single_experiment() deep-copies
+        base_config, so this is safe per run.
+        """
+        cfg = self.baseline_runner.base_config
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "plots").mkdir(parents=True, exist_ok=True)
+
+        cfg.setdefault("output", {})
+        cfg["output"]["results_dir"] = str(run_dir)
+        cfg["output"]["plots_dir"] = str(run_dir / "plots")
+
+        cfg.setdefault("logging", {})
+        cfg["logging"]["log_file"] = str(run_dir / "selfevolve.log")
+
+        gov = cfg.setdefault("governance", {})
+        prov = gov.setdefault("provenance", {})
+        if prov.get("enable", True):
+            prov["log_path"] = str(run_dir / "provenance.jsonl")
+
+    def _run_baseline_comparison_isolated(self) -> dict:
+        """
+        Run the baseline matrix like BaselineComparison.run_all_experiments(), but with
+        per-run config isolation so metrics/logs/provenance never overwrite each other.
+        """
+        configs = self.baseline_runner.get_system_configs()
+        all_results = {}
+
+        total_runs = len(configs) * len(self.baseline_runner.seeds)
+        current_run = 0
+
+        print(f"\nStarting {total_runs} experiment runs (isolated)...")
+        print(f"Systems: {list(configs.keys())}")
+        print(f"Seeds: {self.baseline_runner.seeds}\n")
+
+        for system_name, config in configs.items():
+            system_results = []
+            for seed in self.baseline_runner.seeds:
+                current_run += 1
+                print(f"\n[{current_run}/{total_runs}] {system_name} × seed={seed}")
+
+                run_dir = self._baseline_run_output_dir(system_name, seed)
+                self._prepare_baseline_base_config_for_run(run_dir)
+
+                result = self.baseline_runner.run_single_experiment(system_name, config, seed)
+                system_results.append(result)
+
+                # Save individual result immediately (checkpoint) under the isolated baseline_dir.
+                self.baseline_runner._save_single_result(result, system_name, seed)
+
+                # Per-run manifest for auditability/debugging
+                manifest = {
+                    "run_id": self.run_id,
+                    "experiment": "baseline_comparison",
+                    "system": system_name,
+                    "seed": seed,
+                    "run_dir": str(run_dir),
+                    "timestamp": time.time(),
+                    "config_overrides": config.get("config_overrides", {}),
+                }
+                try:
+                    (run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
+                except Exception:
+                    # Non-fatal: the experiment result JSON is the ground truth
+                    pass
+
+            all_results[system_name] = system_results
+            self.baseline_runner._save_system_results(system_name, system_results)
+
+        self.baseline_runner._save_all_results(all_results)
+        return all_results
 
     def _write_experiment_summary(self) -> None:
         """
@@ -112,19 +214,63 @@ class FullEvaluationRunner:
         demo_manifest = self._read_json_if_exists(demo_dir / "run_manifest.json")
         demo_config = self._read_json_if_exists(demo_dir / "config_resolved.json")
 
+        baseline_complete = self._read_json_if_exists(self.baseline_dir / "complete_results.json")
+        ablation_complete = self._read_json_if_exists(self.ablation_dir / "complete_ablations.json")
+
+        baseline_meta = None
+        if isinstance(baseline_complete, dict):
+            try:
+                results = baseline_complete.get("results", {}) or {}
+                baseline_meta = {
+                    "num_tasks": baseline_complete.get("num_tasks"),
+                    "seeds": baseline_complete.get("seeds"),
+                    "systems": baseline_complete.get("systems") or list(results.keys()),
+                    "total_runs": sum(len(v or []) for v in results.values()),
+                }
+            except Exception:
+                baseline_meta = None
+
+        ablation_meta = None
+        if isinstance(ablation_complete, dict):
+            try:
+                results = ablation_complete.get("results", {}) or {}
+                ablation_meta = {
+                    "seeds": ablation_complete.get("seeds"),
+                    "difficulties": ablation_complete.get("difficulties"),
+                    "task_counts": ablation_complete.get("task_counts"),
+                    "configurations": list(results.keys()),
+                    "total_runs": sum(len(v or []) for v in results.values()),
+                }
+            except Exception:
+                ablation_meta = None
+
         summary = {
             "run_id": self.run_id,
             "timestamp": now,
             "quick_mode": bool(self.quick_mode),
             "total_duration_seconds": total_duration,
-            "experiments": self.experiment_results,
+            "experiment_results": self.experiment_results,
             "paths": {
-                "orchestration_run_dir": str(self.run_dir),
-                "experiments_results_root": str(self.results_root),
-                "data_results_root": str(self.data_root),
-                "demo_results_dir": str(demo_dir),
-                "demo_run_manifest": str(demo_dir / "run_manifest.json"),
-                "demo_config_resolved": str(demo_dir / "config_resolved.json"),
+                "results_root": str(self.results_root),
+                "data_root": str(self.data_root),
+                "run_dir": str(self.run_dir),
+            },
+            "artifacts": {
+                "baseline_comparison": {
+                    "dir": str(self.baseline_dir),
+                    "complete_results": str(self.baseline_dir / "complete_results.json"),
+                    "table_csv": str(self.baseline_dir / "table1_data.csv"),
+                    "snapshot": baseline_meta,
+                },
+                "ablation_study": {
+                    "dir": str(self.ablation_dir),
+                    "complete_results": str(self.ablation_dir / "complete_ablations.json"),
+                    "table_csv": str(self.ablation_dir / "table2_data.csv"),
+                    "snapshot": ablation_meta,
+                },
+                "demo_run": {
+                    "dir": str(self.run_dir / "demo"),
+                },
             },
             # Inline the demo run manifest snapshots when available (small + helpful for debugging).
             "demo_snapshot": {
@@ -143,6 +289,11 @@ class FullEvaluationRunner:
     def run_baseline_comparison(self) -> bool:
         """
         Run baseline comparison experiment (Table 1).
+
+        NOTE:
+        BaselineComparison.run_all_experiments() does not assign a unique output/log/provenance
+        directory per seed/system, so multiple runs can overwrite each other and leak artifacts.
+        We run an isolated loop here that re-roots base_config output paths per run.
         """
         print("\n" + "=" * 70)
         print("📊 EXPERIMENT 1: BASELINE COMPARISON (Table 1)")
@@ -152,7 +303,8 @@ class FullEvaluationRunner:
 
         try:
             print("🚀 Starting baseline comparison...")
-            all_results = self.baseline_runner.run_all_experiments()
+            print(f"   Writing aggregated artifacts to: {self.baseline_dir}")
+            all_results = self._run_baseline_comparison_isolated()
             self.baseline_runner.print_summary(all_results)
             self.experiment_results["baseline_comparison"]["status"] = "success"
             return True
@@ -177,6 +329,7 @@ class FullEvaluationRunner:
 
         try:
             print("🚀 Starting ablation study...")
+            print(f"   Writing aggregated artifacts to: {self.ablation_dir}")
             all_results = self.ablation_runner.run_all_ablations()
             self.ablation_runner.print_summary(all_results)
             self.experiment_results["ablation_study"]["status"] = "success"
@@ -291,21 +444,22 @@ class FullEvaluationRunner:
                     print("\n⏭️ Skipping ablation study (--skip-ablations)")
                     self.experiment_results["ablation_study"]["status"] = "skipped"
 
-                # Demo is optional in non-demo-only mode → mark as skipped for clean exit code
-                if self.experiment_results["demo_run"]["status"] == "not_run":
-                    self.experiment_results["demo_run"]["status"] = "skipped"
+                # Demo is optional in full pipeline; keep skipped unless user requests demo-only.
+                print("\n⏭️ Skipping demo run (default). Use --demo-only to run demo.")
+                self.experiment_results["demo_run"]["status"] = "skipped"
 
+            # Print + persist orchestration summary
             self.generate_summary()
             self._write_experiment_summary()
 
-            # Success if every tracked experiment either succeeded or was intentionally skipped
-            if all(r["status"] in ["success", "skipped"] for r in self.experiment_results.values()):
-                return 0  # Success
-            else:
-                return 1  # Failure
+            # Exit code: 0 only if all run (non-skipped) experiments succeeded
+            for k, v in self.experiment_results.items():
+                if v["status"] in ("failed", "interrupted"):
+                    return 1
+            return 0
 
         except KeyboardInterrupt:
-            print("\n\n⚠️ Evaluation interrupted by user")
+            print("\n\n⚠️  Orchestration interrupted by user")
             self.experiment_results["baseline_comparison"]["status"] = (
                 self.experiment_results["baseline_comparison"]["status"] if self.experiment_results["baseline_comparison"]["status"] != "running" else "interrupted"
             )
@@ -329,12 +483,11 @@ class FullEvaluationRunner:
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Run full evaluation for ACM manuscript",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument('--quick', action='store_true', help='Run with reduced settings for fast testing')
+    """
+    CLI entry.
+    """
+    parser = argparse.ArgumentParser(description="Run full SelfEvolve manuscript evaluation")
+    parser.add_argument('--quick', action='store_true', help='Run a reduced quick test')
     parser.add_argument('--skip-baseline', action='store_true', help='Skip baseline comparison experiment (Table 1)')
     parser.add_argument('--skip-ablations', action='store_true', help='Skip ablation study experiment (Table 2)')
     parser.add_argument('--demo-only', action='store_true', help='Only run a single demo for qualitative analysis')

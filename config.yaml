@@ -36,12 +36,12 @@ fdka:
   enabled: true
 
   scoring_weights:
-    plausibility: 0.35
-    consistency: 0.35
-    utility: 0.20
-    risk: 0.10
+    plausibility: 0.40  # increased from 0.35 (trust LLM proposals more)
+    consistency: 0.25   # reduced from 0.35 (reduce SAT solver veto power)
+    utility: 0.25       # increased from 0.20 (weight empirical success higher)
+    risk: 0.10          # unchanged (maintain safety threshold)
 
-  threshold: 0.48       # patch accept if aggregate >= threshold
+  threshold: 0.22       # patch accept if aggregate >= threshold (lowered from 0.25 - Option C Phase 1)
 
   propose_edit:
     # Provider options: "transformers", "openai", "deepseek", "mock"
@@ -144,8 +144,8 @@ scenario:
 
   # Task generation + failure injection controls (keep stable for comparisons)
   num_tasks: 25
-  failure_rate: 0.4
-  min_failures_in_prefix: 5
+  failure_rate: 0.6    # increased to 0.6 (60% failures) for maximum FDKA triggering
+  min_failures_in_prefix: 7  # increased to 7 for earlier adaptation window
   prefix_len: 10
   failure_injector_seed: 42
   task_generation_seed: 7

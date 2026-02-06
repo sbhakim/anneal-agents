@@ -560,8 +560,7 @@ class SelfEvolveSystem:
 
         if not isinstance(proposed_patch, dict) or not proposed_patch:
             print(" FDKA: ❌ No patch proposed (provider error or empty response).")
-            self.metrics.record_value_check(vetoed=False, reason="no_patch_proposed")
-            self.metrics.record_causal_check(escalated=False, reason="no_patch_proposed")
+            self.metrics.record_pipeline_rejection("PIPELINE:NO_PATCH_PROPOSED")
             # Audit: proposed_patch is empty; still record a consistent event
             self.provenance.log_patch_event(
                 {"id": f"patch-{uuid.uuid4().hex[:8]}", "decision": "rejected", "reason": "no_patch_proposed"},
@@ -578,8 +577,7 @@ class SelfEvolveSystem:
 
         if proposed_patch.get("action") == "REJECTED":
             print(f" FDKA: ❌ Patch rejected during validation: {proposed_patch.get('details')}")
-            self.metrics.record_value_check(vetoed=False, reason="validation_reject")
-            self.metrics.record_causal_check(escalated=False, reason="validation_reject")
+            self.metrics.record_pipeline_rejection("PIPELINE:VALIDATION_REJECT")
             self.provenance.log_patch_event(
                 proposed_patch,
                 decision="rejected",
@@ -594,9 +592,10 @@ class SelfEvolveSystem:
 
         if agg_score < self.fdka_threshold:
             print(f" FDKA: ❌ Score {agg_score:.2f} below threshold {self.fdka_threshold:.2f}. Patch rejected.")
+            proposed_patch["reason_code"] = "PIPELINE:BELOW_THRESHOLD"
+            proposed_patch["decision"] = "rejected"
             self.metrics.record_patch(proposed_patch, success=False, committed=False, scores=scores)
-            self.metrics.record_value_check(vetoed=False, reason="below_threshold")
-            self.metrics.record_causal_check(escalated=False, reason="below_threshold")
+            self.metrics.record_pipeline_rejection("PIPELINE:BELOW_THRESHOLD")
             self.provenance.log_patch_event(
                 proposed_patch,
                 decision="rejected",
@@ -615,13 +614,18 @@ class SelfEvolveSystem:
             }
         )
 
+        value_reason_code = (guard_result.get("value", {}) or {}).get("reason_code", "")
+        causal_reason_code = (guard_result.get("causal", {}) or {}).get("reason_code", "")
+
         self.metrics.record_value_check(
             vetoed=(guard_result['decision'] == 'veto'),
-            reason=guard_result.get('reason', '')
+            reason=guard_result.get('reason', ''),
+            reason_code=value_reason_code or guard_result.get("reason_code", ""),
         )
         self.metrics.record_causal_check(
             escalated=(guard_result['decision'] == 'request_human'),
-            reason=guard_result.get('reason', '')
+            reason=guard_result.get('reason', ''),
+            reason_code=causal_reason_code or guard_result.get("reason_code", ""),
         )
 
         canary_result: Dict[str, Any] = {}
@@ -646,7 +650,11 @@ class SelfEvolveSystem:
             }
 
             canary_result = self.canary_runner.run(proposed_patch, canary_context) or {}
-            self.metrics.record_canary_test(passed=bool(canary_result.get("passed")))
+            self.metrics.record_canary_test(
+                passed=bool(canary_result.get("passed")),
+                mode=canary_result.get("mode"),
+                reason=canary_result.get("reason", "")
+            )
 
             if canary_result.get("passed"):
                 print(" FDKA: Canary test passed. Committing patch permanently.")
@@ -696,8 +704,22 @@ class SelfEvolveSystem:
             else:
                 reason = proposed_patch.get("reason", "committed" if patch_applied else "skipped")
 
+        # Stable reason_code for audit counters (independent of human-readable reason).
+        reason_code = guard_result.get("reason_code", "") or ""
+        if guard_result.get("decision") == "veto":
+            reason_code = value_reason_code or reason_code or "VALUE:VETO"
+        elif guard_result.get("decision") == "request_human":
+            reason_code = causal_reason_code or reason_code or "CAUSAL:REQUEST_HUMAN"
+        elif guard_result.get("decision") == "allow":
+            if not canary_result.get("passed"):
+                reason_code = "CANARY:FAIL"
+            else:
+                reason_code = proposed_patch.get("reason") or ("PATCH:SKIPPED" if decision == "skipped" else "PATCH:APPLIED")
+
         # Write one audit record with joinable ids and key governance outcomes.
         try:
+            proposed_patch["decision"] = decision
+            proposed_patch["reason_code"] = reason_code
             self.provenance.log_patch_event(
                 proposed_patch,
                 decision=decision,
@@ -842,6 +864,12 @@ class SelfEvolveSystem:
             print(f"   ✅ Table 4: {results_dir / 'table4_governance.csv'}")
         except Exception as e:
             print(f"   ⚠️ Table 4 export failed: {e}")
+
+        try:
+            self.metrics.export_governance_detail_csv(results_dir / "table4_governance_detail.csv")
+            print(f"   ✅ Table 4 detail: {results_dir / 'table4_governance_detail.csv'}")
+        except Exception as e:
+            print(f"   ⚠️ Table 4 detail export failed: {e}")
 
         # Reproducibility bundle (manifest + config snapshot)
         self._write_run_bundle(results_dir)

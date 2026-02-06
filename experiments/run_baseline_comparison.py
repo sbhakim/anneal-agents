@@ -341,7 +341,7 @@ class BaselineComparison:
 
             # Header
             writer.writerow([
-                "System", "Seed", "Success_Rate", "RFR", "CSR",
+                "System", "Seed", "Success_Rate", "RFR", "RFR_Observed", "RFR_Terminal", "CSR",
                 "TTA_Mean", "RF", "RP", "HI", "Patches_Proposed", "Patches_Accepted"
             ])
 
@@ -360,6 +360,8 @@ class BaselineComparison:
                         result["seed"],
                         f"{metrics.get('success_rate', 0.0):.3f}",
                         f"{metrics.get('repeat_failure_rate', 0.0):.3f}",
+                        f"{metrics.get('observed_rfr', metrics.get('repeat_failure_rate', 0.0)):.3f}",
+                        f"{metrics.get('terminal_rfr', 0.0):.3f}",
                         f"{metrics.get('constraint_satisfaction_rate', 0.0):.3f}",
                         f"{tta_mean:.1f}" if tta_mean != float('inf') else "∞",
                         f"{metrics.get('rollback_frequency', 0.0):.1f}",

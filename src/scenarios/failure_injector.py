@@ -154,32 +154,46 @@ class FailureInjector:
 
         r = self._rng.random()
 
-        # Keep overall distribution close to prior behavior; reserve a small tail for schema drift on flights.
-        if r < 0.45:
+        # UPDATED: Added OOD entity grounding and explicit schema drift (Option C - Phase 1)
+        # Distribution: blackout(35%), invalid(15%), timeout(13%), OOD(15%), schema(12%), rate_limit(10%)
+        if r < 0.35:
             error_type = "PreconditionUnmet"
             message = "Corporate cards blocked for reservations during blackout dates"
             policy_ref = "H-23"
             category = "blackout_blocked_card"
-        elif allow_invalid_payment and r < 0.70:
+        elif allow_invalid_payment and r < 0.50:
             error_type = "PreconditionUnmet"
             message = "Payment method is invalid or expired"
             policy_ref = "PAY-401"
             category = "invalid_payment"
-        elif r < 0.88:
+        elif r < 0.63:
             error_type = "ToolError"
             message = "Booking API timeout"
             policy_ref = "API-503"
             category = "api_timeout"
-        else:
+        elif r < 0.78:
+            # NEW: OOD Entity Grounding - Unknown payment method
+            error_type = "OODEntityGrounding"
+            message = "Payment method not recognized in knowledge base"
+            policy_ref = "PAY-404"
+            category = "ood_entity_grounding"
+        elif r < 0.90:
+            # NEW: Explicit Tool Schema Drift (more frequent than before)
             error_type = "ToolError"
             if "Flight" in op_name:
                 message = "Endpoint /v1/book deprecated; use /v2/book"
                 policy_ref = "API-V2"
                 category = "api_schema_change"
             else:
-                message = "Booking API timeout"
-                policy_ref = "API-503"
-                category = "api_timeout"
+                message = "Hotel API schema updated: 'location' field now required"
+                policy_ref = "API-V2-HOTEL"
+                category = "api_schema_change"
+        else:
+            # NEW: Rate Limit (distinct from timeout)
+            error_type = "ToolError"
+            message = "Rate limit exceeded: 429 Too Many Requests"
+            policy_ref = "API-429"
+            category = "rate_limit_exceeded"
 
         # Apply policy flip: expand blackout dates post-flip (only meaningful for blackout failures).
         if task_id >= self.policy_flip_at and category == "blackout_blocked_card":
@@ -222,7 +236,7 @@ class FailureInjector:
 
         # One-shot ToolError failures so a retry/repair loop can succeed within the task.
         cat = str(info.get("category", "") or "")
-        if cat in ("api_timeout", "api_schema_change"):
+        if cat in ("api_timeout", "api_schema_change", "rate_limit_exceeded", "ood_entity_grounding"):
             one_shot_key = (task_id, op_name, cat)
             if one_shot_key in self._one_shot_fired:
                 return False
@@ -237,7 +251,7 @@ class FailureInjector:
             if p_key != "CorporateCard:CC-5512":
                 return False
 
-        if cat in ("api_timeout", "api_schema_change"):
+        if cat in ("api_timeout", "api_schema_change", "rate_limit_exceeded", "ood_entity_grounding"):
             self._one_shot_fired.add((task_id, op_name, cat))
 
         return True

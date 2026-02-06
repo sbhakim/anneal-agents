@@ -76,9 +76,12 @@ class StaticNSAgent:
         self.signal_gen = SignalGenerator(config['metacognition'], self.rule_pool)
         self.arbitrator = Arbitrator(config['metacognition'])
 
-        # Executor (KEEP verify-before-act)
+        # Executor (KEEP verify-before-act, but DISABLE recovery for fair baseline)
+        executor_config = config['executor'].copy()
+        executor_config['enable_repair'] = False  # Disable auto-repair for baseline
+        executor_config['max_retries'] = 0         # Disable retries for baseline
         self.executor = Executor(
-            config['executor'],
+            executor_config,
             failure_injector=self.scenario.failure_injector,
             rule_pool=self.rule_pool,
             signal_gen=self.signal_gen,
