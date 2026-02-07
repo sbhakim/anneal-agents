@@ -1,15 +1,13 @@
-# SELFEVOLVE Configuration
-# Domain: travel_planning
-# Notes:
-# - This file is intentionally verbose for reproducibility and reviewer traceability.
-# - Seeds and failure injection controls are pinned to make before/after comparisons fair.
-# - LLM provider blocks include local/offline Transformer options plus remote providers for parity.
-# - Some HF runtime keys may be ignored depending on the repo runner implementation.
+# SELFEVOLVE Comprehensive Configuration
+# ============================================================================
+# This is the unified configuration file with all LLM providers and scenarios
+# Uncomment the provider/scenario you want to use
+# ============================================================================
 
 system:
   name: "SELFEVOLVE"
   version: "1.0.0"
-  domain: "travel_planning"
+  domain: "travel_planning"  # or "ecommerce" for cross-domain validation
 
 planner:
   type: "HTN"
@@ -44,57 +42,84 @@ fdka:
   threshold: 0.18       # patch accept if aggregate >= threshold (lowered for defensibility - allows more patches)
 
   propose_edit:
-    # Provider options: "transformers", "openai", "deepseek", "mock"
+    # =========================================================================
+    # LLM PROVIDER CONFIGURATION
+    # =========================================================================
+    # Choose ONE provider by uncommenting the corresponding section below
+    # Available providers: "transformers", "openai", "deepseek", "mock"
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # OPTION 1: Local Transformers (Offline/HuggingFace models)
+    # -------------------------------------------------------------------------
+    # Best for: Privacy, no API costs, offline operation
+    # Requirements: GPU with 16GB+ VRAM, transformers, torch installed
+    # Cost: Free (hardware only)
+    # -------------------------------------------------------------------------
     # llm_provider: "transformers"
+    # model: "google/gemma-2-9b-it"              # Recommended: Best quality/speed
+    # # Alternatives:
+    # # model: "mistralai/Mistral-7B-Instruct-v0.2"  # Good quality, faster
+    # # model: "meta-llama/Llama-3.1-8B-Instruct"    # High quality, slower
+    # # model: "Qwen/Qwen2.5-7B-Instruct"            # Good multilingual
+    # # model: "microsoft/Phi-3-mini-128k-instruct"  # Lightweight, long context
+    # # model: "tiiuae/falcon-7b-instruct"           # Alternative option
+    # # Local path (pre-downloaded weights):
+    # # model: "/models/gemma-2-9b-it"
 
     # -------------------------------------------------------------------------
-    # Local / offline Transformers (HF) model selection
+    # OPTION 2: OpenAI API (GPT-4o-mini)
     # -------------------------------------------------------------------------
-    # Active local model (Gemma-2 Instruct).
-    # model: "google/gemma-2-9b-it"
+    # Best for: Highest patch quality, production deployments
+    # Requirements: OPENAI_API_KEY environment variable
+    # Cost: ~$0.02 per run (10× more than DeepSeek)
+    # Quality: Best error mapping, recommended after FDKA infrastructure fixes
+    # -------------------------------------------------------------------------
+    llm_provider: "openai"
+    model: "gpt-4o-mini"
+    # # Alternative OpenAI models:
+    # # model: "gpt-4o"           # Highest quality, most expensive
+    # # model: "gpt-3.5-turbo"    # Cheaper, lower quality
 
-    # Other local/offline options (uncomment + set model accordingly):
-    # model: "mistralai/Mistral-7B-Instruct-v0.2"
-    # model: "meta-llama/Llama-3.1-8B-Instruct"
-    # model: "Qwen/Qwen2.5-7B-Instruct"
-    # model: "microsoft/Phi-3-mini-128k-instruct"
-    # model: "tiiuae/falcon-7b-instruct"
-    #
-    # Local path example (pre-downloaded weights):
-    # model: "/models/gemma-2-9b-it"
+    # -------------------------------------------------------------------------
+    # OPTION 3: DeepSeek API (Cost-effective)
+    # -------------------------------------------------------------------------
+    # Best for: Cost-effective operation, similar quality to OpenAI with fixes
+    # Requirements: DEEPSEEK_API_KEY environment variable
+    # Cost: ~$0.002 per run (cheapest)
+    # Quality: NOW sufficient with fixed error capture (same as GPT-4o-mini)
+    # -------------------------------------------------------------------------
+    # llm_provider: "deepseek"
+    # model: "deepseek-chat"
+    # base_url: "https://api.deepseek.com"
 
-    # Generation knobs (repo: max_tokens maps to max_new_tokens)
+    # -------------------------------------------------------------------------
+    # OPTION 4: Mock Provider (Testing only)
+    # -------------------------------------------------------------------------
+    # Best for: Testing, CI/CD, debugging without API calls
+    # Requirements: None
+    # Cost: Free
+    # Quality: Template-based, deterministic (no real LLM)
+    # -------------------------------------------------------------------------
+    # llm_provider: "mock"
+    # model: "mock"
+
+    # -------------------------------------------------------------------------
+    # Common Generation Parameters (all providers)
+    # -------------------------------------------------------------------------
     temperature: 0.3
     max_tokens: 512
     timeout_sec: 60.0
     max_retries: 2
 
-    # HF runtime hints (runner may ignore some keys)
+    # -------------------------------------------------------------------------
+    # Transformers-specific parameters (ignored by other providers)
+    # -------------------------------------------------------------------------
     device_map: "auto"          # "auto" / "cuda:0" / "cpu"
     dtype: "auto"               # "auto" / "fp16" / "bf16" / "fp32"
     use_flash_attention: false
     trust_remote_code: false
     max_input_tokens: 6000
-
-    # -------------------------------------------------------------------------
-    # Remote providers (kept for parity / ablations; switch llm_provider to use)
-    # -------------------------------------------------------------------------
-    # OpenAI:
-    # llm_provider: "openai"
-    # model: "gpt-4o-mini"
-
-    # DeepSeek (OpenAI-compatible endpoint):
-    # llm_provider: "deepseek"
-    # model: "deepseek-chat"
-    # base_url: "https://api.deepseek.com"
-
-    # Mock provider (for testing, no LLM needed):
-    llm_provider: "mock"
-    model: "mock"
-
-    # Mock (offline deterministic testing):
-    # llm_provider: "mock"
-    # model: "mock"
 
   consistency:
     # Enable minimal SMT check in src/fdka/scoring.py (requires `pip install z3-solver`).
@@ -142,10 +167,38 @@ knowledge:
   process_kg_path: "data/knowledge/process_kg.json"
   rule_pool_path: "data/knowledge/operators.json"
 
+# =============================================================================
+# SCENARIO CONFIGURATION
+# =============================================================================
+# Choose scenario by changing the "name" field
+# Available scenarios: "travel_planning", "ecommerce", "travel_stochastic"
+# =============================================================================
 scenario:
+  # -------------------------------------------------------------------------
+  # OPTION 1: Travel Planning (Original domain)
+  # -------------------------------------------------------------------------
   name: "travel_planning"
   difficulty: "hard"
 
+  # -------------------------------------------------------------------------
+  # OPTION 2: E-commerce (Cross-domain validation)
+  # -------------------------------------------------------------------------
+  # name: "ecommerce"
+  # difficulty: "normal"
+
+  # -------------------------------------------------------------------------
+  # OPTION 3: Stochastic Travel (Metacognition stress test)
+  # -------------------------------------------------------------------------
+  # name: "travel_stochastic"
+  # difficulty: "hard"
+  # transient_failure_rate: 0.15
+  # uncertainty_injection_rate: 0.20
+  # policy_shift_rate: 0.10
+  # resource_contention_rate: 0.05
+
+  # -------------------------------------------------------------------------
+  # Common Scenario Parameters
+  # -------------------------------------------------------------------------
   # Task generation + failure injection controls (keep stable for comparisons)
   num_tasks: 25
   failure_rate: 0.7    # increased to 0.7 (70% failures) for maximum FDKA triggering
@@ -174,3 +227,26 @@ output:
 logging:
   level: "INFO"
   log_file: "data/logs/selfevolve.log"
+
+# =============================================================================
+# QUICK START GUIDE
+# =============================================================================
+# 1. Choose your LLM provider (lines 47-110):
+#    - For best quality: OpenAI GPT-4o-mini (requires API key)
+#    - For cost-effective: DeepSeek (requires API key, ~100× cheaper)
+#    - For offline: Transformers with local models
+#    - For testing: Mock provider
+#
+# 2. Choose your scenario (lines 171-195):
+#    - travel_planning: Original domain
+#    - ecommerce: Cross-domain validation
+#    - travel_stochastic: Metacognition stress test
+#
+# 3. Set environment variables (if using remote providers):
+#    export OPENAI_API_KEY="sk-..."       # for OpenAI
+#    export DEEPSEEK_API_KEY="sk-..."    # for DeepSeek
+#
+# 4. Run evaluation:
+#    python main.py --config config.yaml --mode eval
+#
+# =============================================================================
