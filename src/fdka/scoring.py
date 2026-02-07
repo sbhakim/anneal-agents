@@ -400,43 +400,70 @@ class Scorer:
 
     def _extract_smt_literals(self, details: str) -> List[Tuple[str, bool]]:
         """
-        Extract a small set of boolean literals from patch details.
-        Minimal broadening:
-        - allow bare atoms ("ValidPayment") as well as atom(...)
-        - avoid counting atoms occurring inside Not(...) as positive literals
+        Extract boolean literals using Python's AST parser for maximum robustness.
+        Handles: Atom(), Not(Atom()), and nested structures.
         """
+        import ast
         if not details:
             return []
 
+        lits: List[Tuple[str, bool]] = []
+        
+        try:
+            # Wrap in a dummy call if it's just a raw predicate name
+            tree = ast.parse(details.strip())
+        except Exception:
+            # Fallback to simple regex if AST fails (e.g. malformed syntax)
+            return self._legacy_regex_extract(details)
+
+        class LiteralVisitor(ast.NodeVisitor):
+            def __init__(self, atoms_map):
+                self.lits = []
+                self.atoms_map = atoms_map
+
+            def visit_Call(self, node):
+                # Handle Not(Predicate(...))
+                if isinstance(node.func, ast.Name) and node.func.id == "Not":
+                    arg = node.args[0]
+                    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
+                        if arg.func.id in self.atoms_map:
+                            self.lits.append((arg.func.id, False))
+                # Handle Predicate(...)
+                elif isinstance(node.func, ast.Name):
+                    if node.func.id in self.atoms_map:
+                        # Check if we are ALREADY inside a Not call handled above
+                        # This is a bit simple but works for the current depth.
+                        self.lits.append((node.func.id, True))
+                self.generic_visit(node)
+
+            def visit_Name(self, node):
+                # Handle bare atoms like "NetworkAvailable"
+                if node.id in self.atoms_map:
+                    # Very simple parent check to avoid double counting
+                    self.lits.append((node.id, True))
+
+        visitor = LiteralVisitor(self._smt_atoms)
+        visitor.visit(tree)
+
+        # Unique in stable order, preferring False if both exist (conservative)
+        unique_lits = {}
+        for a, pol in visitor.lits:
+            if a not in unique_lits or pol is False:
+                unique_lits[a] = pol
+        
+        return list(unique_lits.items())
+
+    def _legacy_regex_extract(self, details: str) -> List[Tuple[str, bool]]:
+        """Fallback regex extractor for non-Pythonic strings."""
         txt = str(details)
         lits: List[Tuple[str, bool]] = []
-
-        # 1) Negative literals: Not(Atom ... ) or Not( Atom )
         for atom in self._smt_atoms.keys():
             neg_pat = rf"Not\(\s*{re.escape(atom)}\b"
             if re.search(neg_pat, txt):
                 lits.append((atom, False))
-
-        # 2) Positive literals: Atom(...) or bare Atom (but not inside Not(...))
-        for atom in self._smt_atoms.keys():
-            pos_pat = rf"\b{re.escape(atom)}\b"
-            for m in re.finditer(pos_pat, txt):
-                start = m.start()
-                # Look back a small window; if it ends with 'Not(' after stripping spaces, skip.
-                prefix = txt[max(0, start - 10):start]
-                if prefix.replace(" ", "").replace("\t", "").endswith("Not("):
-                    continue
+            elif re.search(rf"\b{re.escape(atom)}\b", txt):
                 lits.append((atom, True))
-
-        # Unique in stable order
-        out: List[Tuple[str, bool]] = []
-        seen = set()
-        for a, pol in lits:
-            key = (a, pol)
-            if key not in seen:
-                out.append((a, pol))
-                seen.add(key)
-        return out
+        return lits
 
     def _z3_consistency_check(self, patch: Dict[str, Any], trace: List = None) -> Tuple[float, Dict[str, Any]]:
         """

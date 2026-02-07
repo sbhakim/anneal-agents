@@ -607,6 +607,12 @@ FAILURE CONTEXT:
 - Error Type: {error_type}
 - Evidence: {error_evidence}
 
+DOMAIN AXIOMS (Must follow):
+- ExpiredPayment -> InvalidPayment
+- InvalidPayment -> Not(ValidPayment)
+- BlockedCard -> Not(ValidPayment)
+- Not(NetworkAvailable) -> ToolError
+
 RULES:
 - Keys required: "action", "operator", "patch".
 - "action" must be one of: {sorted(list(ALLOWED_ACTIONS))}
