@@ -32,6 +32,10 @@ experiments/data/
 experiments/experiments/
 experiments/
 
+# Ignore Results directory and all JSON result files
+Results/
+*.json
+
 
 # specific .py files
 test_canary.py
