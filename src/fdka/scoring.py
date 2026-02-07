@@ -282,7 +282,7 @@ class Scorer:
         print("  " + "-" * 66)
 
         plausibility = self._score_plausibility(patch, trace)
-        consistency = self._score_consistency(patch)
+        consistency = self._score_consistency(patch, trace)
         utility = self._score_utility(patch, trace)
         risk = self._score_risk(patch)
 
@@ -379,13 +379,13 @@ class Scorer:
     def _sigmoid(self, x: float) -> float:
         return 1.0 / (1.0 + math.exp(-x))
 
-    def _score_consistency(self, patch: Dict[str, Any]) -> float:
+    def _score_consistency(self, patch: Dict[str, Any], trace: List = None) -> float:
         print("  [2/4] Consistency (Eq. 10 - SAT/Symbolic Check):")
         print(f"        Solver: {'Z3 (SMT)' if self.use_z3 else 'Symbolic Heuristic'}")
 
         # Always populate self.last_z3_result for audit/joinability.
         if self.use_z3:
-            score, z3_payload = self._z3_consistency_check(patch)
+            score, z3_payload = self._z3_consistency_check(patch, trace)
         else:
             score = self._symbolic_consistency_check(patch)
             z3_payload = {"verdict": "NOT_RUN", "parse_coverage": 0.0, "atoms": [], "solver": "none"}
@@ -438,7 +438,11 @@ class Scorer:
                 seen.add(key)
         return out
 
-    def _z3_consistency_check(self, patch: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+    def _z3_consistency_check(self, patch: Dict[str, Any], trace: List = None) -> Tuple[float, Dict[str, Any]]:
+        """
+        Run SMT check. Includes both INTERNAL consistency (patch vs patch) and
+        CONTEXTUAL validity (patch vs world state from trace).
+        """
         details = str(patch.get('details', '') or '')
         lits = self._extract_smt_literals(details)
 
@@ -473,26 +477,50 @@ class Scorer:
         try:
             s = Solver()
 
-            vars_ = {a: Bool(self._smt_atoms[a]) for a in atoms_in_patch}
-
+            # 1. Patch Internal Logic
+            vars_ = {a: Bool(self._smt_atoms[a]) for a in self._smt_atoms}
             for a, pol in lits:
-                if a not in vars_:
-                    continue
-                s.add(vars_[a] if pol else Not(vars_[a]))
+                if a in vars_:
+                    s.add(vars_[a] if pol else Not(vars_[a]))
 
-            # Tiny axiom set (keep narrow; this is consistency-only).
+            # 2. Contextual Validity (State Injection)
+            # Find the state just before failure to check against current reality
+            state_facts = {}
+            if trace:
+                for entry in reversed(trace):
+                    if "state_before" in entry:
+                        sb = entry["state_before"]
+                        # Map Python state to Z3 Booleans
+                        if sb.get("payment_invalid") is True:
+                            state_facts["InvalidPayment"] = True
+                        if sb.get("payment_valid") is True:
+                            state_facts["ValidPayment"] = True
+                        if sb.get("network_available") is False:
+                            state_facts["NetworkAvailable"] = False
+                        break
+
+            # Add state facts to solver (soft grounding)
+            # If the patch contradicts the STATE, it is "Invalid" in this context.
+            for k, v in state_facts.items():
+                if k in vars_:
+                    print(f"        Z3: Adding state fact {k}={v}")
+                    s.add(vars_[k] if v else Not(vars_[k]))
+
+            # 3. Domain Axioms (The "Physics")
             if "ExpiredPayment" in vars_ and "InvalidPayment" in vars_:
                 s.add(Implies(vars_["ExpiredPayment"], vars_["InvalidPayment"]))
-
             if "InvalidPayment" in vars_ and "ValidPayment" in vars_:
                 s.add(Implies(vars_["InvalidPayment"], Not(vars_["ValidPayment"])))
+            if "BlockedCard" in vars_ and "ValidPayment" in vars_:
+                s.add(Implies(vars_["BlockedCard"], Not(vars_["ValidPayment"])))
 
+            # 4. Solve
             res = s.check()
             if res == sat:
                 print(f"        ✓ Z3: SAT over atoms={atoms_in_patch}")
                 return 1.0, {"verdict": "SAT", "parse_coverage": coverage, "atoms": atoms_in_patch, "solver": "z3"}
             if res == unsat:
-                print(f"        ✗ Z3: UNSAT (inconsistent literals/axioms) over atoms={atoms_in_patch}")
+                print(f"        ✗ Z3: UNSAT (inconsistent with logic or state) over atoms={atoms_in_patch}")
                 return 0.0, {"verdict": "UNSAT", "parse_coverage": coverage, "atoms": atoms_in_patch, "solver": "z3"}
 
             print("        ⚠️ Z3: UNKNOWN; using conservative mid-score")
