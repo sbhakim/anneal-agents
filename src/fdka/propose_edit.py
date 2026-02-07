@@ -101,6 +101,25 @@ def _build_tool_drift_patch(operator_name: str, evidence: str) -> Dict[str, Any]
     }
 
 
+def _is_non_patchable_refund_window(error_type: str, evidence: str, violated: str) -> bool:
+    if error_type != "PreconditionUnmet":
+        return False
+    text = f"{evidence or ''} {violated or ''}".lower()
+    window_markers = (
+        "withinrefundwindow",
+        "is_refund_within_window",
+        "returnwindowexceeded",
+        "refund window",
+        "return window",
+        "within refund window",
+    )
+    if any(m in text for m in window_markers):
+        return True
+    if ("refund" in text or "return" in text) and ("window" in text or "within" in text):
+        return True
+    return False
+
+
 # ---------------------------
 # Templates for mock fallback
 # ---------------------------
@@ -110,6 +129,27 @@ PATCH_TEMPLATES = {
         "patch": {
             "predicate": "Not(BlockedCard(payment, dates))",
             "justification": "API policy H-23 blocks corporate cards during blackout dates"
+        }
+    },
+    ("PreconditionUnmet", ("return window", "refund", "returnwindowexceeded", "withinrefundwindow", "is_refund_within_window")): {
+        "action": "ADD_PRECONDITION",
+        "patch": {
+            "predicate": "WithinRefundWindow(days_since_purchase)",
+            "justification": "Refunds must be within the allowed return window"
+        }
+    },
+    ("PreconditionUnmet", ("shipping", "apo", "fpo", "po_box", "restricted", "shippingallowed", "is_shipping_allowed")): {
+        "action": "ADD_PRECONDITION",
+        "patch": {
+            "predicate": "Not(RestrictedAddress(location))",
+            "justification": "Shipping is restricted for certain address types"
+        }
+    },
+    ("PreconditionUnmet", ("price changed", "price_changed", "pricechanged", "cart", "no_price_change")): {
+        "action": "ADD_PRECONDITION",
+        "patch": {
+            "predicate": "Not(PriceChanged(order))",
+            "justification": "Order price must match current catalog pricing"
         }
     },
     ("PreconditionUnmet", ("invalid", "payment", "unsupported", "expired", "declined")): {
@@ -146,7 +186,7 @@ PATCH_TEMPLATES = {
 # ---------------------------
 # Action normalization helpers
 # ---------------------------
-ALLOWED_ACTIONS = {"ADD_PRECONDITION", "REFINE_EFFECT", "UPDATE_TOOL_SCHEMA"}
+ALLOWED_ACTIONS = {"ADD_PRECONDITION", "REFINE_EFFECT", "UPDATE_TOOL_SCHEMA", "SKIP_CONSTRAINT"}
 ACTION_ALIASES = {
     "ADD_PRE CONDITION": "ADD_PRECONDITION",
     "ADD_PRE-CONDITION": "ADD_PRECONDITION",
@@ -366,7 +406,10 @@ class FDKAPipeline:
 
         # Deterministic router for common tool-drift (prevents "no provable improvement" dead-ends).
         evidence = (prompt.get("error", {}).get("evidence", "") or "")
+        violated = (prompt.get("error", {}).get("violated", "") or "")
         op_name = (prompt.get("operator", {}) or {}).get("name", fi.get("operator", "Unknown"))
+        if _is_non_patchable_refund_window(fi.get("error", ""), evidence, violated):
+            return {"action": "REJECTED", "details": "non_patchable_refund_window"}
         if fi.get("error") == "ToolError" and _is_tool_drift(evidence):
             return self._stage3_validate(_build_tool_drift_patch(op_name, evidence), rule_pool)
 
@@ -389,10 +432,12 @@ class FDKAPipeline:
         }
         minimal = self._extract_minimal_state(trace, sig)
         delta = self._compute_state_delta(fi)
+        violated = fi.get("violated") or fi.get("violated_predicate") or ""
+        ev = (fi.get("policy_ref", "") + " " + (fi.get("message", "") or "") + " " + str(violated)).strip()
         return {
             "operator": sig, "state_minimal": minimal,
             "error": {"type": fi.get("error"), "site": fi.get("operator"),
-                      "evidence": (fi.get("policy_ref", "") + (fi.get("message", "") or "")[:50])},
+                      "evidence": ev[:200], "violated": violated},
             "state_delta": delta
         }
 
@@ -464,9 +509,11 @@ class FDKAPipeline:
                 )
 
             if 'error' in result or not result.get('text'):
+                print(f"  ⚠️ OpenAI error or no text: error={result.get('error')}, text_len={len(result.get('text', ''))}")
                 continue
 
             raw_text = result['text']
+            print(f"  ✅ OpenAI returned {len(raw_text)} chars: {raw_text[:100]}...")
             response_hash = _hash_text(raw_text)
 
             parsed = self._extract_json_from_text(raw_text)
@@ -588,41 +635,98 @@ class FDKAPipeline:
     def _build_llm_prompt(self, sp: Dict) -> Dict:
         """
         Builds the prompt for the LLM, now explicitly asking for the 'operator' key.
+        Enhanced with constraint awareness and better examples to reduce canary failures.
         Also returns the serialized_prompt for mock fallback.
         """
         error_type = sp.get("error", {}).get("type", "Unknown")
         error_evidence = sp.get("error", {}).get("evidence", "")
         operator_name = sp.get("operator", {}).get("name", "Unknown")
 
+        # Extract full error trace for context
+        error_msg = sp.get("error", {}).get("message", "")
+        violated_pred = sp.get("error", {}).get("violated", "")
+        full_context = f"{error_evidence} {error_msg} {violated_pred}".strip()
+
         system_prompt = (
-            "You are an expert system that outputs exactly one valid JSON object for a symbolic patch.\n"
-            "Do not add explanations or markdown. Output ONLY the JSON object."
+            "You are an expert system that generates symbolic patches for operator failures.\n"
+            "Your patches will be tested via canary simulation before deployment.\n"
+            "Output EXACTLY ONE valid JSON object. No explanations, no markdown, no text outside the JSON."
         )
 
+        # Build constraint warning based on evidence
+        constraint_warning = ""
+        evidence_lower = full_context.lower()
+        if any(pattern in evidence_lower for pattern in [
+            'refund', 'return_window', 'purchased', 'days ago',
+            'apo', 'fpo', 'po_box', 'shipping_restriction',
+            'out of stock', 'inventory', 'insufficient',
+            'promo', 'expired', 'policy', 'violation'
+        ]):
+            constraint_warning = """
+⚠️ WARNING: Evidence suggests this may be a BUSINESS CONSTRAINT, not a patchable bug.
+Business constraints (refund windows, shipping restrictions, inventory limits, policy violations)
+should NOT be patched. If you detect a constraint, return:
+{{"action": "SKIP_CONSTRAINT", "operator": "{operator}", "patch": {{"reason": "business_constraint"}}}}
+"""
+
         user_prompt = f"""
-A failure occurred. Generate a JSON patch to fix it.
+A failure occurred. Generate a JSON patch to fix it, or identify if it's an unpatchable constraint.
 
 FAILURE CONTEXT:
 - Operator: {operator_name}
 - Error Type: {error_type}
-- Evidence: {error_evidence}
+- Full Evidence: {full_context[:500]}
+{constraint_warning}
 
-DOMAIN AXIOMS (Must follow):
+DOMAIN AXIOMS (Must preserve):
 - ExpiredPayment -> InvalidPayment
 - InvalidPayment -> Not(ValidPayment)
 - BlockedCard -> Not(ValidPayment)
 - Not(NetworkAvailable) -> ToolError
 
-RULES:
-- Keys required: "action", "operator", "patch".
+PATCH STRUCTURE:
+Required keys: "action", "operator", "patch"
 - "action" must be one of: {sorted(list(ALLOWED_ACTIONS))}
 - "operator" must equal "{operator_name}"
-- For invalid/expired payment: {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "ValidPayment(payment)"}}}}
-- For blocked card/blackout: {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "Not(BlockedCard(payment, dates))"}}}}
-- For network/timeout: {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())"}}}}
-- For deprecation/tool drift (e.g., /v1 → /v2): {{"action": "UPDATE_TOOL_SCHEMA", "operator": "{operator_name}", "patch": {{"schema_update": "Switch endpoint from /v1/book to /v2/book"}}}}
 
-Return only the JSON object, no prose."""
+COMMON PATTERNS (Choose the best match):
+
+1. INVALID/EXPIRED PAYMENT (PreconditionUnmet with payment error):
+   {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "ValidPayment(payment)"}}}}
+
+2. BLOCKED CARD/BLACKOUT DATE:
+   {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "Not(BlockedCard(payment, dates))"}}}}
+
+3. NETWORK/TIMEOUT/SERVICE UNAVAILABLE:
+   {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())"}}}}
+
+4. TOOL DRIFT/DEPRECATION (e.g., API version change /v1 → /v2):
+   {{"action": "UPDATE_TOOL_SCHEMA", "operator": "{operator_name}", "patch": {{"schema_update": "Switch endpoint to new version"}}}}
+
+5. MISSING REQUIRED FIELD:
+   {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "HasRequiredField(data, 'field_name')"}}}}
+
+CRITICAL RULES:
+- DO NOT create patches that change business logic (pricing, inventory, policies)
+- DO NOT add preconditions that will always fail
+- DO NOT modify operator effects unless you're fixing a bug
+- If evidence mentions constraints (refund policy, shipping restrictions), return SKIP_CONSTRAINT
+- Ensure your patch actually addresses the root cause in the evidence
+
+EXAMPLES OF GOOD PATCHES:
+✓ Adding ValidPayment check when payment is expired/invalid
+✓ Updating schema when API endpoint changed (tool drift)
+✓ Adding network availability guard for timeout errors
+
+EXAMPLES OF BAD PATCHES (Will fail canary):
+✗ Adding inventory checks (that's a business constraint, not a bug)
+✗ Changing refund window logic (immutable business policy)
+✗ Generic patches that don't address the specific error
+✗ Patches that make the operator too restrictive
+
+Analyze the failure evidence carefully and generate the MOST APPROPRIATE patch.
+Return ONLY the JSON object."""
+
         return {
             "system": system_prompt,
             "user": user_prompt,
@@ -632,7 +736,13 @@ Return only the JSON object, no prose."""
 
     def _mock_llm_generate(self, sp):
         error = sp.get("error", {}).get("type", "")
-        ev = (sp.get("error", {}).get("evidence", "") or "").lower()
+        violated = sp.get("error", {}).get("violated", "")
+        ev_parts = [
+            sp.get("error", {}).get("evidence", "") or "",
+            error or "",
+            violated or "",
+        ]
+        ev = " ".join(ev_parts).lower()
         operator_name = sp.get("operator", {}).get("name", "Unknown")
         prompt_hash = _hash_text(sp)
 
@@ -707,7 +817,11 @@ Return only the JSON object, no prose."""
         if not isinstance(p["patch"], dict):
             raise ValueError("Patch 'patch' must be a JSON object")
 
-        if p["action"] == "UPDATE_TOOL_SCHEMA":
+        if p["action"] == "SKIP_CONSTRAINT":
+            # SKIP_CONSTRAINT is a meta-action indicating LLM detected a business constraint
+            if "reason" not in p["patch"]:
+                raise ValueError("SKIP_CONSTRAINT requires 'reason' in patch")
+        elif p["action"] == "UPDATE_TOOL_SCHEMA":
             if not any(k in p["patch"] for k in ("schema_update", "schema", "tool_schema", "endpoint", "update")):
                 raise ValueError("UPDATE_TOOL_SCHEMA requires 'schema_update' (or equivalent) in patch")
         else:
@@ -736,6 +850,17 @@ Return only the JSON object, no prose."""
     def _normalize_patch(self, p):
         """Normalize patch to a standard internal format for downstream scoring/governance."""
         act = p["action"]
+
+        # Special handling for SKIP_CONSTRAINT (LLM detected business constraint)
+        if act == "SKIP_CONSTRAINT":
+            print(f"  🔍 LLM detected business constraint: {p['patch'].get('reason', 'unknown')}")
+            return {
+                "action": "SKIP_CONSTRAINT",
+                "operator": p["operator"],
+                "details": p["patch"].get("reason", "llm_detected_constraint"),
+                "justification": "LLM identified this as a business constraint, not a patchable bug",
+                "content_hash": "skip_constraint"
+            }
 
         if act == "UPDATE_TOOL_SCHEMA":
             details = (

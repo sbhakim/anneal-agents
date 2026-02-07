@@ -15,27 +15,78 @@ class ValueKG:
     def __init__(self, config: Dict[str, Any]):
         self.rules: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], bool]] = {}  # rule_id -> predicate fn
         self.preferences: Dict[str, float] = {}  # stakeholder_id -> preference_weight
+        self.domain: str = str(config.get('domain', 'travel'))
         self.blackout_dates: List[str] = config.get('blackout_dates', [])
         self.corporate_policy: str = config.get('corporate_card_policy', 'blocked_on_blackout_dates')
+        self.shipping_restrictions: List[str] = config.get('shipping_restrictions', [])
+        self.promo_policies: Dict[str, Any] = config.get('promo_policies', {})
+        self.return_window_days: int = int(config.get('return_window_days', 30))
+        self.expired_promos: List[str] = config.get('expired_promos', [])
         self._load_default_rules()
-        print(f"VALUE_KG: Initialized with {len(self.rules)} rules and blackout dates: {self.blackout_dates}")
+        print(
+            f"VALUE_KG: Initialized with {len(self.rules)} rules "
+            f"(domain={self.domain}) and blackout dates: {self.blackout_dates}"
+        )
 
     def _load_default_rules(self) -> None:
         """
         Loads default deontic rules for the travel domain (e.g., prohibitions on card use).
         """
-        # Rule: Prohibit corporate card during blackout dates
-        def prohibit_blackout_card(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
-            card_type = params.get("payment", state.get("payment_method", ""))
-            travel_dates = state.get("travel_dates", "")
-            is_corporate = "CorporateCard" in card_type
-            is_blackout = any(date in travel_dates for date in self.blackout_dates)
-            return not (is_corporate and self.corporate_policy == 'blocked_on_blackout_dates' and is_blackout)
+        if self.domain == 'travel':
+            # Rule: Prohibit corporate card during blackout dates
+            def prohibit_blackout_card(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
+                card_type = params.get("payment", state.get("payment_method", "")) or ""
+                travel_dates = state.get("travel_dates", "")
+                travel_dates = str(travel_dates or "")
+                is_corporate = "CorporateCard" in str(card_type)
+                is_blackout = any(date in travel_dates for date in (self.blackout_dates or []))
+                return not (is_corporate and self.corporate_policy == 'blocked_on_blackout_dates' and is_blackout)
 
-        self.rules['no_blackout_corporate'] = prohibit_blackout_card
+            self.rules['no_blackout_corporate'] = prohibit_blackout_card
 
-        # Example preference: Prefer personal cards for low-cost trips (mock weight)
-        self.preferences['user_preference'] = 0.8  # Weight for preferring personal cards
+            # Example preference: Prefer personal cards for low-cost trips (mock weight)
+            self.preferences['user_preference'] = 0.8  # Weight for preferring personal cards
+            return
+
+        if self.domain == 'ecommerce':
+            def prohibit_restricted_shipping(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
+                location = params.get("location", "")
+                if not location:
+                    return True
+                restricted = set(str(r).upper() for r in (self.shipping_restrictions or []))
+                return str(location).upper() not in restricted
+
+            def prohibit_promo_stack(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
+                if not params.get("stackable", False):
+                    return True
+                policies = self.promo_policies or {}
+                return bool(policies.get("stackable_promos", False))
+
+            def require_refund_window(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
+                days = params.get("days_since_purchase")
+                if days is None:
+                    return True
+                try:
+                    days = int(days)
+                except (TypeError, ValueError):
+                    return True
+                window = int(self.return_window_days)
+                return days <= window
+
+            def prohibit_expired_promo(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
+                promo = params.get("promo_code")
+                if not promo:
+                    return True
+                return str(promo) not in (self.expired_promos or [])
+
+            self.rules['no_restricted_shipping'] = prohibit_restricted_shipping
+            self.rules['no_promo_stack'] = prohibit_promo_stack
+            self.rules['refund_within_window'] = require_refund_window
+            self.rules['no_expired_promo'] = prohibit_expired_promo
+            return
+
+        # Unknown domain: no default rules
+        return
 
     def add_rule(self, rule_id: str, predicate: Callable[[Dict[str, Any], Dict[str, Any]], bool]) -> None:
         """

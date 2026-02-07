@@ -58,6 +58,38 @@ def is_card_valid(state: SymbolicState, params: Dict[str, Any]) -> bool:
     return True
 
 
+def has_required_field(state: SymbolicState, params: Dict[str, Any], field_name: str = None) -> bool:
+    """
+    Generic validator: checks if a required field exists and is non-empty in params.
+    Used by FDKA-generated patches like HasRequiredField(data, 'quantity').
+    """
+    # Extract field name from various formats
+    if field_name is None:
+        # Try to extract from predicate name if called as HasRequiredField_quantity
+        import inspect
+        frame = inspect.currentframe()
+        if frame and frame.f_back:
+            caller_locals = frame.f_back.f_locals
+            # Check if there's a field hint in the call context
+            field_name = caller_locals.get('_field_hint')
+
+    if not field_name:
+        # Default check: ensure params dict itself is not empty
+        return bool(params and len(params) > 0)
+
+    # Check if field exists and is non-empty
+    if field_name not in params:
+        return False
+
+    value = params.get(field_name)
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return False
+
+    return True
+
+
 def is_hotel_available(state: SymbolicState, params: Dict[str, Any]) -> bool:
     """Checks if the hotel status is 'available'."""
     return state.get("hotel_status") == "available"
@@ -81,6 +113,64 @@ def book_flight_effect(state: SymbolicState, params: Dict[str, Any]) -> Symbolic
     if state.get("flight_status") != "booked":
         state.set("flight_status", "booked")
         print("EFFECT: Flight booked.")
+    return state
+
+
+def place_order_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    inventory = dict(state.get("inventory", {}) or {})
+    product = params.get("product")
+    quantity = params.get("quantity", 1)
+    try:
+        qty = int(quantity)
+    except (TypeError, ValueError):
+        qty = 0
+    if product:
+        inventory[product] = max(0, int(inventory.get(product, 0)) - qty)
+        state.set("inventory", inventory)
+    state.set("last_order_product", product)
+    state.set("last_order_quantity", qty)
+    return state
+
+
+def apply_promo_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    promo = params.get("promo_code")
+    if promo:
+        applied = list(state.get("applied_promos", []) or [])
+        if promo not in applied:
+            applied.append(promo)
+            state.set("applied_promos", applied)
+    return state
+
+
+def calculate_shipping_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    weight = params.get("weight", 1)
+    try:
+        weight = float(weight)
+    except (TypeError, ValueError):
+        weight = 1.0
+    base = 5.0
+    cost = base + max(0.0, weight * 0.5)
+    state.set("shipping_cost", cost)
+    return state
+
+
+def process_refund_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    state.set("refund_processed", True)
+    state.set("last_refund_reason", params.get("reason"))
+    return state
+
+
+def update_inventory_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    inventory = dict(state.get("inventory", {}) or {})
+    product = params.get("product")
+    delta = params.get("delta", 0)
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        delta = 0
+    if product:
+        inventory[product] = max(0, int(inventory.get(product, 0)) + delta)
+        state.set("inventory", inventory)
     return state
 
 
@@ -143,6 +233,81 @@ def check_valid_payment(state: SymbolicState, params: Dict[str, Any]) -> bool:
 
 
 # ========================================================================
+# E-COMMERCE PREDICATE LIBRARY (Cross-domain baseline)
+# ========================================================================
+
+def is_inventory_sufficient(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    inventory = state.get("inventory", {}) or {}
+    product = params.get("product")
+    quantity = params.get("quantity", 1)
+    if not product:
+        return False
+    try:
+        needed = int(quantity)
+    except (TypeError, ValueError):
+        return False
+    available = int(inventory.get(product, 0))
+    return available >= needed
+
+
+def is_promo_active(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    promo = params.get("promo_code")
+    if not promo:
+        return False
+    active = set(state.get("active_promos", []) or [])
+    expired = set(state.get("expired_promos", []) or [])
+    return (promo in active) and (promo not in expired)
+
+
+def is_promo_stackable(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    if not params.get("stackable", False):
+        return True
+    policies = state.get("promo_policies", {}) or {}
+    return bool(policies.get("stackable_promos", False))
+
+
+def is_shipping_allowed(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    location = str(params.get("location", "") or "")
+    if not location:
+        return False
+    restrictions = [str(r).upper() for r in (state.get("shipping_restrictions", []) or [])]
+    return not any(r in location.upper() for r in restrictions)
+
+
+def check_not_restricted_address(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    return is_shipping_allowed(state, params)
+
+
+def is_refund_within_window(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    days = params.get("days_since_purchase")
+    if days is None:
+        return False
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return False
+    window = int(state.get("return_window_days", 30))
+    return days <= window
+
+
+def is_payment_method_valid(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    if state.get("payment_invalid") is True:
+        return False
+    method = params.get("payment_method") or state.get("payment_method")
+    if not method:
+        return False
+    return True
+
+
+def no_policy_violation(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    return not bool(state.get("policy_violation", False))
+
+
+def no_price_change(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    return not bool(state.get("price_changed", False))
+
+
+# ========================================================================
 # DYNAMIC PREDICATE & EFFECT FACTORIES (The Core of Symbolic Learning)
 # ========================================================================
 
@@ -153,6 +318,18 @@ class PredicateFactory:
     def create_precondition(details: str, operator_name: str) -> Optional[Callable]:
         details_clean = (details or "").strip()
         details_l = details_clean.lower()
+
+        if "withinrefundwindow" in details_l:
+            return is_refund_within_window
+
+        if "shippingallowed" in details_l:
+            return is_shipping_allowed
+
+        if "restrictedaddress" in details_l:
+            return check_not_restricted_address
+
+        if "pricechanged" in details_l:
+            return no_price_change
 
         if "not(blockedcard" in details_l:
             return check_not_blocked_card
@@ -192,6 +369,30 @@ class PredicateFactory:
                 return check_valid_payment
             if predicate_name == "BlockedCard":
                 return check_not_blocked_card
+
+            # Handle HasRequiredField(data, 'field_name') pattern
+            if predicate_name == "HasRequiredField":
+                # Extract field name from the pattern: HasRequiredField(data, 'quantity')
+                field_match = re.search(r"HasRequiredField\s*\([^,]+,\s*['\"]([^'\"]+)['\"]", details_clean)
+                if field_match:
+                    field_name = field_match.group(1)
+
+                    def check_field_exists(state: SymbolicState, params: Dict) -> bool:
+                        """Check if required field exists and is non-empty in params."""
+                        if field_name not in params:
+                            print(f"PRECONDITION CHECK: ❌ Missing required field '{field_name}'")
+                            return False
+
+                        value = params.get(field_name)
+                        if value is None or (isinstance(value, str) and value.strip() == ""):
+                            print(f"PRECONDITION CHECK: ❌ Empty required field '{field_name}'")
+                            return False
+
+                        print(f"PRECONDITION CHECK: ✅ Required field '{field_name}' present")
+                        return True
+
+                    check_field_exists.__name__ = f"check_hasrequiredfield_{field_name}"
+                    return check_field_exists
 
             def generic_check(state: SymbolicState, params: Dict) -> bool:
                 # Fail-closed: unknown predicates must not silently pass if the state doesn't define them.
@@ -336,6 +537,61 @@ class RulePool:
         self.operators[book_flight_op.name] = book_flight_op
         self._snapshot_operator(book_flight_op.name)
 
+        place_order_op = Operator(
+            "PlaceOrder",
+            ["product", "quantity", "customer_type", "payment_method", "promo_code"],
+            [is_inventory_sufficient, is_payment_method_valid, no_policy_violation, no_price_change],
+            [place_order_effect],
+            required_params=["product", "quantity", "payment_method"],
+        )
+        place_order_op.metadata = {"version": "1.0"}
+        self.operators[place_order_op.name] = place_order_op
+        self._snapshot_operator(place_order_op.name)
+
+        apply_promo_op = Operator(
+            "ApplyPromoCode",
+            ["promo_code", "cart_value", "stackable"],
+            [is_promo_active, is_promo_stackable],
+            [apply_promo_effect],
+            required_params=["promo_code"],
+        )
+        apply_promo_op.metadata = {"version": "1.0"}
+        self.operators[apply_promo_op.name] = apply_promo_op
+        self._snapshot_operator(apply_promo_op.name)
+
+        calculate_shipping_op = Operator(
+            "CalculateShipping",
+            ["location", "weight", "order_total"],
+            [is_shipping_allowed],
+            [calculate_shipping_effect],
+            required_params=["location"],
+        )
+        calculate_shipping_op.metadata = {"version": "1.0"}
+        self.operators[calculate_shipping_op.name] = calculate_shipping_op
+        self._snapshot_operator(calculate_shipping_op.name)
+
+        process_refund_op = Operator(
+            "ProcessRefund",
+            ["order_id", "days_since_purchase", "reason"],
+            [is_refund_within_window],
+            [process_refund_effect],
+            required_params=["days_since_purchase"],
+        )
+        process_refund_op.metadata = {"version": "1.0"}
+        self.operators[process_refund_op.name] = process_refund_op
+        self._snapshot_operator(process_refund_op.name)
+
+        update_inventory_op = Operator(
+            "UpdateInventory",
+            ["product", "delta", "reason"],
+            [],
+            [update_inventory_effect],
+            required_params=["product", "delta"],
+        )
+        update_inventory_op.metadata = {"version": "1.0"}
+        self.operators[update_inventory_op.name] = update_inventory_op
+        self._snapshot_operator(update_inventory_op.name)
+
         print(f"RULE_POOL: Loaded {len(self.operators)} initial operators: {list(self.operators.keys())}")
 
     def snapshot(self) -> Dict[str, Any]:
@@ -378,13 +634,13 @@ class RulePool:
             try:
                 if key not in params:
                     print(f"PRECONDITION CHECK: ❌ Missing required param '{key}' for {op_name}")
-                    return False, "anonymous"  # lets executor choose REGROUND_PARAMS_FROM_STATE
+                    return False, f"MissingRequiredParam_{key}"  # Return detailed error for FDKA
                 v = params.get(key)
                 if v is None or (isinstance(v, str) and v.strip() == ""):
                     print(f"PRECONDITION CHECK: ❌ Empty required param '{key}' for {op_name}")
-                    return False, "anonymous"
-            except Exception:
-                return False, "anonymous"
+                    return False, f"EmptyRequiredParam_{key}"  # Return detailed error for FDKA
+            except Exception as e:
+                return False, f"ParamValidationError_{key}"
 
         # 1) Optional validators (schema/domain)
         for validate in (getattr(op, "validators", None) or []):

@@ -131,7 +131,9 @@ class Guard:
         # Try to load ValueKG
         try:
             from ..knowledge.value_kg import ValueKG
+            domain = config.get("domain", "travel")
             kg_config = {
+                "domain": domain,
                 'blackout_dates': config.get('blackout_dates', []),
                 'corporate_card_policy': config.get('corporate_card_policy', 'blocked_on_blackout_dates')
             }
@@ -158,7 +160,11 @@ class Guard:
 
         blackout = state.get("blackout_dates")
         policy = state.get("corporate_card_policy", "blocked_on_blackout_dates")
+        domain = getattr(self, "value_kg", None)
+        domain = getattr(domain, "domain", None) or "travel"
 
+        if domain != "travel":
+            return
         if not isinstance(blackout, list) or not blackout:
             return
 
@@ -173,6 +179,7 @@ class Guard:
         try:
             from ..knowledge.value_kg import ValueKG
             self.value_kg = ValueKG({
+                "domain": "travel",
                 "blackout_dates": list(blackout),
                 "corporate_card_policy": policy,
             })
@@ -461,15 +468,37 @@ class Guard:
             params['payment'] = state.get('payment_method', '')
 
         details = _get(patch, "details", "")
+        details_l = str(details or "").lower()
 
-        if 'payment' in details.lower():
+        if 'payment' in details_l:
             match = re.search(r'payment[,\s]*([A-Za-z0-9:_-]+)', details)
             if match:
                 params['payment'] = match.group(1)
 
-        if 'dates' in details.lower() or 'date' in details.lower():
+        if 'dates' in details_l or 'date' in details_l:
             if state:
                 params['dates'] = state.get('travel_dates', '')
+
+        if 'promo' in details_l:
+            match = re.search(r'promo(?:_code)?[,\s]*([A-Za-z0-9:_-]+)', details, re.IGNORECASE)
+            if match:
+                params['promo_code'] = match.group(1)
+
+        if 'stack' in details_l:
+            params['stackable'] = True
+
+        if 'refund' in details_l or 'return' in details_l:
+            match = re.search(r'(\d+)\s+days', details_l)
+            if match:
+                try:
+                    params['days_since_purchase'] = int(match.group(1))
+                except ValueError:
+                    pass
+
+        if 'ship' in details_l or 'shipping' in details_l:
+            match = re.search(r'location[,\s]*([A-Za-z0-9:_-]+)', details, re.IGNORECASE)
+            if match:
+                params['location'] = match.group(1)
 
         return params
 

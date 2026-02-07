@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from .state import SymbolicState
 from .planner import Planner
 from .executor import Executor
+from ..fdka.failure_classifier import FailureClassifier
 
 # FDKA components
 from ..fdka.propose_edit import FDKAPipeline
@@ -65,6 +66,7 @@ from ..utils.logger import setup_logger
 from ..utils.metrics import MetricsCollector
 
 # Scenario
+from ..scenarios import SCENARIO_MAP
 from ..scenarios.travel_planning import TravelPlanningScenario
 from ..scenarios.test_cases import (
     get_canary_suite_for_operator,
@@ -104,6 +106,8 @@ class SelfEvolveSystem:
         gov_cfg = config.get("governance", {})
         if not isinstance(gov_cfg, dict):
             gov_cfg = {}
+        else:
+            gov_cfg = dict(gov_cfg)
 
         # Metrics first so we can wire it into dependent subsystems (FDKA)
         self.metrics = MetricsCollector()
@@ -129,7 +133,14 @@ class SelfEvolveSystem:
         self.signal_gen = SignalGenerator(config['metacognition'], self.rule_pool)
         self.arbitrator = Arbitrator(config['metacognition'])
         self.planner = Planner(config['planner'], self.rule_pool)
-        self.scenario = TravelPlanningScenario(config['scenario'])
+
+        # Load scenario based on configuration (supports multiple domains)
+        scenario_name = config.get('scenario', {}).get('name', 'travel')
+        scenario_class = SCENARIO_MAP.get(scenario_name, TravelPlanningScenario)
+        self.scenario = scenario_class(config['scenario'])
+
+        # Initialize failure classifier for domain-aware FDKA triggering
+        self.failure_classifier = FailureClassifier(domain=scenario_name)
 
         self.executor = Executor(
             config['executor'],
@@ -143,6 +154,7 @@ class SelfEvolveSystem:
         # Pass metrics collector to FDKA to capture efficiency stats from LLM calls
         self.fdka = FDKAPipeline(fdka_cfg, metrics_collector=self.metrics)
         self.scorer = Scorer(fdka_cfg, experience_pool=self.experience_pool)
+        gov_cfg.setdefault("domain", scenario_name)
         self.guard = Guard(gov_cfg)
 
         # Provenance can be disabled in ablations; keep a no-op sink to avoid None checks everywhere.
@@ -154,7 +166,21 @@ class SelfEvolveSystem:
 
         trust_cfg = (gov_cfg.get("trust", {}) or {}) if isinstance(gov_cfg, dict) else {}
         self.trust_scorer = TrustScorer(trust_cfg)
-        self.canary_runner = CanaryRunner((gov_cfg.get('canary', {}) or {}) if isinstance(gov_cfg, dict) else {})
+
+        # Phase 1 Enhancement: Adaptive Canary Thresholds
+        # Adjust max_fail_rate based on domain characteristics
+        canary_cfg = dict((gov_cfg.get('canary', {}) or {}) if isinstance(gov_cfg, dict) else {})
+        if 'statistical_max_fail_rate' not in canary_cfg:
+            # Domain-adaptive thresholds:
+            # - E-commerce: Higher tolerance (25%) due to legitimate business constraints
+            # - Travel: Standard tolerance (10%) for less constrained domain
+            if scenario_name == 'ecommerce':
+                canary_cfg['statistical_max_fail_rate'] = 0.25
+                print(f"  🎯 Adaptive canary: E-commerce domain detected, using 25% failure tolerance")
+            else:
+                canary_cfg['statistical_max_fail_rate'] = 0.10
+
+        self.canary_runner = CanaryRunner(canary_cfg)
 
         # Explicit enable flag; threshold is for accept gating only
         self.fdka_enabled: bool = bool(fdka_cfg.get('enabled', True))
@@ -272,15 +298,8 @@ class SelfEvolveSystem:
         if not hasattr(self.scenario, "world_defaults"):
             return
         defaults = self.scenario.world_defaults()
-
-        for k in ("hotel_status", "flight_status"):
-            if k in defaults:
-                self.state.set(k, deepcopy(defaults[k]))
-
-        # Always apply scenario world defaults so state matches injector/scenario truth.
-        for k in ("corporate_card_policy", "blackout_dates"):
-            if k in defaults:
-                self.state.set(k, deepcopy(defaults[k]))
+        for k, v in (defaults or {}).items():
+            self.state.set(k, deepcopy(v) if isinstance(v, (dict, list)) else v)
 
     def _reset_world_for_attempt(self) -> None:
         if not hasattr(self.scenario, "world_defaults"):
@@ -373,7 +392,7 @@ class SelfEvolveSystem:
                             False,
                             metadata={"instruction": instruction, "task_id": task_id, "operator": "PLANNER", "error_type": "PlanningFailed"},
                         )
-                    return
+                    return {'status': 'failure', 'trace': aggregated_trace, 'metrics': self.metrics.get_summary()}
             else:
                 print("❌ No patch committed; aborting task.")
                 self.metrics.record_task(task_id, False, aggregated_trace)
@@ -383,7 +402,7 @@ class SelfEvolveSystem:
                         False,
                         metadata={"instruction": instruction, "task_id": task_id, "operator": "PLANNER", "error_type": "PlanningFailed"},
                     )
-                return
+                return {'status': 'failure', 'trace': aggregated_trace, 'metrics': self.metrics.get_summary()}
 
         max_attempts = 3
         final_trace = []
@@ -459,7 +478,7 @@ class SelfEvolveSystem:
                 if self._last_committed_patch_id:
                     self.trust_scorer.update_trust_score(self._last_committed_patch_id, success=True)
                 self._last_committed_patch_id = None
-                return
+                return {'status': 'success', 'trace': task_trace_for_metrics, 'metrics': self.metrics.get_summary()}
 
             print(f"⚠️ Execution failed with type: {failure_type}")
 
@@ -525,6 +544,8 @@ class SelfEvolveSystem:
                 self.experience_pool.add_trace(task_trace_for_metrics, False, metadata=metadata)
             self.metrics.check_adaptation(f"{failure_info.get('operator')}:{failure_info.get('error')}")
 
+        return {'status': 'failure', 'trace': task_trace_for_metrics, 'metrics': self.metrics.get_summary()}
+
     # ---------------------------------------------------------------------
     # FDKA handling
     # ---------------------------------------------------------------------
@@ -538,6 +559,14 @@ class SelfEvolveSystem:
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         if not self.fdka_enabled:
             print("  DEBUG_FDKA: disabled by config. Skipping self-edit.")
+            return False, None
+
+        # Phase 1 Enhancement: Failure Taxonomy Filter
+        # Check if failure is patchable before attempting FDKA
+        is_patchable, constraint_type = self.failure_classifier.is_patchable(trace, instruction)
+        if not is_patchable:
+            print(f"  ⏭️  Skipping FDKA: Immutable business constraint ({constraint_type})")
+            print(f"     Rationale: Cannot patch legitimate business rules")
             return False, None
 
         patch_applied = False
@@ -582,6 +611,19 @@ class SelfEvolveSystem:
                 proposed_patch,
                 decision="rejected",
                 reason="validation_reject",
+                trace={"trace_id": f"task-{task_id}"},
+                context={"task_id": task_id, "instruction": instruction},
+            )
+            return False, None
+
+        if proposed_patch.get("action") == "SKIP_CONSTRAINT":
+            print(f"  ⏭️  FDKA: LLM detected business constraint ({proposed_patch.get('details', 'unknown')})")
+            print(f"     Skipping patch synthesis - this is an immutable constraint, not a bug.")
+            self.metrics.record_pipeline_rejection("PIPELINE:LLM_DETECTED_CONSTRAINT")
+            self.provenance.log_patch_event(
+                proposed_patch,
+                decision="skipped",
+                reason="llm_detected_constraint",
                 trace={"trace_id": f"task-{task_id}"},
                 context={"task_id": task_id, "instruction": instruction},
             )

@@ -59,27 +59,14 @@ class OpenAIProvider:
 
     def _extract_text(self, resp) -> str:
         """
-        Robustly extract text from a Responses API object.
-        - Prefer resp.output_text when available.
-        - Fallback to the first text block in resp.output.
+        Extract text from OpenAI chat.completions response.
         """
         try:
-            txt = getattr(resp, "output_text", None)
-            if txt:
-                return txt
-        except Exception:
-            pass
-
-        try:
-            out = getattr(resp, "output", None) or []
-            if out and isinstance(out, list):
-                # Newer Responses API: output[0].content[*].text
-                first = out[0]
-                content = getattr(first, "content", None) or []
-                for part in content:
-                    t = getattr(part, "text", None)
-                    if t:
-                        return t
+            # Standard chat.completions format
+            if hasattr(resp, 'choices') and resp.choices:
+                message = resp.choices[0].message
+                if hasattr(message, 'content'):
+                    return message.content or ""
         except Exception:
             pass
         return ""
@@ -93,7 +80,8 @@ class OpenAIProvider:
         total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
 
         try:
-            finish_reason = (resp.output[0].finish_reason if getattr(resp, "output", None) else "") or ""
+            # Standard chat.completions format
+            finish_reason = resp.choices[0].finish_reason if (hasattr(resp, 'choices') and resp.choices) else ""
         except Exception:
             finish_reason = ""
 
@@ -211,7 +199,15 @@ class OpenAIProvider:
 
         while True:
             try:
-                resp = self._client.responses.create(**call_args)
+                # Fix: Use standard chat.completions API instead of responses API
+                messages_for_api = input_payload if isinstance(input_payload, list) else [{"role": "user", "content": input_payload}]
+                resp = self._client.chat.completions.create(
+                    model=call_args["model"],
+                    messages=messages_for_api,
+                    temperature=call_args["temperature"],
+                    max_tokens=call_args["max_output_tokens"],
+                    **{k: v for k, v in call_args.items() if k not in ['model', 'input', 'temperature', 'max_output_tokens']}
+                )
                 return self._format_ok(resp, start, call_args["model"])
 
             except AuthenticationError as e:

@@ -30,6 +30,7 @@ MINIMUM DEFENSIBILITY UPDATE (2026-01):
   but required repeated recoveries. This supports analysis and can drive later escalation.
 """
 from typing import List, Dict, Any, Tuple, Optional
+from copy import deepcopy
 import time
 from collections import defaultdict
 from ..core.state import SymbolicState
@@ -73,6 +74,11 @@ class Executor:
         try:
             defaults = self.scenario.world_defaults()
 
+            # Fill in any missing keys from scenario defaults (do not overwrite existing state).
+            for k, v in (defaults or {}).items():
+                if state.get(k) is None:
+                    state.set(k, deepcopy(v) if isinstance(v, (dict, list)) else v)
+
             # Resources: only set if absent (preserve ongoing effects).
             for k in ("hotel_status", "flight_status"):
                 if k in defaults and state.get(k) is None:
@@ -81,7 +87,7 @@ class Executor:
             # Policy context: always mirror scenario truth (prevents silent drift).
             for k in ("corporate_card_policy", "blackout_dates"):
                 if k in defaults:
-                    state.set(k, defaults[k])
+                    state.set(k, deepcopy(defaults[k]) if isinstance(defaults[k], (dict, list)) else defaults[k])
 
             # Network is used by some patches/predicates; keep a sensible default when missing.
             if "network_available" in defaults and state.get("network_available") is None:
@@ -109,10 +115,15 @@ class Executor:
         """
         Keep payment identity consistent across params/state AND prevent "sticky" invalid flags.
         """
-        if "payment" not in params or params["payment"] is None:
+        payment = None
+        if "payment" in params and params["payment"] is not None:
+            payment = params["payment"]
+        elif "payment_method" in params and params["payment_method"] is not None:
+            payment = params["payment_method"]
+
+        if payment is None:
             return
 
-        payment = params["payment"]
         state.set("payment_method", payment)
 
         p = str(payment)
@@ -307,6 +318,53 @@ class Executor:
         if "network" in msg.lower() and ("unavailable" in msg.lower() or "down" in msg.lower()):
             state.set("network_available", False)
 
+        err = str(error_info.get("error") or error_info.get("error_type") or "").lower()
+        if "insufficientinventory" in err:
+            product = params.get("product")
+            quantity = params.get("quantity", 1)
+            inventory = dict(state.get("inventory", {}) or {})
+            try:
+                quantity = int(quantity)
+            except (TypeError, ValueError):
+                quantity = 1
+            if product:
+                inventory[product] = max(0, quantity - 1)
+                state.set("inventory", inventory)
+
+        if "promocodeexpired" in err:
+            promo = params.get("promo_code")
+            active = list(state.get("active_promos", []) or [])
+            expired = list(state.get("expired_promos", []) or [])
+            if promo and promo in active:
+                active = [p for p in active if p != promo]
+                state.set("active_promos", active)
+            if promo and promo not in expired:
+                expired.append(promo)
+                state.set("expired_promos", expired)
+
+        if "promoconflict" in err:
+            state.set("promo_conflict", True)
+
+        if "shippingrestricted" in err:
+            location = params.get("location")
+            restrictions = list(state.get("shipping_restrictions", []) or [])
+            if location and location not in restrictions:
+                restrictions.append(location)
+                state.set("shipping_restrictions", restrictions)
+
+        if "paymentdeclined" in err:
+            state.set("payment_invalid", True)
+            state.set("payment_valid", False)
+
+        if "policyviolation" in err:
+            state.set("policy_violation", True)
+
+        if "pricechanged" in err:
+            state.set("price_changed", True)
+
+        if "returnwindowexceeded" in err:
+            state.set("return_window_days", 0)
+
     # ---------------------------
     # Effect execution with minimal gating
     # ---------------------------
@@ -367,8 +425,41 @@ class Executor:
 
         self._apply_world_defaults(state)
 
+        if self.scenario and hasattr(self.scenario, "inject_dynamic_policy_shift"):
+            try:
+                shift = self.scenario.inject_dynamic_policy_shift(task_id, state)
+                if shift:
+                    trace.append({
+                        "event_type": "policy_shift",
+                        "task_id": task_id,
+                        "details": shift,
+                    })
+            except Exception:
+                pass
+
         u = self.signal_gen.compute_uncertainty(plan)
         p_viol = self.signal_gen.predict_violation_probability(plan, state)
+
+        if self.scenario and hasattr(self.scenario, "inject_uncertainty") and plan:
+            try:
+                hint = self.scenario.inject_uncertainty(
+                    plan[0]["operator"].name,
+                    plan[0].get("params", {}) or {},
+                    state,
+                )
+                if hint:
+                    confidence = float(hint.get("confidence", 1.0))
+                    u = max(u, max(0.0, 1.0 - confidence))
+                    if hint.get("requires_verification"):
+                        floor = float(self.config.get("uncertainty_violation_floor", 0.5))
+                        p_viol = max(p_viol, floor)
+                    trace.append({
+                        "event_type": "uncertainty_injected",
+                        "details": hint,
+                    })
+            except Exception:
+                pass
+
         budget = self.config.get('budget_ms', 2000)
         pathway = self.arbitrator.arbitrate(u, p_viol, budget)
         print(f"EXECUTOR: Arbitrated pathway -> {pathway}")
@@ -441,6 +532,17 @@ class Executor:
                         "task_id": injected_error_info.get("task_id"),
                         "trace_id": injected_error_info.get("trace_id"),
                     })
+
+            if not injected_error_info and self.scenario and hasattr(self.scenario, "inject_resource_contention"):
+                try:
+                    contention = self.scenario.inject_resource_contention(op.name, params, task_id)
+                except Exception:
+                    contention = None
+                if contention:
+                    injected_error_info = dict(contention)
+                    injected_error_info.setdefault("operator", op.name)
+                    injected_error_info.setdefault("error", "ToolError")
+                    injected_error_info.setdefault("error_type", "ToolError")
 
             # Track whether this step had a real verify failure that was later repaired.
             had_verify_failure = False
@@ -592,6 +694,12 @@ class Executor:
                 recovered_counts[f"{op.name}:PreconditionUnmet"] += 1
             trace.append(success_event)
             print(f"EXECUTOR: ✅ Step {op.name} successful.")
+
+            if self.scenario and hasattr(self.scenario, "release_resource_lock"):
+                try:
+                    self.scenario.release_resource_lock(op.name, params)
+                except Exception:
+                    pass
 
         # Audit-only: summarize recoveries (does not change success semantics).
         if recovered_counts and bool(self.config.get("emit_recovery_summary", True)):

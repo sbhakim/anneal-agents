@@ -79,9 +79,9 @@ fdka:
     # -------------------------------------------------------------------------
     # Remote providers (kept for parity / ablations; switch llm_provider to use)
     # -------------------------------------------------------------------------
-    # OpenAI:
-    # llm_provider: "openai"
-    # model: "gpt-4o-mini"
+    # OpenAI (GPT-4o-mini for better patch quality):
+    llm_provider: "openai"
+    model: "gpt-4o-mini"
 
     # DeepSeek (OpenAI-compatible endpoint):
     # llm_provider: "deepseek"
@@ -89,8 +89,8 @@ fdka:
     # base_url: "https://api.deepseek.com"
 
     # Mock provider (for testing, no LLM needed):
-    llm_provider: "mock"
-    model: "mock"
+    # llm_provider: "mock"
+    # model: "mock"
 
     # Mock (offline deterministic testing):
     # llm_provider: "mock"

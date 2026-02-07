@@ -41,8 +41,20 @@ class Planner:
             k in instruction_lower for k in ("travel", "option", "itinerary")
         )
 
+        is_ecommerce = any(
+            k in instruction_lower
+            for k in ("order", "promo", "discount", "refund", "return", "inventory", "stock", "ship", "shipping")
+        )
+
         if wants_cheapest and not (wants_hotel or wants_flight):
             wants_flight = True
+
+        if is_ecommerce and not (wants_hotel or wants_flight):
+            plan = self._compile_ecommerce(instruction, state)
+            if plan:
+                operator_names = [p["operator"].name for p in plan]
+                print(f"PLANNER: Plan created with {len(plan)} step(s) -> {operator_names}")
+                return plan
 
         hotel_step = None
         flight_step = None
@@ -107,6 +119,44 @@ class Planner:
             print(f"PLANNER: Plan created with {len(plan)} step(s) -> {operator_names}")
         else:
             print("PLANNER: ❌ No plan generated (no matching operators or failed grounding).")
+
+        return plan
+
+    def _compile_ecommerce(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build a minimal e-commerce plan from instruction keywords."""
+        instruction_lower = instruction.lower()
+        plan: List[Dict[str, Any]] = []
+
+        wants_order = any(k in instruction_lower for k in ("place an order", "place order", "order", "purchase", "buy"))
+        wants_promo = any(k in instruction_lower for k in ("promo", "discount"))
+        wants_shipping = any(k in instruction_lower for k in ("ship", "shipping"))
+        wants_refund = any(k in instruction_lower for k in ("refund", "return"))
+        wants_inventory = any(k in instruction_lower for k in ("inventory", "stock", "restock"))
+
+        steps = [
+            ("PlaceOrder", wants_order),
+            ("ApplyPromoCode", wants_promo),
+            ("CalculateShipping", wants_shipping),
+            ("ProcessRefund", wants_refund),
+            ("UpdateInventory", wants_inventory),
+        ]
+
+        for op_name, enabled in steps:
+            if not enabled:
+                continue
+            op = self.rule_pool.get_operator(op_name)
+            if not op:
+                print(f"PLANNER: Warning - '{op_name}' operator not found in Rule Pool.")
+                continue
+            params, missing = self._ground_ecommerce_params(op_name, instruction, state)
+            step = {"operator": op, "params": params}
+            if missing:
+                step["meta"] = {"needs_regrounding": missing}
+            plan.append(step)
+            print(f"PLANNER: Added '{op_name}' to plan with params: {params}")
+
+        if not plan:
+            print("PLANNER: ❌ No e-commerce plan generated.")
 
         return plan
 
@@ -285,3 +335,148 @@ class Planner:
                 missing.append(k)
 
         return params, missing
+
+    # ------------------------------------------------------------------
+    # E-commerce grounding helpers
+    # ------------------------------------------------------------------
+
+    def _ground_ecommerce_params(
+        self, operator_name: str, instruction: str, state: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], List[str]]:
+        params: Dict[str, Any] = {}
+        missing: List[str] = []
+
+        product, quantity = self._extract_product_and_quantity(instruction)
+        promo_code = self._extract_promo_code(instruction)
+        location = self._extract_shipping_location(instruction)
+        payment_method = self._extract_payment_method(instruction)
+        customer_type = self._extract_customer_type(instruction)
+        days_since_purchase = self._extract_days_since_purchase(instruction)
+
+        if operator_name == "PlaceOrder":
+            if not payment_method:
+                pm = state.get("payment_method")
+                if not pm:
+                    methods = state.get("payment_methods", []) or []
+                    pm = methods[0] if methods else None
+                payment_method = pm or "credit_card"
+            params.update({
+                "product": product,
+                "quantity": quantity,
+                "customer_type": customer_type,
+                "payment_method": payment_method,
+                "promo_code": promo_code,
+            })
+            for k in ("product", "quantity", "payment_method"):
+                if not params.get(k):
+                    missing.append(k)
+
+        elif operator_name == "ApplyPromoCode":
+            params.update({
+                "promo_code": promo_code,
+                "cart_value": state.get("order_total", 0),
+                "stackable": False,
+            })
+            if not params.get("promo_code"):
+                missing.append("promo_code")
+
+        elif operator_name == "CalculateShipping":
+            params.update({
+                "location": location,
+                "weight": state.get("order_weight", 1),
+                "order_total": state.get("order_total", 0),
+            })
+            if not params.get("location"):
+                missing.append("location")
+
+        elif operator_name == "ProcessRefund":
+            params.update({
+                "order_id": state.get("last_order_id", "ORDER-UNKNOWN"),
+                "days_since_purchase": days_since_purchase,
+                "reason": "customer_request",
+            })
+            if params.get("days_since_purchase") is None:
+                missing.append("days_since_purchase")
+
+        elif operator_name == "UpdateInventory":
+            delta = None
+            if quantity:
+                delta = -int(quantity)
+            params.update({
+                "product": product,
+                "delta": delta,
+                "reason": "sale_adjustment",
+            })
+            for k in ("product", "delta"):
+                if params.get(k) in (None, ""):
+                    missing.append(k)
+
+        return params, missing
+
+    @staticmethod
+    def _extract_product_and_quantity(instruction: str) -> tuple[Optional[str], Optional[int]]:
+        products = ("laptop", "phone", "tablet", "headphones", "monitor", "keyboard")
+        match = re.search(r"(\d+)\s+(\w+)", instruction, re.IGNORECASE)
+        quantity = None
+        product = None
+        if match:
+            try:
+                quantity = int(match.group(1))
+            except ValueError:
+                quantity = None
+            candidate = match.group(2).lower()
+            if candidate in products:
+                product = candidate
+        if not product:
+            for p in products:
+                if p in instruction.lower():
+                    product = p
+                    break
+        return product, quantity
+
+    @staticmethod
+    def _extract_promo_code(instruction: str) -> Optional[str]:
+        match = re.search(r"promo code\s+([A-Za-z0-9_-]+)", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        match = re.search(r"apply\s+([A-Za-z0-9_-]+)\s+discount", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        for code in ("SAVE10", "BULK15", "EMPLOYEE20", "FREESHIP"):
+            if code.lower() in instruction.lower():
+                return code
+        return None
+
+    @staticmethod
+    def _extract_shipping_location(instruction: str) -> Optional[str]:
+        match = re.search(r"\bto\s+([A-Za-z_]+)\b(?:\s+address)?", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        return None
+
+    @staticmethod
+    def _extract_payment_method(instruction: str) -> Optional[str]:
+        match = re.search(r"payment method\s+([A-Za-z_]+)", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+        match = re.search(r"using\s+([A-Za-z_]+)", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+        return None
+
+    @staticmethod
+    def _extract_customer_type(instruction: str) -> Optional[str]:
+        for label in ("employee", "bulk", "premium", "standard"):
+            if label in instruction.lower():
+                return label
+        return None
+
+    @staticmethod
+    def _extract_days_since_purchase(instruction: str) -> Optional[int]:
+        match = re.search(r"(\d+)\s+days?\s+ago", instruction, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+        return None

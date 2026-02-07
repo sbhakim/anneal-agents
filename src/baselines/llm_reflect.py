@@ -115,6 +115,32 @@ class LLMReflectAgent:
 
         return self.metrics
 
+    def run_task(self, task_id: int, instruction: str) -> Dict[str, Any]:
+        """
+        Run a single task and return structured outcome (for evaluation scripts).
+
+        Args:
+            task_id: Task identifier
+            instruction: Natural language instruction
+
+        Returns:
+            Dict with 'status', 'trace', 'metrics'
+        """
+        self._run_task_with_reflection(task_id, instruction)
+
+        # Determine status from metrics
+        task_data = next((t for t in self.metrics.tasks if t.get('task_id') == task_id), None)
+        if task_data and task_data.get('success'):
+            status = 'success'
+        else:
+            status = 'failure'
+
+        return {
+            'status': status,
+            'trace': task_data.get('trace', []) if task_data else [],
+            'metrics': self.metrics.get_summary()
+        }
+
     def _run_task_with_reflection(self, task_id: int, instruction: str) -> None:
         """
         Run a single task using LLM reasoning with textual reflection.
