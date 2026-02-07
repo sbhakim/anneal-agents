@@ -568,7 +568,7 @@ class FDKAPipeline:
         end = text.rfind('}')
         if start != -1 and end != -1 and end > start:
             bal = 0
-            last = start
+            last = None
             for i, ch in enumerate(text[start:end + 1], start=start):
                 if ch == '{':
                     bal += 1
@@ -576,7 +576,9 @@ class FDKAPipeline:
                     bal -= 1
                     if bal == 0:
                         last = i
-                        break
+                        # Continue to find the LAST balanced closing brace.
+            if last is None:
+                last = end
             try:
                 return json.loads(text[start:last + 1])
             except json.JSONDecodeError:

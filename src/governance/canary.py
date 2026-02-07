@@ -218,7 +218,8 @@ class CanaryRunner:
             return self._result(False, "No simulator available", mode=mode, smt_sanity=smt_sanity)
 
         print("\nStaging patch...")
-        snapshot = self._safe_call(rule_pool, "snapshot")
+        defer_rollback = bool(context.get("defer_rollback", False))
+        snapshot = None if defer_rollback else self._safe_call(rule_pool, "snapshot")
 
         try:
             staged = stage_fn(patch)

@@ -33,6 +33,7 @@ from src.utils.config_loader import load_config
 from src.core.system import SelfEvolveSystem
 from experiments.run_baseline_comparison import BaselineComparison
 from experiments.run_ablations import AblationStudy
+from experiments.run_governance_stress import run_stress as run_governance_stress
 
 
 class FullEvaluationRunner:
@@ -58,7 +59,8 @@ class FullEvaluationRunner:
         self.experiment_results = {
             "baseline_comparison": {"status": "not_run", "duration": 0, "error": None},
             "ablation_study": {"status": "not_run", "duration": 0, "error": None},
-            "demo_run": {"status": "not_run", "duration": 0, "error": None}
+            "demo_run": {"status": "not_run", "duration": 0, "error": None},
+            "governance_stress": {"status": "not_run", "duration": 0, "error": None},
         }
 
         # ✅ Initialize experiment objects once
@@ -76,8 +78,10 @@ class FullEvaluationRunner:
 
         self.baseline_dir = self.run_dir / "baseline_comparison"
         self.ablation_dir = self.run_dir / "ablations"
+        self.gov_stress_dir = self.run_dir / "governance_stress"
         self.baseline_dir.mkdir(parents=True, exist_ok=True)
         self.ablation_dir.mkdir(parents=True, exist_ok=True)
+        self.gov_stress_dir.mkdir(parents=True, exist_ok=True)
 
         # Re-root experiment-level result aggregation outputs (JSON/CSV).
         self.baseline_runner.results_dir = self.baseline_dir
@@ -110,6 +114,7 @@ class FullEvaluationRunner:
         print(f"Orchestration Run Dir: {self.run_dir}")
         print(f"Baseline Artifacts Dir: {self.baseline_dir}")
         print(f"Ablation Artifacts Dir: {self.ablation_dir}")
+        print(f"Governance Stress Dir: {self.gov_stress_dir}")
         print("=" * 70)
         print()
 
@@ -216,6 +221,7 @@ class FullEvaluationRunner:
 
         baseline_complete = self._read_json_if_exists(self.baseline_dir / "complete_results.json")
         ablation_complete = self._read_json_if_exists(self.ablation_dir / "complete_ablations.json")
+        gov_stress_summary = self._read_json_if_exists(self.gov_stress_dir / "governance_stress_summary.json")
 
         baseline_meta = None
         if isinstance(baseline_complete, dict):
@@ -267,6 +273,14 @@ class FullEvaluationRunner:
                     "complete_results": str(self.ablation_dir / "complete_ablations.json"),
                     "table_csv": str(self.ablation_dir / "table2_data.csv"),
                     "snapshot": ablation_meta,
+                },
+                "governance_stress": {
+                    "dir": str(self.gov_stress_dir),
+                    "summary_json": str(self.gov_stress_dir / "governance_stress_summary.json"),
+                    "results_csv": str(self.gov_stress_dir / "governance_stress_results.csv"),
+                    "table4_governance_csv": str(self.gov_stress_dir / "table4_governance.csv"),
+                    "table4_governance_detail_csv": str(self.gov_stress_dir / "table4_governance_detail.csv"),
+                    "snapshot": gov_stress_summary.get("governance_stats") if isinstance(gov_stress_summary, dict) else None,
                 },
                 "demo_run": {
                     "dir": str(self.run_dir / "demo"),
@@ -447,6 +461,17 @@ class FullEvaluationRunner:
                 # Demo is optional in full pipeline; keep skipped unless user requests demo-only.
                 print("\n⏭️ Skipping demo run (default). Use --demo-only to run demo.")
                 self.experiment_results["demo_run"]["status"] = "skipped"
+
+                # Governance stress test (standalone, does not affect benchmarks)
+                try:
+                    t0 = time.time()
+                    run_governance_stress(self.gov_stress_dir, self.baseline_runner.base_config, num_examples=8)
+                    self.experiment_results["governance_stress"]["status"] = "success"
+                    self.experiment_results["governance_stress"]["duration"] = time.time() - t0
+                except Exception as e:
+                    self.experiment_results["governance_stress"]["status"] = "failed"
+                    self.experiment_results["governance_stress"]["error"] = str(e)
+                    print(f"❌ Governance stress test failed: {e}")
 
             # Print + persist orchestration summary
             self.generate_summary()

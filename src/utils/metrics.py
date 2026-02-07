@@ -260,7 +260,11 @@ class MetricsCollector:
             self.failure_count += 1
             failure_info = self._extract_failure_info(trace)
             if failure_info:
-                failure_key = f"{self._norm_operator(failure_info.get('operator', 'UNKNOWN'))}:{self._norm_error(failure_info.get('error', 'UNKNOWN'))}"
+                failure_key = self._make_failure_key(
+                    failure_info.get('operator', 'UNKNOWN'),
+                    failure_info.get('error', 'UNKNOWN'),
+                    failure_info.get('policy_ref', ''),
+                )
                 self.failure_classes[failure_key].append(task_id)
 
                 if failure_key not in self.first_failure:
@@ -350,6 +354,17 @@ class MetricsCollector:
 
         self.patches.append(patch_record)
         print(f"METRICS: Patch #{self.patch_count} {decision}")
+
+    def record_patch_commitment_for_tta(self, failure_key: str, task_id: int) -> None:
+        """
+        Record TTA at patch commit time for immediate tracking.
+        Called when a patch is committed to fix a specific failure class.
+        """
+        if failure_key and failure_key not in self.adapted_at:
+            self.adapted_at[failure_key] = task_id
+            first = self.first_failure.get(failure_key, task_id)
+            tta = task_id - first
+            print(f"METRICS: 🎯 TTA={tta} tasks for '{failure_key}' (first@{first}, patched@{task_id})")
 
     def record_rollback(self, patch_id: int, justified: bool = True) -> None:
         """Record a patch rollback."""
@@ -555,7 +570,7 @@ class MetricsCollector:
         - Otherwise fall back to observed events (recovered or not).
         """
         if window_size is None:
-            window_size = min(20, max(10, self.task_count // 2))
+            window_size = 20  # Fixed window for reproducible RFR across runs
 
         # Prefer terminal when available for that key; otherwise use observed.
         if failure_key in self.failure_classes and len(self.failure_classes[failure_key]) > 0:
@@ -1085,6 +1100,8 @@ class MetricsCollector:
                     normalized["operator"] = self._norm_operator(normalized.get("operator"))
                 if "error" in normalized:
                     normalized["error"] = self._norm_error(normalized.get("error"))
+                if "policy_ref" in normalized:
+                    normalized["policy_ref"] = self._norm_policy(normalized.get("policy_ref"))
                 return normalized
         return None
 
@@ -1112,9 +1129,11 @@ class MetricsCollector:
             else:
                 continue
 
-            op = self._norm_operator(entry.get("operator", "UNKNOWN"))
-            er = self._norm_error(err)
-            keys.append(f"{op}:{er}")
+            keys.append(self._make_failure_key(
+                entry.get("operator", "UNKNOWN"),
+                err,
+                entry.get("policy_ref", ""),
+            ))
         return keys
 
     def _extract_recovered_failure_keys(self, trace: List[Dict]) -> List[str]:
@@ -1133,17 +1152,23 @@ class MetricsCollector:
             et = entry.get("event_type")
 
             if et == "verify_failed":
-                op = self._norm_operator(entry.get("operator", "UNKNOWN"))
                 err = entry.get("error_type") or entry.get("error") or "PreconditionUnmet"
-                keys.append(f"{op}:{self._norm_error(err)}")
+                keys.append(self._make_failure_key(
+                    entry.get("operator", "UNKNOWN"),
+                    err,
+                    entry.get("policy_ref", ""),
+                ))
                 continue
 
             if et == "step_success" and bool(entry.get("recovered")):
-                op = self._norm_operator(entry.get("step") or entry.get("operator", "UNKNOWN"))
                 recovered_from = entry.get("recovered_from") or entry.get("error_type") or entry.get("error")
                 # If not specified (e.g., tool retry), default to ToolError for bookkeeping.
                 err = recovered_from or "ToolError"
-                keys.append(f"{op}:{self._norm_error(err)}")
+                keys.append(self._make_failure_key(
+                    entry.get("step") or entry.get("operator", "UNKNOWN"),
+                    err,
+                    entry.get("policy_ref", ""),
+                ))
 
         return keys
 
@@ -1176,6 +1201,17 @@ class MetricsCollector:
                     return str(err[k])
             return "UNKNOWN"
         return str(err)
+
+    def _norm_policy(self, policy_ref: Any) -> str:
+        if policy_ref is None:
+            return ""
+        return str(policy_ref).strip()
+
+    def _make_failure_key(self, operator: Any, error: Any, policy_ref: Any = None) -> str:
+        op = self._norm_operator(operator)
+        er = self._norm_error(error)
+        pr = self._norm_policy(policy_ref)
+        return f"{op}:{er}:{pr}" if pr else f"{op}:{er}"
 
 
 # ========================================================================

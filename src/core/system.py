@@ -640,13 +640,14 @@ class SelfEvolveSystem:
 
             canary_context = {
                 "rule_pool": self.rule_pool,
-                "stage_fn": self.rule_pool.update_operator,
+                "stage_fn": self.rule_pool.stage_patch,
                 "simulator": self._run_canary_simulation,
                 "examples": examples,
                 "canary_suite": get_canary_suite_for_operator(op_name),
                 "scorer": self.scorer,
                 "scores": scores,
                 "synthetic_patches": get_smt_sanity_patches_for_operator(op_name),
+                "defer_rollback": True,
             }
 
             canary_result = self.canary_runner.run(proposed_patch, canary_context) or {}
@@ -660,10 +661,23 @@ class SelfEvolveSystem:
                 print(" FDKA: Canary test passed. Committing patch permanently.")
 
                 # IMPORTANT: PatchUpdateResult truthiness includes "skipped"; use .applied for commit semantics.
-                update_res = self.rule_pool.update_operator(proposed_patch)
+                update_res = self.rule_pool.commit_staged_patch()
+                if update_res is None:
+                    update_res = self.rule_pool.update_operator(proposed_patch)
 
                 patch_applied = bool(getattr(update_res, "applied", False))
                 patch_dict = proposed_patch if patch_applied else None
+
+                # Record TTA when patch is committed
+                if patch_applied:
+                    failure_info = self._extract_failure_info(trace)
+                    if failure_info:
+                        operator = failure_info.get('operator', '')
+                        error_type = failure_info.get('error', '')
+                        policy_ref = failure_info.get('policy_ref', '')
+                        if operator and error_type:
+                            failure_key = f"{operator}:{error_type}:{policy_ref}" if policy_ref else f"{operator}:{error_type}"
+                            self.metrics.record_patch_commitment_for_tta(failure_key, task_id)
 
                 # If canary staging accidentally mutated the live pool, commit may show "skipped".
                 if (not patch_applied) and bool(getattr(update_res, "skipped", False)):
@@ -683,6 +697,7 @@ class SelfEvolveSystem:
                     pass
             else:
                 print(f" FDKA: ❌ Canary test failed: {canary_result.get('reason')}")
+                self.rule_pool.rollback_staged_patch()
         elif guard_result['decision'] == 'request_human':
             print(" FDKA: ⚠️ Causal guard requests human escalation; not committing.")
         else:

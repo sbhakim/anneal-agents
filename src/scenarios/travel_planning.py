@@ -187,9 +187,7 @@ class FailureInjector:
         self.policy_flip_points = self._get_event_points('policy_flips')
         self.schema_change_points = self._get_event_points('schema_changes')
 
-        total_fail = max(0, int(round(self.horizon * self.failure_rate)))
-        base_pool = list(range(self.horizon))
-        self.failing_tasks = set(self.rng.sample(base_pool, total_fail)) if total_fail > 0 else set()
+        self.failing_tasks = set(self._select_failing_tasks())
 
         self.failure_classes = {
             "blocked_card": {"operator": "BookHotel", "error_type": "PreconditionUnmet",
@@ -219,6 +217,29 @@ class FailureInjector:
         if count == 0:
             return []
         return [int(i * self.horizon / (count + 1)) for i in range(1, count + 1)]
+
+    def _select_failing_tasks(self) -> List[int]:
+        """
+        Select failing tasks with a guaranteed minimum in the prefix window.
+        This keeps early adaptation pressure consistent across horizons.
+        """
+        failing: Set[int] = set()
+
+        if self.prefix_len > 0 and self.min_failures_in_prefix > 0:
+            prefix_tasks = list(range(self.prefix_len))
+            self.rng.shuffle(prefix_tasks)
+            for task in prefix_tasks[:min(self.min_failures_in_prefix, len(prefix_tasks))]:
+                failing.add(task)
+
+        target = max(0, int(round(self.horizon * self.failure_rate)))
+        all_tasks = list(range(self.horizon))
+        self.rng.shuffle(all_tasks)
+        for task in all_tasks:
+            if len(failing) >= target:
+                break
+            failing.add(task)
+
+        return sorted(failing)
 
     def _payment_key(self, params: Optional[Dict], state: Optional[Any]) -> str:
         payment = params.get("payment") if isinstance(params, dict) else None

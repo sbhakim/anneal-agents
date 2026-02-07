@@ -298,6 +298,9 @@ class RulePool:
         self.stats = {'total_patches_applied': 0, 'patches_by_type': {}, 'operators_modified': set()}
         self._patch_signature_cache: Set[str] = set()
         self._edit_intent_index: Dict[str, Dict[str, str]] = {}  # edit_key -> {"polarity":..,"patch_id":..,"signature":..}
+        self._staged_snapshot: Optional[Dict[str, Any]] = None
+        self._staged_update: Optional[PatchUpdateResult] = None
+        self._staged_patch_id: str = ""
         self.load_operators()
 
     def load_operators(self):
@@ -350,6 +353,7 @@ class RulePool:
         self.stats = snap.get("stats", self.stats)
         self._patch_signature_cache = snap.get("_patch_signature_cache", self._patch_signature_cache)
         self._edit_intent_index = snap.get("_edit_intent_index", self._edit_intent_index)
+        self._clear_staged()
 
     def get_operator(self, name: str) -> Optional[Operator]:
         return self.operators.get(name)
@@ -591,6 +595,56 @@ class RulePool:
             edit_key=edit_key,
             polarity=polarity,
         )
+
+    def stage_patch(self, patch: Dict[str, Any]) -> PatchUpdateResult:
+        """
+        Apply a patch with rollback support. The patch remains staged until commit/rollback.
+        """
+        patch_id = patch.get("id", "unknown")
+        if self._staged_snapshot is not None:
+            return PatchUpdateResult(
+                applied=False,
+                skipped=False,
+                reason="already_staged",
+                patch_id=patch_id,
+                operator=str(patch.get("operator")),
+                action=str(patch.get("action")),
+            )
+
+        snapshot = self.snapshot()
+        update_res = self.update_operator(patch)
+        if not update_res:
+            # Ensure we return to the exact pre-stage state on failure.
+            self.restore(snapshot)
+            return update_res
+
+        self._staged_snapshot = snapshot
+        self._staged_update = update_res
+        self._staged_patch_id = patch_id
+        return update_res
+
+    def commit_staged_patch(self) -> Optional[PatchUpdateResult]:
+        """Finalize a staged patch by clearing rollback state."""
+        if self._staged_snapshot is None:
+            return None
+        res = self._staged_update
+        self._clear_staged()
+        return res
+
+    def rollback_staged_patch(self) -> bool:
+        """Rollback a staged patch to the pre-stage snapshot."""
+        if self._staged_snapshot is None:
+            return False
+        try:
+            self.restore(self._staged_snapshot)
+            return True
+        finally:
+            self._clear_staged()
+
+    def _clear_staged(self) -> None:
+        self._staged_snapshot = None
+        self._staged_update = None
+        self._staged_patch_id = ""
 
     def _add_precondition(self, op: Operator, details: str, just: str) -> Tuple[bool, bool]:
         new_pre = self.predicate_factory.create_precondition(details, op.name)

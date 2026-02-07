@@ -85,11 +85,21 @@ class Scorer:
 
         # Minimal SMT predicate vocabulary for Eq.10 checks (expand only if needed)
         self._smt_atoms = {
+            # Payment predicates
             "ValidPayment": "ValidPayment",
             "InvalidPayment": "InvalidPayment",
             "ExpiredPayment": "ExpiredPayment",
             "BlockedCard": "BlockedCard",
+            # Network & system predicates
             "NetworkAvailable": "NetworkAvailable",
+            "ToolAvailable": "ToolAvailable",
+            # Domain-specific travel predicates
+            "AvailableHotel": "AvailableHotel",
+            "AvailableFlight": "AvailableFlight",
+            "PolicyViolation": "PolicyViolation",
+            "BlackoutDate": "BlackoutDate",
+            "RateLimitExceeded": "RateLimitExceeded",
+            "EndpointDeprecated": "EndpointDeprecated",
         }
 
         print(f"SCORER: Initialized with weights -> {self.weights}")

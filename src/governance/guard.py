@@ -417,15 +417,20 @@ class Guard:
 
         dangerous_patterns = [
             ('disable', 'security'),
+            ('deactivate', 'security'),
             ('remove', 'auth'),
+            ('bypass', 'auth'),
+            ('skip', 'auth'),
             ('bypass', 'check'),
             ('skip', 'validation'),
+            ('ignore', 'validation'),
             ('allow', 'all'),
+            ('permit', 'any'),
             ('disable', 'verify'),
             ('remove', 'payment'),
             ('skip', 'privacy'),
             ('disable', 'safety'),
-            ('bypass', 'permission')
+            ('bypass', 'permission'),
         ]
 
         for pattern in dangerous_patterns:

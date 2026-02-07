@@ -545,7 +545,7 @@ class Executor:
                         recovered_counts[f"{op.name}:ToolError"] += 1
                         print(f"EXECUTOR: ✅ Recovery retry succeeded for {op.name}.")
                         continue
-                    except Exception as e:
+                    except (RuntimeError, ValueError, AttributeError, TypeError, KeyError) as e:
                         trace.append({
                             "event_type": "step_failure",
                             "error": "ToolError",
@@ -571,7 +571,7 @@ class Executor:
 
             try:
                 state = self._apply_effects(op, state, params, recovery=False)
-            except Exception as e:
+            except (RuntimeError, ValueError, AttributeError, TypeError, KeyError) as e:
                 trace.append({
                     "event_type": "step_failure",
                     "error": "ToolError",
