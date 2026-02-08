@@ -380,3 +380,130 @@ Output JSON array of rules:
                 if self.extraction_stats['documents_processed'] > 0 else 0
             ),
         }
+
+    def detect_conflicts(self, rules: List[DeonticRule]) -> List[Dict[str, Any]]:
+        """
+        Detect contradictory rules (e.g., same action Prohibited vs Obligatory).
+        Returns list of conflicts with details for human review.
+        """
+
+        conflicts = []
+
+        # Group rules by action
+        action_rules = {}
+        for rule in rules:
+            if rule.action not in action_rules:
+                action_rules[rule.action] = []
+            action_rules[rule.action].append(rule)
+
+        # Check for contradictions within each action
+        for action, action_rule_list in action_rules.items():
+            modalities = set(r.modality for r in action_rule_list)
+
+            # Conflict: Same action is both Prohibited and Obligatory
+            if 'Prohibited' in modalities and 'Obligatory' in modalities:
+                prohibited_rules = [r for r in action_rule_list if r.modality == 'Prohibited']
+                obligatory_rules = [r for r in action_rule_list if r.modality == 'Obligatory']
+
+                for p_rule in prohibited_rules:
+                    for o_rule in obligatory_rules:
+                        conflicts.append({
+                            'type': 'modality_contradiction',
+                            'action': action,
+                            'rule1': {
+                                'modality': p_rule.modality,
+                                'condition': p_rule.condition,
+                                'confidence': p_rule.confidence
+                            },
+                            'rule2': {
+                                'modality': o_rule.modality,
+                                'condition': o_rule.condition,
+                                'confidence': o_rule.confidence
+                            },
+                            'severity': 'high',
+                            'description': f"Action '{action}' is both Prohibited and Obligatory"
+                        })
+
+            # Conflict: Duplicate conditions with different modalities
+            condition_map = {}
+            for rule in action_rule_list:
+                # Normalize condition for comparison
+                cond_normalized = rule.condition.lower().strip()
+                if cond_normalized not in condition_map:
+                    condition_map[cond_normalized] = []
+                condition_map[cond_normalized].append(rule)
+
+            for cond, cond_rules in condition_map.items():
+                if len(cond_rules) > 1:
+                    unique_modalities = set(r.modality for r in cond_rules)
+                    if len(unique_modalities) > 1:
+                        conflicts.append({
+                            'type': 'duplicate_condition_different_modality',
+                            'action': action,
+                            'condition': cond,
+                            'modalities': list(unique_modalities),
+                            'rules': [
+                                {'modality': r.modality, 'confidence': r.confidence, 'source': r.source}
+                                for r in cond_rules
+                            ],
+                            'severity': 'medium',
+                            'description': f"Same condition with different modalities: {unique_modalities}"
+                        })
+
+        return conflicts
+
+    def integrate_into_rule_pool(self, rules: List[DeonticRule], rule_pool) -> int:
+        """
+        Integrate extracted rules into the system's RulePool.
+        Returns number of rules successfully integrated.
+
+        Args:
+            rules: List of DeonticRules to integrate
+            rule_pool: RulePool instance to add rules to
+
+        Returns:
+            Number of rules successfully added
+        """
+
+        integrated_count = 0
+
+        for rule in rules:
+            try:
+                # Convert deontic rule to RulePool format
+                # Prohibited → add to precondition check
+                # Obligatory → add validation requirement
+
+                if rule.modality == 'Prohibited':
+                    # Add as a blocking precondition
+                    predicate_name = f"Not{rule.action}When"
+                    predicate_def = f"{predicate_name}({rule.condition})"
+
+                    # Register with rule pool
+                    rule_pool.add_precondition(
+                        operator=rule.action,
+                        predicate=predicate_name,
+                        condition=rule.condition,
+                        source='kg_builder_extracted'
+                    )
+
+                    print(f"✓ Integrated: {rule.action} prohibited when {rule.condition[:50]}...")
+                    integrated_count += 1
+
+                elif rule.modality == 'Obligatory':
+                    # Add as required validation
+                    predicate_name = f"Require{rule.action.replace(' ', '')}"
+
+                    rule_pool.add_precondition(
+                        operator=rule.action,
+                        predicate=predicate_name,
+                        condition=rule.condition,
+                        source='kg_builder_extracted'
+                    )
+
+                    print(f"✓ Integrated: {rule.action} requires {rule.condition[:50]}...")
+                    integrated_count += 1
+
+            except Exception as e:
+                print(f"⚠️  Failed to integrate rule for {rule.action}: {e}")
+
+        return integrated_count

@@ -40,5 +40,7 @@ Results/
 # specific .py files
 test_canary.py
 test_kg_builder.py
+test_kg_builder_advanced.py
+test_kg_integration_real.py
 
 experiments/run_one_llm.py
