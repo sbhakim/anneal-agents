@@ -39,5 +39,6 @@ Results/
 
 # specific .py files
 test_canary.py
+test_kg_builder.py
 
 experiments/run_one_llm.py

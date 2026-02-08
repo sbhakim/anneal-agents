@@ -183,8 +183,8 @@ scenario:
   # -------------------------------------------------------------------------
   # OPTION 2: E-commerce (Cross-domain validation)
   # -------------------------------------------------------------------------
-  name: "ecommerce"
-  difficulty: "easy"
+  # name: "ecommerce"
+  # difficulty: "easy"
   # E-commerce scenario optimized for demonstrating cross-domain adaptation
   # Focuses on patchable failures (payment validation, tool drift)
   # Reduced constraint-heavy failures for better patch success rate
@@ -192,12 +192,12 @@ scenario:
   # -------------------------------------------------------------------------
   # OPTION 3: Stochastic Travel (Metacognition stress test)
   # -------------------------------------------------------------------------
-  # name: "travel_stochastic"
-  # difficulty: "hard"
-  # transient_failure_rate: 0.15
-  # uncertainty_injection_rate: 0.20
-  # policy_shift_rate: 0.10
-  # resource_contention_rate: 0.05
+  name: "travel_stochastic"
+  difficulty: "hard"
+  transient_failure_rate: 0.15
+  uncertainty_injection_rate: 0.20
+  policy_shift_rate: 0.10
+  resource_contention_rate: 0.05
 
   # -------------------------------------------------------------------------
   # Common Scenario Parameters

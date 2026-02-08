@@ -116,7 +116,14 @@ Output JSON array of rules:
                 max_tokens=1000,
             )
 
-            rules_json = self._parse_json_response(response)
+            # Extract text from GenResult dictionary
+            response_text = response.get('text', '') if isinstance(response, dict) else str(response)
+
+            if not response_text:
+                print(f"KG_BUILDER: Empty response from LLM")
+                return []
+
+            rules_json = self._parse_json_response(response_text)
             return [DeonticRule(**rule, source='llm_assisted') for rule in rules_json]
 
         except Exception as e:
