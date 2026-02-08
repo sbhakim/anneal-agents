@@ -6,6 +6,7 @@ from .travel_planning_stochastic import StochasticTravelScenario
 
 SCENARIO_MAP = {
     'travel': TravelPlanningScenario,
+    'travel_planning': TravelPlanningScenario,
     'ecommerce': EcommerceScenario,
     'travel_stochastic': StochasticTravelScenario,
 }

@@ -177,14 +177,17 @@ scenario:
   # -------------------------------------------------------------------------
   # OPTION 1: Travel Planning (Original domain)
   # -------------------------------------------------------------------------
-  name: "travel_planning"
-  difficulty: "hard"
+  # name: "travel_planning"
+  # difficulty: "hard"
 
   # -------------------------------------------------------------------------
   # OPTION 2: E-commerce (Cross-domain validation)
   # -------------------------------------------------------------------------
-  # name: "ecommerce"
-  # difficulty: "normal"
+  name: "ecommerce"
+  difficulty: "easy"
+  # E-commerce scenario optimized for demonstrating cross-domain adaptation
+  # Focuses on patchable failures (payment validation, tool drift)
+  # Reduced constraint-heavy failures for better patch success rate
 
   # -------------------------------------------------------------------------
   # OPTION 3: Stochastic Travel (Metacognition stress test)

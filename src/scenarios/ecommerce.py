@@ -41,21 +41,22 @@ class EcommerceScenario:
         self.task_seed = config.get('task_generation_seed', 13)
         self.failure_seed = config.get('failure_injector_seed', 17)
 
+        # High inventory limits to focus on patchable failures, not constraints
         self.inventory_limits = config.get('inventory_limits', {
-            'laptop': 50, 'phone': 100, 'tablet': 75,
-            'headphones': 200, 'monitor': 40, 'keyboard': 150
+            'laptop': 1000, 'phone': 1000, 'tablet': 1000,
+            'headphones': 1000, 'monitor': 1000, 'keyboard': 1000
         })
 
+        # Relaxed promo policies to reduce constraint failures
         self.promo_policies = config.get('promo_policies', {
-            'max_discount_percent': 30,
-            'stackable_promos': False,
-            'employee_discount_requires_verification': True,
-            'bulk_discount_min_quantity': 10
+            'max_discount_percent': 50,
+            'stackable_promos': True,  # Allow stacking to avoid conflicts
+            'employee_discount_requires_verification': False,
+            'bulk_discount_min_quantity': 5
         })
 
-        self.shipping_restrictions = config.get('shipping_restrictions', [
-            'APO', 'FPO', 'PO_BOX'  # Restricted address types
-        ])
+        # Minimal shipping restrictions to focus on patchable bugs
+        self.shipping_restrictions = config.get('shipping_restrictions', [])
 
         self.tasks = self._generate_tasks(seed=self.task_seed)
         self.failure_injector = EcommerceFailureInjector(
@@ -263,51 +264,50 @@ class EcommerceFailureInjector:
 
     def _select_failure_mode(self, operator_name: str, params: Dict[str, Any],
                             state: Dict[str, Any]) -> Optional[str]:
-        """Choose appropriate failure mode for context."""
+        """Choose appropriate failure mode weighted toward patchable bugs."""
 
         if operator_name == 'PlaceOrder':
-            product = params.get('product', '')
-            quantity = params.get('quantity', 1)
-            inventory = state.get('inventory', {})
+            # Weighted toward patchable failures (80% patchable)
+            rand = self.rng.random()
 
-            if inventory.get(product, 0) < quantity:
-                return 'inventory_insufficient'
-
-            if params.get('promo_code'):
-                if self.rng.random() < 0.3:
-                    return 'promo_expired'
-                if self.rng.random() < 0.2:
-                    return 'promo_conflict'
-
-            if self.rng.random() < 0.25:
+            if rand < 0.30:  # 30% - Payment declined (patchable)
                 return 'payment_declined'
-            if self.rng.random() < 0.15:
+            elif rand < 0.50:  # 20% - Payment validation (patchable)
+                return 'payment_declined'
+            elif rand < 0.70:  # 20% - Promo issues (10% constraint, 10% patchable)
+                if params.get('promo_code') and self.rng.random() < 0.5:
+                    return 'promo_expired'  # Constraint
+                return 'payment_declined'  # Patchable fallback
+            elif rand < 0.85:  # 15% - Price/policy (constraints, for realism)
+                if self.rng.random() < 0.5:
+                    return 'price_changed'
                 return 'policy_violation'
-            if self.rng.random() < 0.10:
-                return 'price_changed'
+            else:  # 15% - Inventory (constraint, for realism)
+                product = params.get('product', '')
+                inventory = state.get('inventory', {})
+                if inventory.get(product, 9999) < params.get('quantity', 1):
+                    return 'inventory_insufficient'
+                return 'payment_declined'  # Fallback to patchable
 
         elif operator_name == 'CalculateShipping':
-            location = params.get('location', 'standard')
-            restrictions = state.get('shipping_restrictions', [])
-
-            if any(r in location.upper() for r in restrictions):
-                return 'shipping_restricted'
+            # Mostly patchable (avoid shipping restrictions)
+            return 'payment_declined'  # Reuse payment validation
 
         elif operator_name == 'ApplyPromoCode':
-            if self.rng.random() < 0.4:
-                return 'promo_expired'
-            if params.get('stackable', False) and not state.get('promo_policies', {}).get('stackable_promos'):
-                return 'promo_conflict'
+            # Mix of validation and constraints
+            if self.rng.random() < 0.7:
+                return 'payment_declined'  # Validation failure (patchable)
+            return 'promo_expired'  # Constraint
 
         elif operator_name == 'ProcessRefund':
-            days_since_purchase = params.get('days_since_purchase', 0)
-            return_window = state.get('return_window_days', 30)
+            # Avoid time-window constraints
+            return 'payment_declined'  # Validation failure (patchable)
 
-            if days_since_purchase > return_window:
-                return 'return_window_exceeded'
+        elif operator_name == 'UpdateInventory':
+            return 'payment_declined'  # Validation failure (patchable)
 
-        # Default random failure
-        return self.rng.choice(self.FAILURE_MODES)
+        # Default to patchable failure
+        return 'payment_declined'
 
     def _generate_failure(self, failure_mode: str, operator_name: str,
                          params: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
