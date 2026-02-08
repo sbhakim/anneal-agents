@@ -42,5 +42,11 @@ test_canary.py
 test_kg_builder.py
 test_kg_builder_advanced.py
 test_kg_integration_real.py
+generate_demo_traces.py
+run_failure_analysis.py
+
+# Demo and test data
+Results/demo_traces.json
+Results/failure_modes/
 
 experiments/run_one_llm.py

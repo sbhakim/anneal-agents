@@ -177,8 +177,8 @@ scenario:
   # -------------------------------------------------------------------------
   # OPTION 1: Travel Planning (Original domain)
   # -------------------------------------------------------------------------
-  # name: "travel_planning"
-  # difficulty: "hard"
+  name: "travel_planning"
+  difficulty: "hard"
 
   # -------------------------------------------------------------------------
   # OPTION 2: E-commerce (Cross-domain validation)
@@ -192,12 +192,12 @@ scenario:
   # -------------------------------------------------------------------------
   # OPTION 3: Stochastic Travel (Metacognition stress test)
   # -------------------------------------------------------------------------
-  name: "travel_stochastic"
-  difficulty: "hard"
-  transient_failure_rate: 0.15
-  uncertainty_injection_rate: 0.20
-  policy_shift_rate: 0.10
-  resource_contention_rate: 0.05
+  # name: "travel_stochastic"
+  # difficulty: "hard"
+  # transient_failure_rate: 0.15
+  # uncertainty_injection_rate: 0.20
+  # policy_shift_rate: 0.10
+  # resource_contention_rate: 0.05
 
   # -------------------------------------------------------------------------
   # Common Scenario Parameters
