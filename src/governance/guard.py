@@ -150,42 +150,65 @@ class Guard:
 
     def _maybe_hydrate_kgs_from_state(self, state: Any) -> None:
         """
-        MINIMUM FIX:
-        ValueKG was often initialized with empty blackout_dates because governance config
-        doesn't include domain state. If runtime state contains blackout_dates and policy,
-        hydrate (re-init) ValueKG once per distinct state fingerprint.
+        Rehydrate ValueKG from runtime state when scenario config alone is too weak.
+        Travel uses blackout/payment policy state; ecommerce uses live shipping/promo/
+        refund/auth policy state so governance can reason about the actual environment.
         """
         if not isinstance(state, dict):
             return
 
-        blackout = state.get("blackout_dates")
-        policy = state.get("corporate_card_policy", "blocked_on_blackout_dates")
         domain = getattr(self, "value_kg", None)
         domain = getattr(domain, "domain", None) or "travel"
 
-        if domain != "travel":
+        if domain == "travel":
+            blackout = state.get("blackout_dates")
+            policy = state.get("corporate_card_policy", "blocked_on_blackout_dates")
+            if not isinstance(blackout, list) or not blackout:
+                return
+            fp = (
+                tuple(sorted(str(x) for x in blackout)),
+                str(policy),
+            )
+            cfg = {
+                "domain": "travel",
+                "blackout_dates": list(blackout),
+                "corporate_card_policy": policy,
+            }
+        elif domain == "ecommerce":
+            shipping = tuple(sorted(str(x) for x in (state.get("shipping_restrictions") or [])))
+            expired = tuple(sorted(str(x) for x in (state.get("expired_promos") or [])))
+            promo_policies = state.get("promo_policies") if isinstance(state.get("promo_policies"), dict) else {}
+            required_auth_mode = str(state.get("required_auth_mode") or state.get("auth_schema_version") or "legacy_auth_token")
+            allowed_auth_modes = [str(x) for x in (state.get("allowed_auth_modes") or [required_auth_mode])]
+            return_window = int(state.get("return_window_days", 30) or 30)
+            fp = (
+                shipping,
+                tuple(sorted((str(k), str(v)) for k, v in promo_policies.items())),
+                str(return_window),
+                expired,
+                required_auth_mode,
+                tuple(sorted(allowed_auth_modes)),
+            )
+            cfg = {
+                "domain": "ecommerce",
+                "shipping_restrictions": list(shipping),
+                "promo_policies": dict(promo_policies),
+                "return_window_days": return_window,
+                "expired_promos": list(expired),
+                "required_auth_mode": required_auth_mode,
+                "allowed_auth_modes": allowed_auth_modes,
+            }
+        else:
             return
-        if not isinstance(blackout, list) or not blackout:
-            return
-
-        # Create a stable fingerprint from blackout dates + policy
-        blackout_fp = tuple(sorted(str(x) for x in blackout))
-        fp = (blackout_fp, str(policy))
 
         if self._kg_state_fingerprint == fp:
             return
 
-        # Re-init ValueKG with state-derived config (safe, minimal, avoids empty defaults)
         try:
             from ..knowledge.value_kg import ValueKG
-            self.value_kg = ValueKG({
-                "domain": "travel",
-                "blackout_dates": list(blackout),
-                "corporate_card_policy": policy,
-            })
+            self.value_kg = ValueKG(cfg)
             self._kg_state_fingerprint = fp
         except Exception:
-            # Leave existing ValueKG as-is on error
             pass
 
     def _is_low_risk_tool_schema_drift(self, patch: Any) -> bool:
@@ -196,16 +219,31 @@ class Guard:
         details = str(_get(patch, "details", "") or "")
         d = details.lower()
 
-        # Endpoint/version drift patterns (keep narrow).
-        has_endpoint_drift = ("/v1/" in d and "/v2/" in d) or ("v1/book" in d and "v2/book" in d) or ("deprecated" in d)
+        # Endpoint/version drift patterns.
+        # Extended to cover natural-language LLM patch descriptions
+        # (e.g. "Switch endpoint to new version", "use v2", "old version deprecated")
+        # in addition to the original path-style patterns (/v1/ → /v2/).
+        has_endpoint_drift = (
+            ("/v1/" in d and "/v2/" in d)
+            or ("v1/book" in d and "v2/book" in d)
+            or ("deprecated" in d)
+            or ("v2" in d)
+            or ("endpoint" in d and "version" in d)
+            or ("new version" in d)
+            or ("switch endpoint" in d)
+            or ("old version" in d)
+        )
 
         if not has_endpoint_drift:
             return False
 
         # Escalate if this touches sensitive surfaces.
+        # Note: "payment" and "card" removed — field *renames* like payment_method→payment_token
+        # are legitimate API schema drift, already guarded by _check_dangerous_patterns()
+        # (which catches "remove payment", "bypass auth", etc. separately).
         sensitive = (
             "auth", "oauth", "token", "key", "secret", "credential",
-            "payment", "card", "security", "privacy", "pii", "encrypt",
+            "security", "privacy", "pii", "encrypt",
             "signature", "jwt", "mfa", "permission",
         )
         if any(s in d for s in sensitive):
@@ -475,6 +513,12 @@ class Guard:
             if match:
                 params['payment'] = match.group(1)
 
+        if any(tok in details_l for tok in ['auth', 'token', 'session', 'bearer', 'oauth', 'jwt']):
+            if 'signed_session_token' in details_l or 'session token' in details_l:
+                params['auth_mode'] = 'signed_session_token'
+            elif 'legacy_auth_token' in details_l or 'bearer token' in details_l or 'auth_token' in details_l:
+                params['auth_mode'] = 'legacy_auth_token'
+
         if 'dates' in details_l or 'date' in details_l:
             if state:
                 params['dates'] = state.get('travel_dates', '')
@@ -698,6 +742,12 @@ class Guard:
         if action == 'UPDATE_TOOL_SCHEMA':
             if self._is_low_risk_tool_schema_drift(patch):
                 return False, "Tool schema drift update (low risk)"
+
+            details_l = str(details or '').lower()
+            if any(tok in details_l for tok in ['auth', 'token', 'session', 'bearer', 'oauth', 'jwt']):
+                return True, 'Authentication schema changes affect trust and authorization paths'
+            if any(tok in details_l for tok in ['payment', 'refund', 'shipping', 'policy']):
+                return True, 'Business-critical schema changes affect financial or policy enforcement paths'
             return True, "Tool schema changes affect multiple operators"
 
         if causal_kg and hasattr(causal_kg, 'get_intervention_effects'):

@@ -156,7 +156,7 @@ class ExperiencePool:
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         with open(filepath, "w") as f:
-            json.dump(self.traces, f, indent=2)
+            json.dump(self.traces, f, indent=2, default=str)
 
         print(f"EXPERIENCE_POOL: Saved {len(self.traces)} traces to {filepath}")
 

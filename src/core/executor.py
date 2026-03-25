@@ -124,6 +124,17 @@ class Executor:
         if payment is None:
             return
 
+        # If a policy shift locked payment state, skip the entire sync.
+        # Only explicit repair (_repair_clear_invalid_marker) can unlock.
+        if state.get("payment_shift_locked"):
+            return
+
+        # Cross-populate both aliases so required_params checks pass
+        if "payment" not in params or params["payment"] is None:
+            params["payment"] = payment
+        if "payment_method" not in params or params["payment_method"] is None:
+            params["payment_method"] = payment
+
         state.set("payment_method", payment)
 
         p = str(payment)
@@ -156,6 +167,11 @@ class Executor:
                 if "/v2/book" in s or "v2/book" in s:
                     state.set("booking_endpoint", "/v2/book")
                     params.setdefault("endpoint", "/v2/book")
+
+            if "signed_session_token" in s or "session token" in s:
+                state.set("required_auth_mode", "signed_session_token")
+                state.set("auth_schema_version", "signed_session_token")
+                params.setdefault("auth_mode", "signed_session_token")
         except Exception:
             return
 
@@ -163,16 +179,28 @@ class Executor:
     # Verify→Repair (h=1–2) templates
     # ---------------------------
     def _repair_clear_invalid_marker(self, params: Dict[str, Any], state: SymbolicState) -> bool:
-        p = params.get("payment")
-        if not p or not isinstance(p, str) or "(invalid)" not in p.lower():
+        # Check both params and state for invalid marker
+        p = params.get("payment") or ""
+        sp = str(state.get("payment_method") or "")
+        source = None
+        if isinstance(p, str) and "(invalid)" in p.lower():
+            source = p
+        elif "(invalid)" in sp.lower():
+            source = sp
+        elif state.get("payment_shift_locked") and state.get("payment_invalid"):
+            # Policy-shift locked: payment was tainted at state level
+            source = sp if sp else p
+        if not source:
             return False
-        cleaned = p.replace("(invalid)", "").replace("(INVALID)", "").strip()
-        if cleaned == p:
-            return False
+        cleaned = source.replace("(invalid)", "").replace("(INVALID)", "").strip()
         params["payment"] = cleaned
         state.set("payment_method", cleaned)
         state.set("payment_invalid", False)
         state.set("payment_valid", True)
+        # Clear the policy-shift lock so _sync_payment_from_params
+        # resumes normal behaviour after explicit repair.
+        if state.get("payment_shift_locked"):
+            state.set("payment_shift_locked", False)
         return True
 
     def _repair_switch_to_personal_payment(self, params: Dict[str, Any], state: SymbolicState) -> bool:
@@ -229,11 +257,91 @@ class Executor:
                 params["payment"] = pm
                 changed = True
 
+        # payment_method alias: fill from params["payment"] or state
+        if params.get("payment_method") in (None, "", "None"):
+            pm = params.get("payment") or state.get("payment_method")
+            if pm not in (None, "", "None"):
+                params["payment_method"] = pm
+                changed = True
+
         return changed
 
     def _repair_backoff_and_refresh(self, params: Dict[str, Any], state: SymbolicState) -> bool:
         time.sleep(float(self.config.get("repair_backoff_s", 0.03)))
         self._apply_world_defaults(state)
+        return True
+
+    def _repair_restore_resource_availability(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        """Restore transient resource unavailability (simulates retry after outage)."""
+        changed = False
+        for key in ("hotel_status", "flight_status"):
+            if state.get(key) == "unavailable":
+                state.set(key, "available")
+                changed = True
+        return changed
+
+    def _repair_add_approval_code(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        if params.get("approval_code"):
+            return False
+        requester = str(params.get("requester", "manager.taylor") or "manager.taylor")
+        suffix = requester.split(".")[-1][:6].upper() or "AUTO"
+        params["approval_code"] = f"APR-{suffix}"
+        state.set("approval_required", False)
+        return True
+
+    def _repair_book_change_window(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        approved_slots = list(state.get("change_windows", []) or [])
+        slot = approved_slots[0] if approved_slots else "Saturday 00:00-06:00"
+        params["change_window_slot"] = slot
+        state.set("current_time_slot", slot)
+        state.set("change_window_required", False)
+        return True
+
+    def _repair_complete_mfa(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        user = params.get("user")
+        params["mfa_verified"] = True
+        verified_users = set(state.get("mfa_verified_users", set()) or set())
+        if user:
+            verified_users.add(user)
+            state.set("mfa_verified_users", verified_users)
+        state.set("mfa_required", False)
+        return True
+
+    def _repair_downgrade_ticket_priority(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        if str(params.get("priority", "") or "").lower() != "critical":
+            return False
+        params["priority"] = "high"
+        params["requester_role"] = "standard_user"
+        return True
+
+    def _repair_switch_promo(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        """Switch to a valid promo or drop the promo_code param entirely."""
+        current = params.get("promo_code")
+        active = list(state.get("active_promos", []) or [])
+        expired = list(state.get("expired_promos", []) or [])
+        # Try switching to a valid promo that isn't the current one
+        for p in active:
+            if p != current:
+                params["promo_code"] = p
+                state.set("promo_conflict", False)
+                return True
+        # No valid promo available — drop promo_code so the operator skips promo logic
+        params.pop("promo_code", None)
+        state.set("promo_conflict", False)
+        return True
+
+    def _repair_clear_policy_violation(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        """Clear transient policy violation flag so the order can proceed."""
+        if not state.get("policy_violation"):
+            return False
+        state.set("policy_violation", False)
+        return True
+
+    def _repair_accept_price_change(self, params: Dict[str, Any], state: SymbolicState) -> bool:
+        """Accept the new price and clear the price_changed flag."""
+        if not state.get("price_changed"):
+            return False
+        state.set("price_changed", False)
         return True
 
     def _select_repair_action(
@@ -246,10 +354,40 @@ class Executor:
         v = (violated or "").lower()
         msg = str((injected_error_info or {}).get("message", "") or "").lower()
 
+        # Missing/empty required params should attempt regrounding from state first.
+        # This prevents false-positive blocks when the planner uses a param alias
+        # (e.g. "payment" instead of "payment_method").
+        if "missingrequiredparam" in v or "emptyrequiredparam" in v:
+            return "REGROUND_PARAMS_FROM_STATE", lambda: self._repair_reground_params_from_state(params, state)
+
         if "payment" in v or "card" in v or "blocked" in v:
             if self._repair_clear_invalid_marker(params, state):
                 return "CLEAR_INVALID_PAYMENT_MARKER", lambda: True
             return "SWITCH_TO_PERSONAL_PAYMENT", lambda: self._repair_switch_to_personal_payment(params, state)
+
+        if "approval" in v or "approval code" in msg or "iam-401" in msg:
+            return "ADD_APPROVAL_CODE", lambda: self._repair_add_approval_code(params, state)
+
+        if "change_window" in v or "maintenance window" in msg or "chg-301" in msg:
+            return "BOOK_CHANGE_WINDOW", lambda: self._repair_book_change_window(params, state)
+
+        if "mfa" in v or "sec-202" in msg:
+            return "COMPLETE_MFA", lambda: self._repair_complete_mfa(params, state)
+
+        if "priority" in v or "access denied" in msg or "rbac-101" in msg:
+            return "DOWNGRADE_TICKET_PRIORITY", lambda: self._repair_downgrade_ticket_priority(params, state)
+
+        if "promo" in v or "promo" in msg or "promocodeexpired" in v or "promoconflict" in v:
+            return "SWITCH_PROMO", lambda: self._repair_switch_promo(params, state)
+
+        if "policy_violation" in v or "no_policy_violation" in v:
+            return "CLEAR_POLICY_VIOLATION", lambda: self._repair_clear_policy_violation(params, state)
+
+        if "price_change" in v or "no_price_change" in v or "pricechanged" in v:
+            return "ACCEPT_PRICE_CHANGE", lambda: self._repair_accept_price_change(params, state)
+
+        if "available" in v or "hotel_available" in v or "flight_available" in v:
+            return "RESTORE_RESOURCE_AVAILABILITY", lambda: self._repair_restore_resource_availability(params, state)
 
         if "network" in v or "timeout" in msg:
             return "RETRY_BACKOFF_REFRESH", lambda: self._repair_backoff_and_refresh(params, state)
@@ -258,6 +396,62 @@ class Executor:
             return "REGROUND_PARAMS_FROM_STATE", lambda: self._repair_reground_params_from_state(params, state)
 
         return "RETRY_BACKOFF_REFRESH", lambda: self._repair_backoff_and_refresh(params, state)
+
+    # ---------------------------
+    # S2 deliberation: preemptive full-plan verification
+    # ---------------------------
+    def _s2_preemptive_verification(
+            self, plan: List[Dict[str, Any]], state: SymbolicState,
+            trace: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        S2 (slow path) deliberation: verify ALL operators' preconditions before
+        execution starts and preemptively repair state conflicts.
+
+        This catches compound violations from policy shifts that step-by-step
+        (S1) verification would only discover at execution time—after earlier
+        steps have already committed state.  Returns a list of repair names
+        applied during the look-ahead pass.
+        """
+        applied: List[str] = []
+        base_hops = int(self.config.get("repair_hops", 2))
+        max_hops = base_hops * 2  # S2 gets double the repair budget
+
+        for step in plan:
+            op = step.get("operator")
+            params = dict(step.get("params", {}) or {})
+            if not op:
+                continue
+
+            ok, violated = self._verify_preconditions(op, params, state)
+            if ok:
+                continue
+
+            # Attempt up to max_hops repairs on *state* (not params—params are
+            # per-step copies; state is shared and persists into execution).
+            for _ in range(max_hops):
+                sel = self._select_repair_action(violated, None, params, state)
+                if not sel:
+                    break
+                repair_name, repair_fn = sel
+                try:
+                    if not bool(repair_fn()):
+                        break
+                except Exception:
+                    break
+                applied.append(f"{op.name}:{repair_name}")
+                self._sync_payment_from_params(params, state)
+                ok, violated = self._verify_preconditions(op, params, state)
+                if ok:
+                    break
+
+            if not ok:
+                print(f"EXECUTOR: S2 look-ahead: {op.name} still has unresolved "
+                      f"violation ({violated}) after preemptive repair.")
+
+        if applied:
+            print(f"EXECUTOR: S2 preemptive repairs applied: {applied}")
+        return applied
 
     # ---------------------------
     # Failure injector compatibility + patchable constraint injection
@@ -317,6 +511,24 @@ class Executor:
 
         if "network" in msg.lower() and ("unavailable" in msg.lower() or "down" in msg.lower()):
             state.set("network_available", False)
+
+        if "approval code" in msg.lower() or policy_ref.strip() == "IAM-401":
+            state.set("approval_required", True)
+            params.pop("approval_code", None)
+
+        if "maintenance window" in msg.lower() or policy_ref.strip() == "CHG-301":
+            state.set("change_window_required", True)
+            state.set("current_time_slot", "weekday_business_hours")
+            params["environment"] = "prod"
+            params.pop("change_window_slot", None)
+
+        if "mfa" in msg.lower() or policy_ref.strip() == "SEC-202":
+            state.set("mfa_required", True)
+            params["mfa_verified"] = False
+
+        if "access denied" in msg.lower() or policy_ref.strip() == "RBAC-101":
+            params["priority"] = "critical"
+            params["requester_role"] = "standard_user"
 
         err = str(error_info.get("error") or error_info.get("error_type") or "").lower()
         if "insufficientinventory" in err:
@@ -478,14 +690,27 @@ class Executor:
 
         if pathway == "S2":
             print("EXECUTOR: 🤔 S2 (Slow Path) - Performing extra deliberation.")
-            time.sleep(0.1)
-            trace.append({"event_type": "deliberation", "detail": "Simulated deep verification (S2 path)"})
+            trace.append({"event_type": "deliberation", "detail": "S2 deliberation: preemptive look-ahead verification"})
+            # S2 deliberation: preemptively verify ALL operators and repair state conflicts
+            # before execution starts.  This catches compound violations from policy shifts
+            # that step-by-step (S1) verification would discover too late.
+            preemptive_repairs = self._s2_preemptive_verification(plan, state, trace)
+            if preemptive_repairs:
+                trace.append({"event_type": "s2_preemptive_repairs", "repairs": preemptive_repairs})
         elif pathway == "VERIFY_S1":
             print("EXECUTOR: ✓ VERIFY→S1 - Proceeding with standard verified execution.")
         else:
             print("EXECUTOR: ⚡ S1 (Fast Path) - Proceeding with standard execution.")
 
-        max_repairs = int(self.config.get("repair_hops", 2))
+        base_max_repairs = int(self.config.get("repair_hops", 2))
+        # S2 pathway gets extended repair budget for compound stochastic failures.
+        # VERIFY_S1 gets a modest increase.  S1 uses the base budget.
+        if pathway == "S2":
+            max_repairs = base_max_repairs * 2
+        elif pathway == "VERIFY_S1":
+            max_repairs = base_max_repairs + 1
+        else:
+            max_repairs = base_max_repairs
         enable_repair = bool(self.config.get("enable_repair", True))
 
         for step_idx, step in enumerate(plan):

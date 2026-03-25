@@ -64,6 +64,22 @@ class FailureClassifier:
             (r'hotel.*no.*vacancy', 'capacity_limit'),
         ]
 
+        # ITSM domain constraint patterns
+        # These are hard business rules that FDKA must NOT attempt to patch.
+        # Patchable ITSM failures (approval_required, change_window, mfa) are intentionally
+        # absent here so they flow through to FDKA.
+        self.itsm_constraints = [
+            # Priority escalation: CreateTicket:critical denied by policy — hard constraint
+            (r'priority.*escalation.*denied|cannot.*escalate.*priority', 'priority_escalation'),
+            (r'critical.*ticket.*requires.*director', 'priority_escalation'),
+            # Budget/capacity hard limits
+            (r'budget.*exhausted|no.*budget.*remaining', 'budget_limit'),
+            (r'license.*capacity.*reached|seat.*limit.*exceeded', 'license_capacity'),
+            # Regulatory/compliance freezes
+            (r'change.*freeze.*active|deployment.*frozen', 'change_freeze'),
+            (r'compliance.*hold|regulatory.*block', 'compliance_hold'),
+        ]
+
         print(f"CLASSIFIER: Initialized for domain='{domain}'")
 
     def is_patchable(self, trace: List[Dict[str, Any]], instruction: str = "") -> Tuple[bool, Optional[str]]:
@@ -110,8 +126,12 @@ class FailureClassifier:
             return self.ecommerce_constraints
         elif self.domain == 'travel' or self.domain == 'travel_planning':
             return self.travel_constraints
+        elif self.domain == 'itsm':
+            return self.itsm_constraints
         else:
-            return []  # Unknown domain - no constraints defined
+            # Unknown domain: return empty — all failures treated as patchable.
+            # Add domain-specific patterns above when a new scenario is introduced.
+            return []
 
     def _extract_error_info(self, trace: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Extract error information from trace."""

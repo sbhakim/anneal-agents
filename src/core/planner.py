@@ -36,7 +36,7 @@ class Planner:
         instruction_lower = instruction.lower()
 
         wants_hotel = any(k in instruction_lower for k in ("hotel", "accommodation", "stay", "room"))
-        wants_flight = any(k in instruction_lower for k in ("flight", "fly", "airfare", "plane", "ticket"))
+        wants_flight = any(k in instruction_lower for k in ("flight", "fly", "airfare", "plane"))
         wants_cheapest = any(k in instruction_lower for k in ("cheapest", "lowest cost", "budget")) and any(
             k in instruction_lower for k in ("travel", "option", "itinerary")
         )
@@ -45,12 +45,28 @@ class Planner:
             k in instruction_lower
             for k in ("order", "promo", "discount", "refund", "return", "inventory", "stock", "ship", "shipping")
         )
+        is_itsm = any(
+            k in instruction_lower
+            for k in (
+                "provision", "grant access", "privileges", "deploy", "patch", "hotfix",
+                "configuration update", "reset credentials", "reset password", "unlock",
+                "credential rotation", "ticket", "incident", "severity", "readonly access",
+                "contributor access", "set up", "grant admin"
+            )
+        )
 
         if wants_cheapest and not (wants_hotel or wants_flight):
             wants_flight = True
 
         if is_ecommerce and not (wants_hotel or wants_flight):
             plan = self._compile_ecommerce(instruction, state)
+            if plan:
+                operator_names = [p["operator"].name for p in plan]
+                print(f"PLANNER: Plan created with {len(plan)} step(s) -> {operator_names}")
+                return plan
+
+        if is_itsm and not (wants_hotel or wants_flight):
+            plan = self._compile_itsm(instruction, state)
             if plan:
                 operator_names = [p["operator"].name for p in plan]
                 print(f"PLANNER: Plan created with {len(plan)} step(s) -> {operator_names}")
@@ -127,11 +143,16 @@ class Planner:
         instruction_lower = instruction.lower()
         plan: List[Dict[str, Any]] = []
 
-        wants_order = any(k in instruction_lower for k in ("place an order", "place order", "order", "purchase", "buy"))
-        wants_promo = any(k in instruction_lower for k in ("promo", "discount"))
-        wants_shipping = any(k in instruction_lower for k in ("ship", "shipping"))
-        wants_refund = any(k in instruction_lower for k in ("refund", "return"))
-        wants_inventory = any(k in instruction_lower for k in ("inventory", "stock", "restock"))
+        wants_order = bool(
+            re.search(
+                r"\b(place an order|place order|order for|process order|buy|purchase|validate order)\b",
+                instruction_lower,
+            )
+        )
+        wants_promo = bool(re.search(r"\b(promo|discount)\b", instruction_lower))
+        wants_shipping = bool(re.search(r"\b(ship|shipping)\b", instruction_lower))
+        wants_refund = bool(re.search(r"\b(refund|return)\b", instruction_lower))
+        wants_inventory = bool(re.search(r"\b(inventory|stock|restock)\b", instruction_lower))
 
         steps = [
             ("PlaceOrder", wants_order),
@@ -157,6 +178,60 @@ class Planner:
 
         if not plan:
             print("PLANNER: ❌ No e-commerce plan generated.")
+
+        return plan
+
+    def _compile_itsm(self, instruction: str, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build a minimal ITSM plan from instruction keywords."""
+        il = instruction.lower()
+        plan: List[Dict[str, Any]] = []
+
+        wants_provision = any(
+            phrase in il for phrase in (
+                "provision ", "grant ", "readonly access", "contributor access",
+                "admin access", "admin privileges", "set up admin account", "set up "
+            )
+        )
+        wants_deploy = any(
+            phrase in il for phrase in (
+                "deploy ", "patch ", "hotfix", "roll out", "configuration update", "apply configuration"
+            )
+        )
+        wants_reset = any(
+            phrase in il for phrase in (
+                "reset credentials", "reset password", "unlock ", "credential rotation"
+            )
+        )
+        wants_ticket = bool(
+            re.search(r"\b(ticket|incident)\b", il)
+            or "severity ticket" in il
+            or "priority ticket" in il
+            or "critical-priority ticket" in il
+        )
+
+        steps = [
+            ("ProvisionAccess", wants_provision),
+            ("DeployPatch", wants_deploy),
+            ("ResetCredentials", wants_reset),
+            ("CreateTicket", wants_ticket),
+        ]
+
+        for op_name, enabled in steps:
+            if not enabled:
+                continue
+            op = self.rule_pool.get_operator(op_name)
+            if not op:
+                print(f"PLANNER: Warning - '{op_name}' operator not found in Rule Pool.")
+                continue
+            params, missing = self._ground_itsm_params(op_name, instruction, state)
+            step = {"operator": op, "params": params}
+            if missing:
+                step["meta"] = {"needs_regrounding": missing}
+            plan.append(step)
+            print(f"PLANNER: Added '{op_name}' to plan with params: {params}")
+
+        if not plan:
+            print("PLANNER: ❌ No ITSM plan generated.")
 
         return plan
 
@@ -360,6 +435,8 @@ class Planner:
                     methods = state.get("payment_methods", []) or []
                     pm = methods[0] if methods else None
                 payment_method = pm or "credit_card"
+            if quantity is None and product:
+                quantity = 1
             params.update({
                 "product": product,
                 "quantity": quantity,
@@ -449,25 +526,39 @@ class Planner:
 
     @staticmethod
     def _extract_shipping_location(instruction: str) -> Optional[str]:
-        match = re.search(r"\bto\s+([A-Za-z_]+)\b(?:\s+address)?", instruction, re.IGNORECASE)
+        match = re.search(
+            r"\bto\s+(standard|international|apo|fpo)\b(?:\s+address)?",
+            instruction,
+            re.IGNORECASE,
+        )
         if match:
             return match.group(1).upper()
         return None
 
     @staticmethod
     def _extract_payment_method(instruction: str) -> Optional[str]:
+        known_methods = ("credit_card", "debit_card", "paypal", "employee_account")
         match = re.search(r"payment method\s+([A-Za-z_]+)", instruction, re.IGNORECASE)
         if match:
-            return match.group(1).lower()
+            candidate = match.group(1).lower()
+            return candidate if candidate in known_methods else None
         match = re.search(r"using\s+([A-Za-z_]+)", instruction, re.IGNORECASE)
         if match:
-            return match.group(1).lower()
+            candidate = match.group(1).lower()
+            return candidate if candidate in known_methods else None
         return None
 
     @staticmethod
     def _extract_customer_type(instruction: str) -> Optional[str]:
-        for label in ("employee", "bulk", "premium", "standard"):
-            if label in instruction.lower():
+        lowered = instruction.lower()
+        patterns = {
+            "employee": r"\bemployee\b(?:\s+customer)?",
+            "bulk": r"\bbulk(?:_buyer|\s+buyer)?\b",
+            "premium": r"\bpremium(?:_member|\s+member)?\b",
+            "standard": r"\bstandard\s+customer\b",
+        }
+        for label, pattern in patterns.items():
+            if re.search(pattern, lowered):
                 return label
         return None
 
@@ -480,3 +571,198 @@ class Planner:
             except ValueError:
                 return None
         return None
+
+    # ------------------------------------------------------------------
+    # ITSM grounding helpers
+    # ------------------------------------------------------------------
+
+    def _ground_itsm_params(
+        self, operator_name: str, instruction: str, state: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], List[str]]:
+        params: Dict[str, Any] = {}
+        missing: List[str] = []
+
+        user = self._extract_itsm_user(instruction)
+        resource = self._extract_itsm_resource(instruction)
+        role = self._extract_itsm_role(instruction)
+        requester = self._extract_itsm_requester(instruction) or "manager.taylor"
+        patch_id = self._extract_itsm_patch_id(instruction)
+        system = self._extract_itsm_system(instruction)
+        environment = self._extract_itsm_environment(instruction)
+        method = self._extract_itsm_method(instruction)
+        priority = self._extract_itsm_priority(instruction)
+        category = self._extract_itsm_category(instruction)
+
+        if operator_name == "ProvisionAccess":
+            params.update({
+                "user": user,
+                "resource": resource,
+                "role": role or "readonly",
+                "requester": requester,
+            })
+            approval_code = self._extract_approval_code(instruction)
+            if approval_code:
+                params["approval_code"] = approval_code
+            for key in ("user", "resource", "role", "requester"):
+                if not params.get(key):
+                    missing.append(key)
+
+        elif operator_name == "DeployPatch":
+            params.update({
+                "system": system,
+                "patch_id": patch_id or "CFG-2024-0001",
+                "environment": environment or "staging",
+                "approved_by": requester,
+                "api_version": state.get("api_version", "v1"),
+            })
+            for key in ("system", "patch_id", "environment"):
+                if not params.get(key):
+                    missing.append(key)
+
+        elif operator_name == "ResetCredentials":
+            params.update({
+                "user": user,
+                "system": system,
+                "method": method or "email",
+            })
+            for key in ("user", "system", "method"):
+                if not params.get(key):
+                    missing.append(key)
+
+        elif operator_name == "CreateTicket":
+            description = instruction.strip()
+            params.update({
+                "category": category or "service-unavailable",
+                "priority": priority or "normal",
+                "description": description,
+                "requester_role": self._infer_requester_role(instruction),
+            })
+            for key in ("category", "priority", "description"):
+                if not params.get(key):
+                    missing.append(key)
+
+        return params, missing
+
+    @staticmethod
+    def _extract_itsm_user(instruction: str) -> Optional[str]:
+        patterns = [
+            r"\bfor\s+([a-z]+\.[a-z]+)\b",
+            r"\bnew hire\s+([a-z]+\.[a-z]+)\b",
+            r"\bto\s+([a-z]+\.[a-z]+)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, instruction, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_itsm_resource(instruction: str) -> Optional[str]:
+        patterns = [
+            r"\bprivileges\s+to\s+[a-z]+\.[a-z]+\s+for\s+([a-z0-9_-]+)\b",
+            r"\baccess\s+for\s+[a-z]+\.[a-z]+\s+in\s+[A-Za-z]+\s+to\s+([a-z0-9_-]+)\b",
+            r"\baccess\s+to\s+[a-z]+\.[a-z]+\s+for\s+([a-z0-9_-]+)\b",
+            r"\bto\s+the\s+([a-z0-9_-]+)\s+(?:resource|dashboard)\b",
+            r"\bto\s+([a-z0-9_-]+)\s+(?:resource|dashboard)\b",
+            r"\bfor\s+([a-z0-9_-]+)\s+as requested\b",
+            r"\bon\s+([a-z0-9_-]+)\s+\(approved by\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, instruction, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_itsm_role(instruction: str) -> Optional[str]:
+        for role in ("superuser", "privileged", "admin", "contributor", "readonly"):
+            if role in instruction.lower():
+                return role
+        return None
+
+    @staticmethod
+    def _extract_itsm_requester(instruction: str) -> Optional[str]:
+        match = re.search(r"\b(?:requested|approved)\s+by\s+([a-z]+\.[a-z]+)\b", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_approval_code(instruction: str) -> Optional[str]:
+        match = re.search(r"\bapproval(?:[_ -]?code)?\s*[:=]?\s*([A-Z0-9-]+)\b", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        return None
+
+    @staticmethod
+    def _extract_itsm_patch_id(instruction: str) -> Optional[str]:
+        match = re.search(r"\b([A-Z]+-\d{4}-\d{3,4})\b", instruction)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_itsm_environment(instruction: str) -> Optional[str]:
+        for env in ("prod", "production", "staging"):
+            if env in instruction.lower():
+                return "prod" if env == "production" else env
+        return None
+
+    @staticmethod
+    def _extract_itsm_system(instruction: str) -> Optional[str]:
+        patterns = [
+            r"\bto\s+(?:prod|staging)\s+([a-z0-9_-]+)\s+servers?\b",
+            r"\bto\s+prod\s+([a-z0-9_-]+)\s+as approved by\b",
+            r"\bto\s+([a-z0-9_-]+)\s+(?:staging|prod(?:uction)?)\s+environment\b",
+            r"\bon\s+the\s+([a-z0-9_-]+)\s+system\b",
+            r"\bon\s+([a-z0-9_-]+)\s+system\b",
+            r"\bon\s+([a-z0-9_-]+)\b",
+            r"\bto\s+([a-z0-9_-]+)\s+in\s+(?:staging|prod(?:uction)?)\b",
+            r"\bof\s+([a-z0-9_-]+)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, instruction, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_itsm_method(instruction: str) -> Optional[str]:
+        match = re.search(r"\busing\s+([a-z_]+)\s+verification\b", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+        for method in ("security_key", "email", "sms"):
+            if method.replace("_", " ") in instruction.lower() or method in instruction.lower():
+                return method
+        return None
+
+    @staticmethod
+    def _extract_itsm_priority(instruction: str) -> Optional[str]:
+        for priority in ("critical", "high", "normal", "low"):
+            if priority in instruction.lower():
+                return priority
+        return None
+
+    @staticmethod
+    def _extract_itsm_category(instruction: str) -> Optional[str]:
+        match = re.search(r"\b(?:ticket|incident)\s+(?:for|:)\s+([a-z0-9_-]+)", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"\bexperiencing\s+([a-z0-9_-]+)", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"\b([a-z0-9_-]+)\s+issue\b", instruction, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _infer_requester_role(instruction: str) -> str:
+        il = instruction.lower()
+        if "team lead" in il or "lead." in il or "lead " in il:
+            return "team_lead"
+        if "manager" in il:
+            return "manager"
+        if "admin" in il:
+            return "admin"
+        return "standard_user"

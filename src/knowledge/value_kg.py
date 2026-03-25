@@ -22,6 +22,10 @@ class ValueKG:
         self.promo_policies: Dict[str, Any] = config.get('promo_policies', {})
         self.return_window_days: int = int(config.get('return_window_days', 30))
         self.expired_promos: List[str] = config.get('expired_promos', [])
+        self.required_auth_mode: str = str(config.get('required_auth_mode', 'legacy_auth_token'))
+        self.allowed_auth_modes: List[str] = [
+            str(x) for x in config.get('allowed_auth_modes', ['legacy_auth_token', 'signed_session_token'])
+        ]
         self._load_default_rules()
         print(
             f"VALUE_KG: Initialized with {len(self.rules)} rules "
@@ -79,10 +83,26 @@ class ValueKG:
                     return True
                 return str(promo) not in (self.expired_promos or [])
 
+            def require_supported_auth_mode(state: Dict[str, Any], params: Dict[str, Any]) -> bool:
+                auth_mode = str(
+                    params.get('auth_mode')
+                    or state.get('auth_schema_version')
+                    or state.get('required_auth_mode')
+                    or self.required_auth_mode
+                )
+                allowed = set(self.allowed_auth_modes or [self.required_auth_mode])
+                if auth_mode not in allowed:
+                    return False
+                required = str(state.get('required_auth_mode') or self.required_auth_mode)
+                if required == 'signed_session_token' and auth_mode != 'signed_session_token':
+                    return False
+                return True
+
             self.rules['no_restricted_shipping'] = prohibit_restricted_shipping
             self.rules['no_promo_stack'] = prohibit_promo_stack
             self.rules['refund_within_window'] = require_refund_window
             self.rules['no_expired_promo'] = prohibit_expired_promo
+            self.rules['supported_auth_mode'] = require_supported_auth_mode
             return
 
         # Unknown domain: no default rules

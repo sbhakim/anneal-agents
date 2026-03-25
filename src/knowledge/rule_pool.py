@@ -308,6 +308,86 @@ def no_price_change(state: SymbolicState, params: Dict[str, Any]) -> bool:
 
 
 # ========================================================================
+# ITSM PREDICATE LIBRARY
+# ========================================================================
+
+def is_access_request_approved(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    role = str(params.get("role", "") or "").lower()
+    approval_code = str(params.get("approval_code", "") or "").strip()
+    approval_required = bool(state.get("approval_required", False))
+    privileged_roles = set(state.get("roles_requiring_approval", []) or ["admin", "privileged", "superuser"])
+    if approval_required or role in privileged_roles:
+        return bool(approval_code)
+    return True
+
+
+def is_change_window_open(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    env = str(params.get("environment", "") or "").lower()
+    if env != "prod":
+        return True
+    if state.get("change_window_required", False) is False and params.get("change_window_slot"):
+        return True
+    current_slot = str(state.get("current_time_slot", "") or "")
+    approved_slots = set(state.get("change_windows", []) or [])
+    requested_slot = str(params.get("change_window_slot", "") or "")
+    return current_slot in approved_slots or requested_slot in approved_slots
+
+
+def is_mfa_verified(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    if not bool(state.get("mfa_required", False)):
+        return True
+    if bool(params.get("mfa_verified", False)):
+        return True
+    user = params.get("user")
+    verified_users = state.get("mfa_verified_users", set()) or set()
+    return user in verified_users
+
+
+def can_create_priority_ticket(state: SymbolicState, params: Dict[str, Any]) -> bool:
+    priority = str(params.get("priority", "") or "").lower()
+    requester_role = str(params.get("requester_role", "standard_user") or "").lower()
+    if priority != "critical":
+        return True
+    return requester_role in {"team_lead", "manager", "admin"}
+
+
+def provision_access_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    state.set("last_access_provisioned", {
+        "user": params.get("user"),
+        "resource": params.get("resource"),
+        "role": params.get("role"),
+    })
+    return state
+
+
+def deploy_patch_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    state.set("last_patch_deployed", {
+        "system": params.get("system"),
+        "patch_id": params.get("patch_id"),
+        "environment": params.get("environment"),
+    })
+    return state
+
+
+def reset_credentials_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    state.set("last_credentials_reset", {
+        "user": params.get("user"),
+        "system": params.get("system"),
+        "method": params.get("method"),
+    })
+    return state
+
+
+def create_ticket_effect(state: SymbolicState, params: Dict[str, Any]) -> SymbolicState:
+    state.set("last_ticket_created", {
+        "category": params.get("category"),
+        "priority": params.get("priority"),
+        "description": params.get("description"),
+    })
+    return state
+
+
+# ========================================================================
 # DYNAMIC PREDICATE & EFFECT FACTORIES (The Core of Symbolic Learning)
 # ========================================================================
 
@@ -345,6 +425,18 @@ class PredicateFactory:
 
         if "validpayment" in details_l:
             return check_valid_payment
+
+        if "approval" in details_l and ("manager" in details_l or "approval_code" in details_l):
+            return is_access_request_approved
+
+        if "change_window" in details_l or "maintenance window" in details_l:
+            return is_change_window_open
+
+        if "mfa" in details_l:
+            return is_mfa_verified
+
+        if "priority" in details_l and ("team-lead" in details_l or "team lead" in details_l or "rbac" in details_l):
+            return can_create_priority_ticket
 
         if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', details_clean):
             if details_clean in globals() and callable(globals()[details_clean]):
@@ -591,6 +683,50 @@ class RulePool:
         update_inventory_op.metadata = {"version": "1.0"}
         self.operators[update_inventory_op.name] = update_inventory_op
         self._snapshot_operator(update_inventory_op.name)
+
+        provision_access_op = Operator(
+            "ProvisionAccess",
+            ["user", "resource", "role", "requester", "approval_code"],
+            [is_access_request_approved],
+            [provision_access_effect],
+            required_params=["user", "resource", "role", "requester"],
+        )
+        provision_access_op.metadata = {"version": "1.0"}
+        self.operators[provision_access_op.name] = provision_access_op
+        self._snapshot_operator(provision_access_op.name)
+
+        deploy_patch_op = Operator(
+            "DeployPatch",
+            ["system", "patch_id", "environment", "approved_by", "api_version", "change_window_slot"],
+            [is_change_window_open],
+            [deploy_patch_effect],
+            required_params=["system", "patch_id", "environment"],
+        )
+        deploy_patch_op.metadata = {"version": "1.0"}
+        self.operators[deploy_patch_op.name] = deploy_patch_op
+        self._snapshot_operator(deploy_patch_op.name)
+
+        reset_credentials_op = Operator(
+            "ResetCredentials",
+            ["user", "system", "method", "mfa_verified"],
+            [is_mfa_verified],
+            [reset_credentials_effect],
+            required_params=["user", "system", "method"],
+        )
+        reset_credentials_op.metadata = {"version": "1.0"}
+        self.operators[reset_credentials_op.name] = reset_credentials_op
+        self._snapshot_operator(reset_credentials_op.name)
+
+        create_ticket_op = Operator(
+            "CreateTicket",
+            ["category", "priority", "description", "requester_role"],
+            [can_create_priority_ticket],
+            [create_ticket_effect],
+            required_params=["category", "priority", "description"],
+        )
+        create_ticket_op.metadata = {"version": "1.0"}
+        self.operators[create_ticket_op.name] = create_ticket_op
+        self._snapshot_operator(create_ticket_op.name)
 
         print(f"RULE_POOL: Loaded {len(self.operators)} initial operators: {list(self.operators.keys())}")
 

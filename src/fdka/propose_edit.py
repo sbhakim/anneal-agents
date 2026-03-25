@@ -86,8 +86,22 @@ def _is_tool_drift(evidence: str) -> bool:
 
 def _build_tool_drift_patch(operator_name: str, evidence: str) -> Dict[str, Any]:
     ev = (evidence or "").lower()
+    auth_markers = (
+        "auth_token",
+        "bearer",
+        "signed_session_token",
+        "session token",
+        "authentication schema",
+        "oauth",
+        "jwt",
+    )
     # Keep details as a string because RulePool stores schema updates as metadata text.
-    if "/v1/" in ev or "v1/book" in ev:
+    if any(m in ev for m in auth_markers):
+        details = (
+            "Replace legacy auth_token bearer flow with signed_session_token request field "
+            "(authentication schema drift)."
+        )
+    elif "/v1/" in ev or "v1/book" in ev:
         details = "Switch tool endpoint from /v1/book to /v2/book (deprecation/tool-drift)."
     else:
         details = "Update tool schema/endpoint to the latest supported version (tool-drift)."
@@ -166,11 +180,18 @@ PATCH_TEMPLATES = {
             "justification": "Fix endpoint deprecation by migrating to v2."
         }
     },
-    ("ToolError", ("timeout", "api", "network")): {
+    ("ToolError", ("timeout", "unavailable", "network")): {
         "action": "REFINE_EFFECT",
         "patch": {
-            "guard": "IfThen(NetworkAvailable(), ExecuteTool())",
-            "justification": "Tool timeout handling; ensure network is available before execution."
+            "guard": "ApiTimeoutRetry(service)",
+            "justification": "Add timeout retry recovery to handle transient API failures."
+        }
+    },
+    ("ToolError", ("payment validation", "invalid", "unsupported payment")): {
+        "action": "ADD_PRECONDITION",
+        "patch": {
+            "predicate": "ValidPayment(payment)",
+            "justification": "Validate payment method before API call to prevent rejection."
         }
     },
     "default": {
@@ -433,7 +454,7 @@ class FDKAPipeline:
         minimal = self._extract_minimal_state(trace, sig)
         delta = self._compute_state_delta(fi)
         violated = fi.get("violated") or fi.get("violated_predicate") or ""
-        ev = (fi.get("policy_ref", "") + " " + (fi.get("message", "") or "") + " " + str(violated)).strip()
+        ev = ((fi.get("policy_ref") or "") + " " + (fi.get("message", "") or "") + " " + str(violated)).strip()
         return {
             "operator": sig, "state_minimal": minimal,
             "error": {"type": fi.get("error"), "site": fi.get("operator"),
@@ -654,9 +675,14 @@ class FDKAPipeline:
         )
 
         # Build constraint warning based on evidence
+        # Strip operator name from evidence before checking — operator names like
+        # "ApplyPromoCode" contain substrings ("promo") that falsely trigger the
+        # constraint warning on patchable ToolError failures.
         constraint_warning = ""
-        evidence_lower = full_context.lower()
-        if any(pattern in evidence_lower for pattern in [
+        evidence_for_constraint_check = full_context.lower()
+        for name_fragment in [operator_name.lower(), operator_name.replace(" ", "").lower()]:
+            evidence_for_constraint_check = evidence_for_constraint_check.replace(name_fragment, "")
+        if any(pattern in evidence_for_constraint_check for pattern in [
             'refund', 'return_window', 'purchased', 'days ago',
             'apo', 'fpo', 'po_box', 'shipping_restriction',
             'out of stock', 'inventory', 'insufficient',
@@ -698,12 +724,15 @@ COMMON PATTERNS (Choose the best match):
    {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "Not(BlockedCard(payment, dates))"}}}}
 
 3. NETWORK/TIMEOUT/SERVICE UNAVAILABLE:
-   {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "IfThen(NetworkAvailable(), ExecuteTool())"}}}}
+   {{"action": "REFINE_EFFECT", "operator": "{operator_name}", "patch": {{"guard": "ApiTimeoutRetry(service)"}}}}
 
 4. TOOL DRIFT/DEPRECATION (e.g., API version change /v1 → /v2):
    {{"action": "UPDATE_TOOL_SCHEMA", "operator": "{operator_name}", "patch": {{"schema_update": "Switch endpoint to new version"}}}}
 
-5. MISSING REQUIRED FIELD:
+5. AUTH TOKEN / SESSION TOKEN SCHEMA DRIFT:
+   {{"action": "UPDATE_TOOL_SCHEMA", "operator": "{operator_name}", "patch": {{"schema_update": "Replace legacy auth_token with signed_session_token"}}}}
+
+6. MISSING REQUIRED FIELD:
    {{"action": "ADD_PRECONDITION", "operator": "{operator_name}", "patch": {{"predicate": "HasRequiredField(data, 'field_name')"}}}}
 
 CRITICAL RULES:
