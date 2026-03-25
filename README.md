@@ -1,114 +1,108 @@
-# SelfEvolve: Governed Self-Evolution via Symbolic Knowledge Editing
+# ANNEAL: Adapting LLM Agents via Governed Symbolic Patch Learning
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Paper](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/XXXX.XXXXX)
 
-**Adaptive agents without model retraining.** SelfEvolve repairs symbolic process knowledge through governed self-editing, achieving perfect task success where static baselines plateau below 50%.
+> LLM-based agents recover from individual errors but repeatedly fail on the same fault when process knowledge remains unrepaired. **ANNEAL** converts recurring failures into governed symbolic edits of a process knowledge graph — without modifying foundation model weights.
+
+<p align="center">
+  <img src="Figures/anneal_system_arch.png" width="85%" alt="ANNEAL System Architecture"/>
+</p>
 
 ## Key Results
 
-- **100% task success** on travel planning (vs. 30–49% baselines), **72%** on e-commerce cross-domain
-- **9.0±5.6 tasks to adapt** (2 min vs. 4–8 GPU hours for fine-tuning)
-- **1 patch per run, 100% acceptance rate** (surgical precision, zero rollbacks)
-- **1250× cost reduction** ($0.04 vs. $50 per adaptation cycle)
-- **0% terminal failures** despite 76% observed failures during recovery (robust iterative repair)
+Evaluated with GPT-4o-mini across 27 multi-seed runs (3 agents, 3 scenarios, 3 seeds each):
 
-## Innovation
+| Domain | ANNEAL | ReAct | Reflexion | Patches |
+|--------|--------|-------|-----------|---------|
+| Travel planning | 100.0±0.0% | 100.0±0.0% | 100.0±0.0% | 1.0±0.0 |
+| Travel stochastic | 100.0±0.0% | 97.3±2.3% | 100.0±0.0% | 1.0±0.0 |
+| E-commerce | 94.7±2.3% | 78.7±2.3% | **98.7±1.9%** | 2.7±0.6 |
+| ITSM (untuned transfer) | 100.0±0.0% | — | — | 1.0±0.0 |
 
-**Failure-Driven Knowledge Acquisition (FDKA)** converts execution failures into typed symbolic patches via constrained neurosymbolic generation, multi-dimensional scoring (plausibility, SMT consistency, counterfactual replay, risk), and multi-layered governance (value/causal guardrails, canary testing, cryptographic provenance). Foundation model weights remain frozen—adaptation occurs exclusively through auditable, reversible symbolic edits.
-
----
-
-## Architecture
-
-**Three-layer design:**
-
-1. **Metacognitive Control**: Monitor–evaluate–regulate loop with uncertainty-driven arbitration (S1/S2 pathways), verify-before-act semantics, and reflection-based threshold tuning
-2. **FDKA Pipeline**: Localization → constrained generation (closed JSON schema) → scoring (plausibility, SMT consistency, utility, risk) → guardrails (value/causal constraints) → canary testing → commit with provenance
-3. **Knowledge Graphs**: Process (HTN operators), Value (deontic constraints), Causal (intervention effects), Experience (indexed failure traces)
+ANNEAL is the only system that commits persistent structural repairs. In recurring-failure stress tests, committed patches suppress holdout failures to **0%**, while ReAct and Reflexion retain 72–100% holdout failure rates despite high episodic SR.
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Set up environment
+conda activate hysym
+export OPENAI_API_KEY="sk-..."
 
-# Run evaluation (travel planning, 25 tasks)
-python -m selfevolve.main
+# Single evaluation run (default: e-commerce, 25 tasks)
+python main.py --config config.yaml --mode eval
 
-# Run with specific configuration
-python -m selfevolve.main --config config.yaml
+# Multi-seed reproducibility matrix (paper Tables 2–4)
+python scripts/run_agent_matrix.py \
+  --base-config config.yaml \
+  --agents anneal react reflexion \
+  --scenarios travel_planning ecommerce travel_stochastic \
+  --seeds 7 13 31 --mode eval
 
-# Reproduce paper results
-bash experiments/run_baselines.sh
-bash experiments/run_ablations.sh
+# Aggregate results
+python scripts/summarize_multiseed_metrics.py data/output_dir
 ```
 
-**Reproducibility:** All experiments use fixed seeds. Results directory contains evaluation outputs, patch commits, and provenance logs.
+All four domains (travel, e-commerce, travel stochastic, ITSM) are switchable inside `config.yaml`.
 
----
+## Project Structure
 
-## ⚙️ Configuration
-
-Key settings in `config.yaml`:
-```yaml
-fdka:
-  propose_edit:
-    llm_provider: "openai"      # Options: "openai", "deepseek", "transformers", "mock"
-    model: "gpt-4o-mini"
-    temperature: 0.3
-
-metacognition:
-  tau_u: 0.25                   # Uncertainty threshold
-  tau_p: 0.20                   # Violation probability threshold
-
-governance:
-  gates:
-    tau_impact: 0.6             # Risk escalation threshold
-    tau_conf: 0.5               # Confidence gate threshold
+```
+├── main.py                          # Entry point
+├── config.yaml                      # Unified configuration (all domains & providers)
+├── src/
+│   ├── constants.py                 # System name (single source of truth)
+│   ├── core/
+│   │   ├── system.py                # Main orchestrator
+│   │   ├── planner.py               # HTN planner
+│   │   └── executor.py              # Operator execution + verify/repair
+│   ├── fdka/
+│   │   ├── failure_classifier.py    # Patchability classification
+│   │   ├── propose_edit.py          # Constrained patch synthesis (3-stage)
+│   │   └── scoring.py               # Multi-dimensional scoring
+│   ├── governance/
+│   │   ├── guard.py                 # Value/causal guardrails
+│   │   ├── canary.py                # Canary testing
+│   │   ├── trust.py                 # Beta-Bernoulli trust scoring
+│   │   └── provenance.py            # Provenance tracking + rollback sets
+│   ├── metacognition/
+│   │   ├── arbitrator.py            # S1/S2/Verify pathway selection
+│   │   ├── signals.py               # Uncertainty + violation signals
+│   │   └── reflection.py            # Threshold tuning
+│   ├── knowledge/
+│   │   ├── rule_pool.py             # Operator definitions + committed patches
+│   │   ├── experience_pool.py       # Indexed failure traces
+│   │   └── value_kg.py              # Deontic constraint knowledge graph
+│   ├── scenarios/                   # Travel, e-commerce, ITSM, stochastic
+│   └── baselines/                   # ReAct, Reflexion, LLM-Reflect, Static-NS
+├── scripts/
+│   ├── run_agent_matrix.py          # Multi-seed evaluation runner
+│   └── summarize_multiseed_metrics.py
+├── tests/                           # Unit and integration tests
+└── data/knowledge/extracted/        # Domain knowledge graphs (input)
 ```
 
----
+## Ablation Summary
 
-## Empirical Validation
-
-**Travel Planning** (50 tasks, 5 seeds, deterministic):
-
-| System         | Success Rate | Terminal RFR | Time-to-Adapt | Patches | Acceptance |
-|----------------|--------------|--------------|---------------|---------|------------|
-| **SelfEvolve** | **100%***    | **0%***      | **9.0±5.6**   | **1.0** | **100%**   |
-| Static-NS      | 49.2%        | 45.6%        | ∞             | 0       | —          |
-| LLM-Reflect    | 48.8%        | 43.2%        | ∞             | 0       | —          |
-| Verify-Only    | 30.0%        | 66.0%        | ∞             | 0       | —          |
-
-*p < 0.001, Cohen's d = 4.2*
-
-**Cross-Domain** (25 tasks, e-commerce): 72% SR confirms architectural portability.
-
-**Observed vs. Terminal RFR:** 76% failures during recovery attempts (52% precondition violations, 48% tool errors), but 0% terminal failures—all tasks ultimately succeed through iterative self-repair.
-
-### Additional Findings
-
-- **Cross-model robustness**: 78–90% SR across GPT-4o-mini, DeepSeek, Llama-3.1-8B, Qwen2.5-7B, Mistral-7B
-- **Governance validation**: Zero rollbacks across 250 executions confirm defense-in-depth (scoring + guardrails + canary)
-- **Hierarchy of learnability**: Operator-level failures adapt within 11–14 tasks; meta-planning failures require HTN-level edits (future work)
+| Ablation | Domain | Delta SR | Interpretation |
+|----------|--------|----------|----------------|
+| −FDKA | E-commerce | −26.7pp | Eliminates all structural repairs |
+| −Arbitration | Travel stochastic | −4.7pp | Compound policy shifts overwhelm fast path |
+| −Verify | E-commerce | +4.0pp | Residual constraint types |
+| −Governance | Routine benchmark | 0.0pp | Low-risk patches pass silently |
+| −Governance | Stress suite | 6/6 escalated | Auth-sensitive edits selectively blocked |
 
 ## Citation
 
-If you use SelfEvolve in your research, please cite:
-
 ```bibtex
-@article{hakim2025selfevolve,
-  title={SelfEvolve: Governed Self-Evolution via Symbolic Knowledge Editing},
-  author={Hakim, Safayat Bin and [Co-authors]},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2025}
+@inproceedings{hakim2026anneal,
+  title={{ANNEAL}: Adapting LLM Agents via Governed Symbolic Patch Learning},
+  author={Hakim, Safayat Bin},
+  booktitle={Conference on Language Modeling (COLM)},
+  year={2026}
 }
 ```
 
-## License & Contact
+## License
 
-MIT License. For questions: safayat.b.hakim [at] gmail [dot] com
-
-**Reproducibility artifacts**: Code, configurations, and evaluation scripts are provided for full reproducibility of paper results.
+MIT License.

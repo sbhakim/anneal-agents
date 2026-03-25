@@ -50,3 +50,33 @@ Results/demo_traces.json
 Results/failure_modes/
 
 experiments/run_one_llm.py
+
+# Ablation and stress-test configs (derivable from main config.yaml)
+config_nofdka.yaml
+config_nogovern.yaml
+config_noverify.yaml
+config_noarbitr.yaml
+config_itsm.yaml
+config_govern_stress.yaml
+config_govern_stress_nogovern.yaml
+config_govern_stress_suite.yaml
+config_govern_stress_suite_nogovern.yaml
+
+# Smoke/debug configs
+config.react_smoke.yaml
+config.reflexion_smoke.yaml
+
+# Raw experiment data outputs (all regenerable by running the code)
+data/ecommerce_3seed/
+data/ecommerce_stress_3seed/
+data/itsm_3seed/
+data/stress_ecommerce/
+data/stress_ecommerce2/
+data/logs/
+data/patches/
+data/traces/
+
+# Internal manuscript helper scripts
+scripts/export_manuscript_metrics.py
+scripts/run_adaptation_stress.py
+scripts/run_ecommerce_stress.py
