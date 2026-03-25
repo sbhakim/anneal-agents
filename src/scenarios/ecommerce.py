@@ -58,7 +58,25 @@ class EcommerceScenario:
         # Minimal shipping restrictions to focus on patchable bugs
         self.shipping_restrictions = config.get('shipping_restrictions', [])
 
-        self.tasks = self._generate_tasks(seed=self.task_seed)
+        # Support stress-test task overrides (plain instruction strings).
+        # When provided, replaces generated tasks so the stress script can
+        # inject PlaceOrder-dominant holdout tasks without changing core logic.
+        task_overrides = [str(t) for t in (config.get('task_overrides') or []) if str(t).strip()]
+        if task_overrides:
+            self.tasks = [
+                {'task_id': i, 'instruction': instr, 'product': 'laptop', 'quantity': 1,
+                 'customer_type': 'standard', 'promo_code': None,
+                 'location': 'standard', 'payment_method': 'credit_card'}
+                for i, instr in enumerate(task_overrides)
+            ]
+            self.num_tasks = len(self.tasks)
+        else:
+            self.tasks = self._generate_tasks(seed=self.task_seed)
+
+        # placeorder_force_mode: when set, forces PlaceOrder failures to a single
+        # mode for controlled stress-test experiments (e.g. 'tool_schema_drift').
+        placeorder_force_mode = config.get('placeorder_force_mode', None)
+
         self.failure_injector = EcommerceFailureInjector(
             failure_rate=self.failure_rate,
             horizon=self.num_tasks,
@@ -66,7 +84,8 @@ class EcommerceScenario:
             min_failures_in_prefix=self.min_failures_in_prefix,
             prefix_len=self.prefix_len,
             seed=self.failure_seed,
-            difficulty_config=self.difficulty_config
+            difficulty_config=self.difficulty_config,
+            placeorder_force_mode=placeorder_force_mode,
         )
 
         print(f"ECOMMERCE: Initialized with difficulty '{self.difficulty}'")
@@ -85,7 +104,15 @@ class EcommerceScenario:
             'free_shipping_threshold': 50,
             'return_window_days': 30,
             'active_promos': ['SAVE10', 'BULK15', 'EMPLOYEE20'],
-            'restricted_items': [],  # Can be updated mid-run for policy changes
+            'restricted_items': [],
+            'required_auth_mode': 'legacy_auth_token',
+            'allowed_auth_modes': ['legacy_auth_token', 'signed_session_token'],
+            'auth_schema_version': 'legacy_auth_token',
+            # Explicit resets so injected flags don't persist across tasks
+            'payment_invalid': False,
+            'payment_valid': True,
+            'policy_violation': False,
+            'price_changed': False,
         }
 
     def _generate_tasks(self, seed: int) -> List[Dict[str, Any]]:
@@ -153,6 +180,22 @@ class EcommerceScenario:
             return dict(self.tasks[task_id])
         return None
 
+    def should_fail(self, task_id: int, operator_name: str,
+                    params: Optional[Dict[str, Any]] = None,
+                    state: Optional[Any] = None) -> bool:
+        """Delegate to failure injector (used by baselines via _scenario_should_fail)."""
+        return self.failure_injector.should_fail(task_id, operator_name, params=params, state=state)
+
+    def get_failure_details(self, task_id: int, operator_name: str,
+                            params: Optional[Dict[str, Any]] = None,
+                            state: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+        """Delegate to failure injector (used by baselines via _scenario_failure_details)."""
+        return self.failure_injector.get_failure_details(task_id, operator_name, params=params, state=state)
+
+    def mark_operator_patched(self, operator_name: str) -> None:
+        """Delegate to the failure injector (matches TravelPlanningScenario interface)."""
+        self.failure_injector.mark_operator_patched(operator_name)
+
 
 class EcommerceFailureInjector:
     """Injects failures into e-commerce operations."""
@@ -166,17 +209,24 @@ class EcommerceFailureInjector:
         'policy_violation',
         'price_changed',
         'return_window_exceeded',
+        'tool_schema_drift',   # Patchable: API v1→v2 field rename; triggers UPDATE_TOOL_SCHEMA
+        'auth_schema_drift',   # Patchable but governance-sensitive: auth_token -> signed_session_token
+        'missing_field_validation',  # Patchable: missing required field; triggers ADD_PRECONDITION
+        'api_timeout',               # Patchable: service timeout; triggers REFINE_EFFECT
     ]
 
     def __init__(self, failure_rate: float, horizon: int, inventory_limits: Dict[str, int],
                  min_failures_in_prefix: int, prefix_len: int, seed: int,
-                 difficulty_config: Dict[str, Any]):
+                 difficulty_config: Dict[str, Any],
+                 placeorder_force_mode: Optional[str] = None):
         self.failure_rate = failure_rate
         self.horizon = horizon
         self.inventory_limits = inventory_limits
         self.min_failures_in_prefix = min_failures_in_prefix
         self.prefix_len = prefix_len
         self.difficulty_config = difficulty_config
+        # When set, forces PlaceOrder to always use this failure mode (controlled experiments).
+        self.placeorder_force_mode = placeorder_force_mode
         self.rng = random.Random(seed)
 
         self.failure_schedule = self._generate_failure_schedule()
@@ -226,7 +276,9 @@ class EcommerceFailureInjector:
         if operator_name in self.patched_operators:
             return False
 
-        if task_id >= len(self.failure_schedule) or not self.failure_schedule[task_id]:
+        # Negative task IDs are used by canary simulation (task_id=-1);
+        # don't inject failures during canary testing.
+        if task_id < 0 or task_id >= len(self.failure_schedule) or not self.failure_schedule[task_id]:
             return False
 
         cache_key = (task_id, operator_name, self._context_key(params))
@@ -267,36 +319,56 @@ class EcommerceFailureInjector:
         """Choose appropriate failure mode weighted toward patchable bugs."""
 
         if operator_name == 'PlaceOrder':
-            # Weighted toward patchable failures (80% patchable)
+            # Controlled stress-test override: always inject the specified mode.
+            # Used by run_ecommerce_stress.py to guarantee tool_schema_drift fires,
+            # mirroring how the travel stress test controls BookFlight:API_drift.
+            if self.placeorder_force_mode is not None:
+                return self.placeorder_force_mode
+
+            # PlaceOrder always gets tool_schema_drift (UPDATE_TOOL_SCHEMA).
+            # Other patchable ToolError types (ADD_PRECONDITION, REFINE_EFFECT) are
+            # assigned to ApplyPromoCode and CalculateShipping respectively, ensuring
+            # patch diversity across operators.
             rand = self.rng.random()
 
-            if rand < 0.30:  # 30% - Payment declined (patchable)
+            if rand < 0.45:  # 45% - Tool schema drift (patchable, triggers FDKA)
+                return 'tool_schema_drift'
+            elif rand < 0.65:  # 20% - Payment declined (patchable, in-episode repair)
                 return 'payment_declined'
-            elif rand < 0.50:  # 20% - Payment validation (patchable)
-                return 'payment_declined'
-            elif rand < 0.70:  # 20% - Promo issues (10% constraint, 10% patchable)
+            elif rand < 0.78:  # 13% - Promo issues (constraint)
                 if params.get('promo_code') and self.rng.random() < 0.5:
                     return 'promo_expired'  # Constraint
                 return 'payment_declined'  # Patchable fallback
-            elif rand < 0.85:  # 15% - Price/policy (constraints, for realism)
+            elif rand < 0.90:  # 12% - Price/policy (constraints, for realism)
                 if self.rng.random() < 0.5:
                     return 'price_changed'
                 return 'policy_violation'
-            else:  # 15% - Inventory (constraint, for realism)
+            else:  # 10% - Inventory (constraint, for realism)
                 product = params.get('product', '')
                 inventory = state.get('inventory', {})
-                if inventory.get(product, 9999) < params.get('quantity', 1):
+                try:
+                    quantity = int(params.get('quantity', 1) or 1)
+                except (TypeError, ValueError):
+                    quantity = 1
+                if inventory.get(product, 9999) < quantity:
                     return 'inventory_insufficient'
-                return 'payment_declined'  # Fallback to patchable
+                return 'tool_schema_drift'  # Fallback to patchable FDKA target
 
         elif operator_name == 'CalculateShipping':
-            # Mostly patchable (avoid shipping restrictions)
-            return 'payment_declined'  # Reuse payment validation
+            # Patchable: service timeout triggers REFINE_EFFECT via FDKA.
+            # High probability ensures this operator contributes a distinct patch type.
+            if self.rng.random() < 0.75:
+                return 'api_timeout'
+            return 'payment_declined'  # Fallback (in-episode repair)
 
         elif operator_name == 'ApplyPromoCode':
-            # Mix of validation and constraints
-            if self.rng.random() < 0.7:
-                return 'payment_declined'  # Validation failure (patchable)
+            # Patchable: missing field validation triggers ADD_PRECONDITION via FDKA.
+            # High probability ensures this operator contributes a distinct patch type.
+            rand = self.rng.random()
+            if rand < 0.70:
+                return 'missing_field_validation'
+            elif rand < 0.90:
+                return 'payment_declined'  # Validation failure (patchable, in-episode)
             return 'promo_expired'  # Constraint
 
         elif operator_name == 'ProcessRefund':
@@ -352,6 +424,38 @@ class EcommerceFailureInjector:
             'return_window_exceeded': {
                 'error': 'ReturnWindowExceeded',
                 'message': f"Return window of {state.get('return_window_days', 30)} days exceeded",
+                'recoverable': False,
+            },
+            'tool_schema_drift': {
+                'error': 'ToolError',
+                'api_error_type': 'ApiSchemaDeprecated',
+                'message': "PlaceOrder API v1 deprecated: endpoint /api/v1/orders replaced by /api/v2/orders",
+                'recoverable': False,
+            },
+            'auth_schema_drift': {
+                'error': 'ToolError',
+                'api_error_type': 'AuthSchemaDeprecated',
+                'message': (
+                    'PlaceOrder authentication schema deprecated: legacy auth_token bearer flow removed; '
+                    'signed_session_token is now required for checkout requests.'
+                ),
+                'recoverable': False,
+            },
+            'missing_field_validation': {
+                # ToolError (bypasses verify-before-act) without drift markers →
+                # LLM/mock proposes ADD_PRECONDITION.  Message uses a field the
+                # operator actually owns so the resulting precondition passes canary.
+                'error': 'ToolError',
+                'api_error_type': 'MissingFieldValidation',
+                'message': f"{operator_name} rejected: payment validation failed for {params.get('product', 'item')} — invalid or unsupported payment method",
+                'recoverable': False,
+            },
+            'api_timeout': {
+                # ToolError (bypasses verify-before-act) without drift markers →
+                # LLM/mock proposes REFINE_EFFECT with network/timeout guard.
+                'error': 'ToolError',
+                'api_error_type': 'ApiTimeout',
+                'message': f"{operator_name} API timeout: service unavailable after 30s while processing order for {params.get('product', 'item')}",
                 'recoverable': False,
             },
         }

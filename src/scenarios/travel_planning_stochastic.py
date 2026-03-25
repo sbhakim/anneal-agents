@@ -119,10 +119,18 @@ class StochasticTravelScenario(TravelPlanningScenario):
         """
         Inject mid-execution policy changes.
         Tests adaptation to evolving constraints.
+
+        ~30% of shifts are compound (affect multiple dimensions simultaneously),
+        creating multi-step precondition violations that require deeper
+        deliberation (S2 pathway) to resolve preemptively.
         """
 
         if self.noise_rng.random() > self.dynamic_policy_shift_rate:
             return None
+
+        # ~40% chance of compound shift (card policy + resource availability)
+        if self.noise_rng.random() < 0.40:
+            return self._shift_compound(state, task_id)
 
         shift_types = [
             ('blackout_dates', lambda: self._shift_blackout_dates(state)),
@@ -141,6 +149,53 @@ class StochasticTravelScenario(TravelPlanningScenario):
         })
 
         return shift_result
+
+    def _shift_compound(self, state: Any, task_id: int) -> Dict[str, Any]:
+        """
+        Compound policy shift: block corporate card AND mark resources as
+        temporarily unavailable.  Creates 3+ precondition violations on
+        booking operators that exceed a 2-hop repair budget (S1 limit) but
+        are resolvable with S2's extended repair budget + preemptive look-ahead.
+        """
+        # 1. Block corporate card
+        old_policy = self._state_get(state, 'corporate_card_policy', 'blocked_on_blackout_dates')
+        self._state_set(state, 'corporate_card_policy', 'blocked_on_blackout_dates')
+
+        # Taint payment as invalid (forces clear_invalid + switch_personal = 2 hops)
+        # Lock prevents _sync_payment_from_params from clearing the taint.
+        pm = self._state_get(state, 'payment_method', None)
+        if pm and isinstance(pm, str) and "(invalid)" not in pm.lower():
+            self._state_set(state, 'payment_method', f"{pm} (invalid)")
+            self._state_set(state, 'payment_invalid', True)
+            self._state_set(state, 'payment_valid', False)
+            self._state_set(state, 'payment_shift_locked', True)
+
+        # Ensure travel_dates overlaps a blackout date so check_not_blocked_card fires.
+        travel_dates = str(self._state_get(state, 'travel_dates', '') or '')
+        blackout_dates = self._state_get(state, 'blackout_dates', []) or []
+        overlap = any(bd in travel_dates for bd in blackout_dates)
+        if not overlap and blackout_dates:
+            # Pick a blackout date and inject it into travel_dates
+            bd = self.noise_rng.choice(blackout_dates)
+            self._state_set(state, 'travel_dates', bd)
+
+        # 2. Temporarily mark hotel as unavailable (requires backoff_refresh = +1 hop)
+        old_hotel = self._state_get(state, 'hotel_status', 'available')
+        self._state_set(state, 'hotel_status', 'unavailable')
+
+        self.policy_shift_history.append({
+            'task_id': task_id,
+            'shift_type': 'compound',
+            'old_value': {'policy': old_policy, 'hotel': old_hotel},
+            'new_value': {'policy': 'blocked_on_blackout_dates', 'hotel': 'unavailable'},
+        })
+
+        return {
+            'old': {'policy': old_policy, 'hotel': old_hotel},
+            'new': {'policy': 'blocked_on_blackout_dates', 'hotel': 'unavailable'},
+            'action': 'compound_shift',
+            'message': 'Compound policy shift: card blocked + hotel temporarily unavailable',
+        }
 
     def inject_resource_contention(self, operator_name: str, params: Dict[str, Any],
                                    task_id: int) -> Optional[Dict[str, Any]]:

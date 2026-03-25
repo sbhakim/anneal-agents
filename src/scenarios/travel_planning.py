@@ -1,6 +1,6 @@
 # src/scenarios/travel_planning.py
 """
-Travel planning scenario for SELFEVOLVE evaluation.
+Travel planning scenario for ANNEAL evaluation.
 Generates tasks and handles failure injection for the demo.
 Based on Section X walkthrough and Section XII evaluation protocol.
 """
@@ -51,6 +51,7 @@ class TravelPlanningScenario:
         self.difficulty_config = DIFFICULTY_CONFIGS.get(self.difficulty, DIFFICULTY_CONFIGS['normal'])
 
         self.num_tasks = config.get('num_tasks', 50)
+        self.task_overrides = [str(task) for task in (config.get('task_overrides') or []) if str(task).strip()]
 
         # Respect an explicit scenario failure_rate override when provided; otherwise fall back to difficulty defaults.
         cfg_failure_rate = config.get('failure_rate', None)
@@ -68,7 +69,11 @@ class TravelPlanningScenario:
         self.task_seed = config.get('task_generation_seed', 7)
         self.failure_seed = config.get('failure_injector_seed', 42)
 
-        self.tasks = self._generate_tasks(seed=self.task_seed)
+        if self.task_overrides:
+            self.tasks = list(self.task_overrides)
+            self.num_tasks = len(self.tasks)
+        else:
+            self.tasks = self._generate_tasks(seed=self.task_seed)
 
         self.failure_injector = FailureInjector(
             failure_rate=self.failure_rate,
@@ -77,7 +82,9 @@ class TravelPlanningScenario:
             min_failures_in_prefix=self.min_failures_in_prefix,
             prefix_len=self.prefix_len,
             seed=self.failure_seed,
-            difficulty_config=self.difficulty_config
+            difficulty_config=self.difficulty_config,
+            forced_failures=config.get('forced_failures') or [],
+            patch_successes_to_suppress=config.get('patch_successes_to_suppress', 3),
         )
 
         print(f"SCENARIO: Initialized with difficulty '{self.difficulty}'.")
@@ -165,7 +172,9 @@ class FailureInjector:
 
     def __init__(self, failure_rate: float, horizon: int,
                  blackout_dates: Optional[List[str]] = None, min_failures_in_prefix: int = 0, prefix_len: int = 0,
-                 seed: int = 42, difficulty_config: Optional[Dict] = None):
+                 seed: int = 42, difficulty_config: Optional[Dict] = None,
+                 forced_failures: Optional[List[Dict[str, Any]]] = None,
+                 patch_successes_to_suppress: int = 3):
         self.failure_rate = failure_rate
         self.horizon = max(1, int(horizon))
         self.blackout_dates = set(blackout_dates or [])
@@ -176,6 +185,7 @@ class FailureInjector:
         self.difficulty = next((key for key, value in DIFFICULTY_CONFIGS.items() if value == self.difficulty_config), 'normal')
         self.patched_operators: Set[str] = set()
         self._patch_successes: Dict[str, int] = {}
+        self.patch_successes_to_suppress = max(1, int(patch_successes_to_suppress))
 
         # Local RNG: deterministic without mutating global random state.
         self.rng = random.Random(self.seed)
@@ -210,7 +220,44 @@ class FailureInjector:
                                 "message": "Payment method is invalid or expired.",
                                 "policy_ref": "PAY-401", "category": "logical"}
         }
+        self.forced_failures = self._normalize_forced_failures(forced_failures or [])
+        self.failing_tasks.update(ff["task_id"] for ff in self.forced_failures)
         print(f"FAILURE_INJECTOR: Initialized with seed={self.seed}. {len(self.failing_tasks)} tasks will fail.")
+
+    def _normalize_forced_failures(self, forced_failures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in forced_failures or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                task_id = int(item.get("task_id"))
+            except Exception:
+                continue
+            operator = str(item.get("operator") or "").strip()
+            if not operator:
+                continue
+
+            failure_class = str(item.get("failure_class") or "").strip()
+            base: Dict[str, Any] = {}
+            if failure_class:
+                base = dict(self.failure_classes.get(failure_class, {}))
+
+            error_type = str(item.get("error_type") or base.get("error_type") or item.get("error") or "ToolError")
+            policy_ref = str(item.get("policy_ref") or base.get("policy_ref") or "")
+            message = str(item.get("message") or base.get("message") or error_type)
+            category = str(item.get("category") or base.get("category") or "forced")
+
+            normalized.append({
+                "task_id": task_id,
+                "operator": operator,
+                "error_type": error_type,
+                "error": error_type,
+                "message": message,
+                "policy_ref": policy_ref,
+                "category": category,
+                "trace_id": f"T-{task_id:04d}",
+            })
+        return normalized
 
     def _get_event_points(self, event_type: str) -> List[int]:
         count = self.difficulty_config.get(event_type, 0)
@@ -319,6 +366,12 @@ class FailureInjector:
 
     def get_failure_details(self, task_id: int, op_name: str, params: Optional[Dict] = None,
                             state: Optional[Any] = None) -> Dict:
+        for forced in self.forced_failures:
+            if forced.get("task_id") == int(task_id) and forced.get("operator") == str(op_name):
+                out = forced.copy()
+                out["operator"] = op_name
+                return out
+
         payment_key = self._payment_key(params, state)
         cache_key = (int(task_id), str(op_name), payment_key)
         if cache_key in self._intended_failure_cache:
@@ -366,9 +419,13 @@ class FailureInjector:
     def mark_operator_patched(self, operator_name: str) -> None:
         if operator_name not in self.patched_operators:
             self._patch_successes[operator_name] = self._patch_successes.get(operator_name, 0) + 1
-            if self._patch_successes[operator_name] >= 3:
+            if self._patch_successes[operator_name] >= self.patch_successes_to_suppress:
                 self.patched_operators.add(operator_name)
                 print(f"INJECTOR: 🎓 {operator_name} marked as permanently patched...")
                 print(f"         ✓ Future tasks will not inject failures for this operator.")
             else:
-                print(f"INJECTOR: 📊 {operator_name} success count: {self._patch_successes[operator_name]}/3 before permanent patching.")
+                print(
+                    f"INJECTOR: 📊 {operator_name} success count: "
+                    f"{self._patch_successes[operator_name]}/{self.patch_successes_to_suppress} "
+                    f"before permanent patching."
+                )
