@@ -1,33 +1,38 @@
 # main.py
 """
-SELFEVOLVE: Self-Evolving Neuro-Symbolic Architecture
+ANNEAL: Adapting LLM Agents via Governed Symbolic Patch Learning
 Main execution entry point.
 """
 
 import argparse
 import sys
 
+from src.constants import SYSTEM_NAME, SYSTEM_KEY
 # Import all agents: the main system and the baselines
 from src.core.system import SelfEvolveSystem
 from src.baselines.static_ns import StaticNSAgent
 from src.baselines.llm_reflect import LLMReflectAgent
 from src.baselines.verify_only import VerifyOnlyAgent
+from src.baselines.react import ReActAgent
+from src.baselines.reflexion import ReflexionAgent
 from src.utils.config_loader import load_config
 
 
 # Map agent names from the config file to their respective classes
 AGENT_MAP = {
-    "selfevolve": SelfEvolveSystem,
+    SYSTEM_KEY: SelfEvolveSystem,
     "static_ns": StaticNSAgent,
     "llm_reflect": LLMReflectAgent,
     "verify_only": VerifyOnlyAgent,
+    "react": ReActAgent,
+    "reflexion": ReflexionAgent,
 }
 
 
 def main():
     """Main entry point: parses arguments and starts the selected system."""
     parser = argparse.ArgumentParser(
-        description="SELFEVOLVE: Self-Evolving Neuro-Symbolic Architecture",
+        description=f"{SYSTEM_NAME}: Adapting LLM Agents via Governed Symbolic Patch Learning",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
@@ -42,12 +47,7 @@ def main():
 
     # ASCII Banner
     print("\n" + "=" * 70)
-    print(" ███████╗███████╗██╗     ███████╗███████╗██╗   ██╗ ██████╗ ██╗    ██╗   ██╗███████╗")
-    print(" ██╔════╝██╔════╝██║     ██╔════╝██╔════╝██║   ██║██╔═══██╗██║    ██║   ██║██╔════╝")
-    print(" ███████╗█████╗  ██║     █████╗  █████╗  ██║   ██║██║   ██║██║    ██║   ██║█████╗  ")
-    print(" ╚════██║██╔══╝  ██║     ██╔══╝  ██╔══╝  ╚██╗ ██╔╝██║   ██║██║    ╚██╗ ██╔╝██╔══╝  ")
-    print(" ███████║███████╗███████╗██║     ███████╗ ╚████╔╝ ╚██████╔╝███████╗╚████╔╝ ███████╗")
-    print(" ╚══════╝╚══════╝╚══════╝╚═╝     ╚══════╝  ╚═══╝   ╚═════╝ ╚══════╝ ╚═══╝  ╚══════╝")
+    print(f"  {SYSTEM_NAME}: Adapting LLM Agents via Governed Symbolic Patch Learning")
     print("=" * 70)
 
     try:
@@ -83,7 +83,7 @@ def main():
             print("📈 Running FULL EVALUATION...\n")
 
         # Determine which agent to run from the config
-        agent_key = config.get('experiment', {}).get('agent_to_run', 'selfevolve')
+        agent_key = config.get('experiment', {}).get('agent_to_run', SYSTEM_KEY)
         AgentClass = AGENT_MAP.get(agent_key)
 
         if not AgentClass:

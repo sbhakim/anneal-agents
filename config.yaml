@@ -1,13 +1,17 @@
-# SELFEVOLVE Comprehensive Configuration
+# ANNEAL Comprehensive Configuration
 # ============================================================================
 # This is the unified configuration file with all LLM providers and scenarios
 # Uncomment the provider/scenario you want to use
 # ============================================================================
 
 system:
-  name: "SELFEVOLVE"
+  name: "ANNEAL"
   version: "1.0.0"
-  domain: "travel_planning"  # or "ecommerce" for cross-domain validation
+  # IMPORTANT: Keep domain in sync with scenario.name below.
+  # travel run  → domain: "travel_planning"
+  # ecommerce   → domain: "ecommerce"
+  # itsm        → domain: "itsm"
+  domain: "ecommerce"
 
 planner:
   type: "HTN"
@@ -174,30 +178,52 @@ knowledge:
 # Available scenarios: "travel_planning", "ecommerce", "travel_stochastic"
 # =============================================================================
 scenario:
-  # -------------------------------------------------------------------------
-  # OPTION 1: Travel Planning (Original domain)
-  # -------------------------------------------------------------------------
-  name: "travel_planning"
-  difficulty: "hard"
+  # =========================================================================
+  # HOW TO SWITCH SCENARIOS
+  # Step 1: Uncomment the name + difficulty for the scenario you want.
+  # Step 2: Comment out the other name lines.
+  # Step 3: Also change system.domain (top of file) to match.
+  # Run:  conda run -n hysym python main.py --config config.yaml --mode eval
+  # =========================================================================
 
   # -------------------------------------------------------------------------
-  # OPTION 2: E-commerce (Cross-domain validation)
+  # OPTION 1: Travel Planning (Original domain — CURRENTLY ACTIVE)
+  # system.domain must be: "travel_planning"
   # -------------------------------------------------------------------------
-  # name: "ecommerce"
-  # difficulty: "easy"
-  # E-commerce scenario optimized for demonstrating cross-domain adaptation
-  # Focuses on patchable failures (payment validation, tool drift)
-  # Reduced constraint-heavy failures for better patch success rate
+  # name: "travel_planning"
+  # difficulty: "hard"
+
+  # -------------------------------------------------------------------------
+  # OPTION 2: E-commerce (Cross-domain validation) — CURRENTLY ACTIVE
+  # To activate: comment out Option 1 name/difficulty, uncomment below.
+  # system.domain must be: "ecommerce"
+  # New: tool_schema_drift injected for PlaceOrder → triggers FDKA patch
+  # -------------------------------------------------------------------------
+  name: "ecommerce"
+  difficulty: "normal"
 
   # -------------------------------------------------------------------------
   # OPTION 3: Stochastic Travel (Metacognition stress test)
+  # system.domain must be: "travel_planning"
   # -------------------------------------------------------------------------
   # name: "travel_stochastic"
   # difficulty: "hard"
-  # transient_failure_rate: 0.15
-  # uncertainty_injection_rate: 0.20
-  # policy_shift_rate: 0.10
-  # resource_contention_rate: 0.05
+  # noise:
+  #   seed: 99
+  #   transient_failure_rate: 0.05
+  #   uncertainty_injection: 0.25
+  #   dynamic_policy_shifts: 0.30
+  #   resource_contention: 0.05
+
+  # -------------------------------------------------------------------------
+  # OPTION 4: IT Service Management (Third-domain cross-domain validation)
+  # system.domain must be: "itsm"
+  # Constraint guardrails now active: priority_escalation_denied is vetoed
+  # Patchable: approval_required, change_window, mfa, api_schema_deprecated
+  # Seeds: task_generation_seed=31, failure_injector_seed=53
+  # -------------------------------------------------------------------------
+  # name: "itsm"
+  # difficulty: "hard"
 
   # -------------------------------------------------------------------------
   # Common Scenario Parameters
@@ -211,11 +237,12 @@ scenario:
   task_generation_seed: 7
 
 evaluation:
-  baselines: ["static_nesy", "llm_reflect", "verify_only"]
+  baselines: ["static_nesy", "llm_reflect", "verify_only", "react", "reflexion"]
   ablations: ["no_governance", "no_verify", "no_arbitration", "no_fdka"]
+  domains: ["travel_planning", "ecommerce", "itsm"]
 
 experiment:
-  agent_to_run: "selfevolve"
+  agent_to_run: "anneal"
 
 demo:
   # Demo mode parameters; keep aligned with scenario unless intentionally diverging.
@@ -229,7 +256,7 @@ output:
 
 logging:
   level: "INFO"
-  log_file: "data/logs/selfevolve.log"
+  log_file: "data/logs/anneal.log"
 
 # =============================================================================
 # QUICK START GUIDE

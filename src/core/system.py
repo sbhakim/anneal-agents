@@ -1,6 +1,6 @@
 # src/core/system.py
 """
-SelfEvolveSystem orchestrator (PoC).
+ANNEAL system orchestrator (PoC).
 This version integrates all architectural components from the manuscript:
 - Metacognitive arbitration (S1/S2/VERIFY/DEFER)
 - Executor with Verify-Before-Act
@@ -86,14 +86,14 @@ class _NoOpProvenance:
 
 class SelfEvolveSystem:
     """
-    Main SELFEVOLVE system orchestrator that integrates all components.
+    Main ANNEAL system orchestrator that integrates all components.
     """
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.logger = setup_logger(config['logging'])
         self.logger.info("=" * 70)
-        self.logger.info("Initializing SELFEVOLVE system...")
+        self.logger.info("Initializing ANNEAL system...")
         self.logger.info("=" * 70)
 
         # Reproducibility: stable run identifier for manifests + artifacts
@@ -180,6 +180,7 @@ class SelfEvolveSystem:
             else:
                 canary_cfg['statistical_max_fail_rate'] = 0.10
 
+        self.canary_enabled = bool(canary_cfg.get('enable', True))
         self.canary_runner = CanaryRunner(canary_cfg)
 
         # Explicit enable flag; threshold is for accept gating only
@@ -205,7 +206,7 @@ class SelfEvolveSystem:
         self.logger.info(f"Run ID: {self.run_id}")
         self.logger.info(f"FDKA enabled: {self.fdka_enabled}  | threshold: {self.fdka_threshold:.3f}")
         self.logger.info(f"FDKA provider/model: {pe_cfg.get('llm_provider', 'N/A')} / {pe_cfg.get('model', 'N/A')}")
-        self.logger.info("✅ SELFEVOLVE system ready")
+        self.logger.info("✅ ANNEAL system ready")
         self.logger.info("=" * 70)
 
     # ---------------------------------------------------------------------
@@ -239,7 +240,7 @@ class SelfEvolveSystem:
         manifest = {
             "run_id": self.run_id,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "agent": "selfevolve",
+            "agent": "anneal",
             "python_version": sys.version.split(" ")[0],
             "platform": platform.platform(),
             "git_commit": self._get_git_commit(),
@@ -274,13 +275,17 @@ class SelfEvolveSystem:
         }
 
         try:
-            (results_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
+            (results_dir / "run_manifest.json").write_text(
+                json.dumps(manifest, indent=2, default=str)
+            )
         except Exception as e:
             self.logger.info(f"⚠️ Failed to write run_manifest.json: {e}")
 
         # Save the resolved config as executed (single-file snapshot).
         try:
-            (results_dir / "config_resolved.json").write_text(json.dumps(self.config, indent=2))
+            (results_dir / "config_resolved.json").write_text(
+                json.dumps(self.config, indent=2, default=str)
+            )
         except Exception as e:
             self.logger.info(f"⚠️ Failed to write config_resolved.json: {e}")
 
@@ -377,7 +382,12 @@ class SelfEvolveSystem:
             if patch_applied and committed_patch:
                 op = committed_patch.get("operator")
                 if op:
-                    pending_patched_operators.add(op)
+                    # Patch passed full governance pipeline (score + guard + canary).
+                    # Mark the operator immediately so the failure injector stops
+                    # failing it — waiting for a post-patch success creates a deadlock
+                    # when failure_rate is high (no task ever succeeds to trigger marking).
+                    self.scenario.mark_operator_patched(op)
+                    pending_patched_operators.add(op)  # kept for metrics/adaptation tracking
 
             if patch_applied:
                 print("🔁 Re-compiling plan after FDKA patch...")
@@ -511,6 +521,9 @@ class SelfEvolveSystem:
                 if patch_applied and committed_patch:
                     operator_name = committed_patch.get("operator")
                     if operator_name:
+                        # Patch passed full governance — mark immediately so the
+                        # failure injector is suppressed on the very next attempt.
+                        self.scenario.mark_operator_patched(operator_name)
                         pending_patched_operators.add(operator_name)
 
                     print("🔁 Re-compiling plan and retrying execution with the patched operator...")
@@ -620,6 +633,7 @@ class SelfEvolveSystem:
             print(f"  ⏭️  FDKA: LLM detected business constraint ({proposed_patch.get('details', 'unknown')})")
             print(f"     Skipping patch synthesis - this is an immutable constraint, not a bug.")
             self.metrics.record_pipeline_rejection("PIPELINE:LLM_DETECTED_CONSTRAINT")
+            self.metrics.record_constraint_skip()  # disambiguates terminal_rfr in manuscript
             self.provenance.log_patch_event(
                 proposed_patch,
                 decision="skipped",
@@ -673,31 +687,35 @@ class SelfEvolveSystem:
         canary_result: Dict[str, Any] = {}
 
         if guard_result['decision'] == 'allow':
-            print(" FDKA: Guardrails passed. Proceeding to canary test...")
-
             op_name = proposed_patch.get("operator")
-            fail_examples = self.experience_pool.get_failure_traces(operator=op_name) or []
-            succ_examples = self.experience_pool.get_success_traces(operator=op_name) or []
-            examples = (fail_examples[-5:] + succ_examples[-5:]) or self.experience_pool.traces[-10:]
+            if self.canary_enabled:
+                print(" FDKA: Guardrails passed. Proceeding to canary test...")
 
-            canary_context = {
-                "rule_pool": self.rule_pool,
-                "stage_fn": self.rule_pool.stage_patch,
-                "simulator": self._run_canary_simulation,
-                "examples": examples,
-                "canary_suite": get_canary_suite_for_operator(op_name),
-                "scorer": self.scorer,
-                "scores": scores,
-                "synthetic_patches": get_smt_sanity_patches_for_operator(op_name),
-                "defer_rollback": True,
-            }
+                fail_examples = self.experience_pool.get_failure_traces(operator=op_name) or []
+                succ_examples = self.experience_pool.get_success_traces(operator=op_name) or []
+                examples = (fail_examples[-5:] + succ_examples[-5:]) or self.experience_pool.traces[-10:]
 
-            canary_result = self.canary_runner.run(proposed_patch, canary_context) or {}
-            self.metrics.record_canary_test(
-                passed=bool(canary_result.get("passed")),
-                mode=canary_result.get("mode"),
-                reason=canary_result.get("reason", "")
-            )
+                canary_context = {
+                    "rule_pool": self.rule_pool,
+                    "stage_fn": self.rule_pool.stage_patch,
+                    "simulator": self._run_canary_simulation,
+                    "examples": examples,
+                    "canary_suite": get_canary_suite_for_operator(op_name),
+                    "scorer": self.scorer,
+                    "scores": scores,
+                    "synthetic_patches": get_smt_sanity_patches_for_operator(op_name),
+                    "defer_rollback": True,
+                }
+
+                canary_result = self.canary_runner.run(proposed_patch, canary_context) or {}
+                self.metrics.record_canary_test(
+                    passed=bool(canary_result.get("passed")),
+                    mode=canary_result.get("mode"),
+                    reason=canary_result.get("reason", "")
+                )
+            else:
+                print(" FDKA: Guardrails passed. Canary disabled by config; committing without empirical gate.")
+                canary_result = {"passed": True, "mode": "disabled", "reason": "disabled_by_config"}
 
             if canary_result.get("passed"):
                 print(" FDKA: Canary test passed. Committing patch permanently.")
@@ -805,11 +823,22 @@ class SelfEvolveSystem:
             patch_id = proposed_patch.get("id")
             self._last_committed_patch_id = patch_id
             self.trust_scorer.initialize_trust(patch_id)
+            failure_info = self._extract_failure_info(trace) or {}
+            failure_key = ""
+            if failure_info.get("operator") and failure_info.get("error"):
+                policy_ref = str(failure_info.get("policy_ref", "") or "")
+                failure_key = (
+                    f"{failure_info.get('operator')}:{failure_info.get('error')}:{policy_ref}"
+                    if policy_ref else
+                    f"{failure_info.get('operator')}:{failure_info.get('error')}"
+                )
             try:
                 self._committed_patches.append({
                     "patch_id": patch_id,
+                    "task_id": task_id,
                     "operator": proposed_patch.get("operator"),
                     "action": proposed_patch.get("action"),
+                    "failure_key": failure_key,
                     "scores": {
                         "plausibility": scores.get("plausibility"),
                         "consistency": scores.get("consistency"),
@@ -877,7 +906,7 @@ class SelfEvolveSystem:
     # ---------------------------------------------------------------------
 
     def run_evaluation(self) -> MetricsCollector:
-        print(f"\n{'=' * 70}\n🚀 STARTING SELFEVOLVE EVALUATION\n{'=' * 70}")
+        print(f"\n{'=' * 70}\n🚀 STARTING ANNEAL EVALUATION\n{'=' * 70}")
 
         for task_id in range(self.config.get('scenario', {}).get('num_tasks', 10)):
             instruction = self.scenario.get_task(task_id)
@@ -933,3 +962,7 @@ class SelfEvolveSystem:
 
         print(f"\n💾 Results saved to: {results_dir}")
         return self.metrics
+
+
+# Public alias — use this for new code; SelfEvolveSystem kept for backwards compat.
+AnnealSystem = SelfEvolveSystem

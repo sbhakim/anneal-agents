@@ -1,6 +1,6 @@
 # src/core/state.py
 """
-Implements the typed symbolic state (Σ) for the SELFEVOLVE architecture.
+Implements the typed symbolic state (Σ) for the ANNEAL architecture.
 """
 from typing import Dict, Any
 import copy
