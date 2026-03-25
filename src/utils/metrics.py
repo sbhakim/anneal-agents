@@ -1,6 +1,6 @@
 # src/utils/metrics.py
 """
-Metrics collection and computation for SELFEVOLVE evaluation.
+Metrics collection and computation for ANNEAL evaluation.
 Implements metrics from Section XII-C of the paper.
 
 UPDATED:
@@ -63,7 +63,7 @@ import pandas as pd
 
 class MetricsCollector:
     """
-    Collects and computes evaluation metrics for SELFEVOLVE.
+    Collects and computes evaluation metrics for ANNEAL.
 
     Primary metrics (Section XII-C):
     - Repeat Failure Rate (RFR)
@@ -130,6 +130,11 @@ class MetricsCollector:
 
         # Constraint violations
         self.constraint_violations = 0
+
+        # Tracks how many terminal failures were correctly identified as immutable
+        # business constraints and skipped by FDKA (not system failures).
+        # Used to disambiguate terminal_rfr in the manuscript.
+        self.constraint_skip_count = 0
 
         # Governance statistics
         self.governance_stats = {
@@ -237,6 +242,8 @@ class MetricsCollector:
             "observed_failure_events": len(observed_failure_keys),
             "observed_failure_classes": len(observed_failure_keys_unique),
             "recovered_failure_classes": len(recovered_failure_keys_unique),
+            "observed_failure_keys": observed_failure_keys_unique,
+            "recovered_failure_keys": recovered_failure_keys_unique,
         }
 
         if success:
@@ -388,6 +395,13 @@ class MetricsCollector:
     def record_constraint_violation(self) -> None:
         """Record a constraint violation."""
         self.constraint_violations += 1
+
+    def record_constraint_skip(self) -> None:
+        """Record a terminal failure where FDKA correctly identified an immutable
+        business constraint and skipped patching (not a system failure).
+        Allows manuscript to disambiguate terminal_rfr into:
+          constraint_terminal_rfr (expected) vs patchable_terminal_rfr (unexpected)."""
+        self.constraint_skip_count += 1
 
     # ============= GOVERNANCE & EFFICIENCY TRACKING =============
 
@@ -776,6 +790,16 @@ class MetricsCollector:
             "observed_rfr": observed_rfr,
             "terminal_rfr": terminal_rfr,
 
+            # Manuscript defensibility: break terminal_rfr into constraint vs patchable.
+            # constraint_terminal_rfr = failures correctly skipped (immutable business rules).
+            # patchable_terminal_rfr  = failures that FDKA should have fixed but didn't.
+            "constraint_terminal_rfr": (
+                self.constraint_skip_count / self.task_count if self.task_count > 0 else 0.0
+            ),
+            "patchable_terminal_rfr": max(0.0, terminal_rfr - (
+                self.constraint_skip_count / self.task_count if self.task_count > 0 else 0.0
+            )),
+
             "constraint_satisfaction_rate": self.calculate_csr(),
             "time_to_adapt": self.calculate_tta(),
             "rollback_frequency": self.calculate_rollback_frequency(),
@@ -803,7 +827,7 @@ class MetricsCollector:
         summary = self.get_summary()
 
         print("\n" + "=" * 60)
-        print("📊 SELFEVOLVE METRICS SUMMARY")
+        print("📊 ANNEAL METRICS SUMMARY")
         print("=" * 60)
 
         rm = summary.get("run_metadata") or {}
@@ -844,6 +868,8 @@ class MetricsCollector:
         print(f"\n[Primary Metrics]")
         print(f"  Repeat Failure Rate (Observed): {summary['observed_rfr']:.1%}")
         print(f"  Repeat Failure Rate (Terminal): {summary['terminal_rfr']:.1%}")
+        print(f"    → Constraint-class (correctly skipped): {summary['constraint_terminal_rfr']:.1%}")
+        print(f"    → Patchable-class (FDKA target):        {summary['patchable_terminal_rfr']:.1%}")
         print(f"  Constraint Satisfaction: {summary['constraint_satisfaction_rate']:.1%}")
         print(f"  Rollback Frequency: {summary['rollback_frequency']:.1f} per 1000")
         print(f"  Rollback Precision: {summary['rollback_precision']:.1%}")
@@ -1028,7 +1054,7 @@ class MetricsCollector:
             return
 
         rows = [{
-            'System': 'SelfEvolve-Full',
+            'System': 'ANNEAL-Full',
             'Total_LLM_Calls': self.efficiency['total_llm_calls'],
             'Total_Tokens': self.efficiency['total_tokens'],
             'Avg_Tokens_Per_Call': f"{self.efficiency['total_tokens'] / self.efficiency['total_llm_calls']:.1f}",
@@ -1225,7 +1251,7 @@ if __name__ == "__main__":
 
     metrics = MetricsCollector()
     metrics.set_run_metadata({
-        "ablation": "SelfEvolve-Full",
+        "ablation": "ANNEAL-Full",
         "difficulty": "hard",
         "seed": 42,
         "llm_provider": "openai",

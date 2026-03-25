@@ -1,6 +1,6 @@
 # src/utils/logger.py
 """
-Logging configuration for SELFEVOLVE.
+Logging configuration for ANNEAL.
 Simple setup for console and file logging.
 """
 import logging
@@ -10,7 +10,7 @@ from typing import Optional
 from datetime import datetime
 
 
-def setup_logger(config: dict, name: str = "selfevolve") -> logging.Logger:
+def setup_logger(config: dict, name: str = "anneal") -> logging.Logger:
     """
     Set up logging based on configuration.
 
@@ -23,7 +23,7 @@ def setup_logger(config: dict, name: str = "selfevolve") -> logging.Logger:
     """
     # Get config parameters
     level = config.get('level', 'INFO')
-    log_file = config.get('log_file', 'data/logs/selfevolve.log')
+    log_file = config.get('log_file', 'data/logs/anneal.log')
     console = config.get('console', True)
 
     # Create logger
@@ -69,7 +69,7 @@ def setup_logger(config: dict, name: str = "selfevolve") -> logging.Logger:
     return logger
 
 
-def get_logger(name: str = "selfevolve") -> logging.Logger:
+def get_logger(name: str = "anneal") -> logging.Logger:
     """
     Get existing logger instance.
 
