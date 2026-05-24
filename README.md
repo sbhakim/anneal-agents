@@ -120,6 +120,14 @@ Then run the same `scripts/run_agent_matrix.py` invocation. The symbolic accepta
 }
 ```
 
+## Contact
+
+For questions or comments about this work, feel free to reach out:
+
+> **safayat** &#x200B;[dot]&#x200B; **b** &#x200B;[dot]&#x200B; **hakim** &#x200B;[at]&#x200B; **gmail** &#x200B;[dot]&#x200B; **com**
+
+(Replace `[at]` with `@` and `[dot]` with `.` to get the address.)
+
 ## License
 
 MIT License.
