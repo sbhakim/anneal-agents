@@ -293,6 +293,11 @@ class FDKAPipeline:
             self.llm = DeepSeekProvider(self.config)
             print(f"FDKA: ✅ DeepSeek provider initialized (model={self.config.get('model', 'deepseek-chat')})")
 
+        elif self.llm_provider_type == 'anthropic':
+            from .llm_providers.anthropic_provider import AnthropicProvider
+            self.llm = AnthropicProvider(self.config)
+            print(f"FDKA: ✅ Anthropic provider initialized (model={self.config.get('model', 'claude-haiku-4-5-20251001')})")
+
         elif self.llm_provider_type == 'transformers':
             if not TRANSFORMERS_AVAILABLE:
                 raise ImportError(
@@ -491,7 +496,7 @@ class FDKAPipeline:
     # ---------------------------
     def _stage2_generate(self, serialized_prompt):
         prompt_dict = self._build_llm_prompt(serialized_prompt)
-        if self.llm_provider_type in ['openai', 'deepseek']:
+        if self.llm_provider_type in ['openai', 'deepseek', 'anthropic']:
             return self._generate_with_api(prompt_dict)
         elif self.llm_provider_type == 'transformers':
             return self._generate_with_transformers(prompt_dict)

@@ -45,6 +45,19 @@ python scripts/summarize_multiseed_metrics.py data/output_dir
 
 All four domains (travel, e-commerce, travel stochastic, ITSM) are switchable inside `config.yaml`.
 
+### Cross-model spot-check (optional)
+
+FDKA's patch synthesizer is provider-agnostic. To rerun the e-commerce matrix with Anthropic's Claude family in place of GPT-4o-mini, set `ANTHROPIC_API_KEY` and switch the provider under `fdka.propose_edit` in `config.yaml`:
+
+```yaml
+fdka:
+  propose_edit:
+    llm_provider: "anthropic"
+    model: "claude-haiku-4-5-20251001"
+```
+
+Then run the same `scripts/run_agent_matrix.py` invocation. The symbolic acceptance layer (scoring, guardrails, canary) is unchanged.
+
 ## Project Structure
 
 ```
