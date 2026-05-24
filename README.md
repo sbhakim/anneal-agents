@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.16309-b31b1b.svg)](https://arxiv.org/abs/2605.16309)
 
-> LLM-based agents recover from individual errors but repeatedly fail on the same fault when process knowledge remains unrepaired. **ANNEAL** converts recurring failures into governed symbolic edits of a process knowledge graph — without modifying foundation model weights.
+> LLM-based agents recover from individual errors but repeatedly fail on the same fault when process knowledge remains unrepaired. **ANNEAL** converts recurring failures into governed symbolic edits of a process knowledge graph — validated through scoring, guardrails, and canary testing, without modifying foundation model weights.
 
 <p align="center">
   <img src="Figures/anneal_system_arch.png" width="85%" alt="ANNEAL System Architecture"/>
