@@ -73,7 +73,8 @@ Then run the same `scripts/run_agent_matrix.py` invocation. The symbolic accepta
 │   ├── fdka/
 │   │   ├── failure_classifier.py    # Patchability classification
 │   │   ├── propose_edit.py          # Constrained patch synthesis (3-stage)
-│   │   └── scoring.py               # Multi-dimensional scoring
+│   │   ├── scoring.py               # Multi-dimensional scoring
+│   │   └── llm_providers/           # OpenAI, DeepSeek, Anthropic, mock backends
 │   ├── governance/
 │   │   ├── guard.py                 # Value/causal guardrails
 │   │   ├── canary.py                # Canary testing
@@ -91,7 +92,12 @@ Then run the same `scripts/run_agent_matrix.py` invocation. The symbolic accepta
 │   └── baselines/                   # ReAct, Reflexion, LLM-Reflect, Static-NS
 ├── scripts/
 │   ├── run_agent_matrix.py          # Multi-seed evaluation runner
-│   └── summarize_multiseed_metrics.py
+│   ├── summarize_multiseed_metrics.py
+│   └── run_ecommerce_stress.py      # Recurring-failure stress (PlaceOrder schema drift)
+├── analysis/                        # Post-hoc evaluation tooling
+│   ├── recovery_source_breakdown.py # Verify-vs-FDKA attribution per task
+│   ├── significance_analysis.py     # Bootstrap CIs + paired tests
+│   └── governance_breadth_probe.py  # Unsafe-edit guard coverage probe
 ├── tests/                           # Unit and integration tests
 └── data/knowledge/extracted/        # Domain knowledge graphs (input)
 ```
