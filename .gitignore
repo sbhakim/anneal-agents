@@ -79,4 +79,3 @@ data/traces/
 # Internal manuscript helper scripts
 scripts/export_manuscript_metrics.py
 scripts/run_adaptation_stress.py
-scripts/run_ecommerce_stress.py
