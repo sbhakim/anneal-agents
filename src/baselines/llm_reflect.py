@@ -140,6 +140,9 @@ class LLMReflectAgent:
 
         # Print summary
         self.metrics.print_summary()
+        output_dir = Path(self.config.get("output", {}).get("results_dir", "data/results"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics.save(output_dir / "metrics.json")
 
         return self.metrics
 
@@ -210,14 +213,15 @@ class LLMReflectAgent:
             trace, success, failure_info = self._execute_llm_plan(
                 plan, task_id, instruction
             )
-            final_trace = trace or final_trace
+            if trace:
+                final_trace.extend(trace)
 
             if success:
                 print("✅ Task Succeeded")
-                self.metrics.record_task(task_id, True, trace)
+                self.metrics.record_task(task_id, True, final_trace)
 
                 # Store successful execution in history
-                self._update_execution_history(instruction, trace, success=True)
+                self._update_execution_history(instruction, final_trace, success=True)
                 return
 
             # Step 3: On failure, generate reflection
@@ -457,22 +461,26 @@ Plan:"""
             print(f"   Executing: {action_name}")
 
             # Simulate execution (check for injected failures)
-            should_fail = self.scenario.should_inject_failure(
-                task_id, action_name, params, self.state
+            should_fail = self._scenario_should_fail(
+                task_id, action_name, params
             )
 
             if should_fail:
                 # Execution failed
-                failure_info = self.scenario.get_failure_details(
-                    task_id, action_name, params, self.state
+                failure_info = self._scenario_failure_details(
+                    task_id, action_name, params
                 )
 
                 trace.append({
                     "step": i,
                     "action": action_name,
+                    "operator": action_name,
                     "params": params,
                     "success": False,
-                    "error": failure_info
+                    "error": failure_info.get("error", "UnknownError"),
+                    "message": failure_info.get("message", ""),
+                    "policy_ref": failure_info.get("policy_ref", ""),
+                    "failure_details": failure_info,
                 })
 
                 return trace, False, failure_info
@@ -481,12 +489,26 @@ Plan:"""
             trace.append({
                 "step": i,
                 "action": action_name,
+                "operator": action_name,
                 "params": params,
                 "success": True
             })
             print(f"   ✓ {action_name} succeeded")
 
         return trace, True, {}
+
+    def _scenario_should_fail(self, task_id: int, operator: str, params: Dict[str, Any]) -> bool:
+        """Support both travel-style and ecommerce-style scenario failure APIs."""
+        if hasattr(self.scenario, "should_inject_failure"):
+            return bool(self.scenario.should_inject_failure(task_id, operator, params, self.state))
+        if hasattr(self.scenario, "should_fail"):
+            return bool(self.scenario.should_fail(task_id, operator, params=params, state=self.state))
+        return False
+
+    def _scenario_failure_details(self, task_id: int, operator: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if hasattr(self.scenario, "get_failure_details"):
+            return self.scenario.get_failure_details(task_id, operator, params=params, state=self.state) or {}
+        return {}
 
     def _generate_reflection(self, instruction: str, trace: List[Dict], failure_info: Dict) -> Dict[str, str]:
         """
