@@ -2,6 +2,7 @@
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.16309-b31b1b.svg)](https://arxiv.org/abs/2605.16309)
 
 > LLM-based agents recover from individual errors but repeatedly fail on the same fault when process knowledge remains unrepaired. **ANNEAL** converts recurring failures into governed symbolic edits of a process knowledge graph — without modifying foundation model weights.
 
@@ -108,11 +109,14 @@ Then run the same `scripts/run_agent_matrix.py` invocation. The symbolic accepta
 ## Citation
 
 ```bibtex
-@inproceedings{hakim2026anneal,
+@misc{hakim2026anneal,
   title={{ANNEAL}: Adapting LLM Agents via Governed Symbolic Patch Learning},
-  author={Hakim, Safayat Bin},
-  booktitle={Conference on Language Modeling (COLM)},
-  year={2026}
+  author={Hakim, Safayat Bin and Guo, Keyan and Tan, Wenkai and Velasquez, Alvaro and Xu, Shouhuai and Song, Houbing Herbert},
+  year={2026},
+  eprint={2605.16309},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2605.16309}
 }
 ```
 
