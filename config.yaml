@@ -50,7 +50,7 @@ fdka:
     # LLM PROVIDER CONFIGURATION
     # =========================================================================
     # Choose ONE provider by uncommenting the corresponding section below
-    # Available providers: "transformers", "openai", "deepseek", "mock"
+    # Available providers: "transformers", "openai", "deepseek", "anthropic", "mock"
     # =========================================================================
 
     # -------------------------------------------------------------------------
@@ -98,7 +98,17 @@ fdka:
     # base_url: "https://api.deepseek.com"
 
     # -------------------------------------------------------------------------
-    # OPTION 4: Mock Provider (Testing only)
+    # OPTION 4: Anthropic API (Claude family)
+    # -------------------------------------------------------------------------
+    # Best for: Cross-model spot-check of FDKA proposals (see README)
+    # Requirements: ANTHROPIC_API_KEY environment variable
+    # Quality: Used in rebuttal to confirm patch parity with GPT-4o-mini
+    # -------------------------------------------------------------------------
+    # llm_provider: "anthropic"
+    # model: "claude-haiku-4-5-20251001"
+
+    # -------------------------------------------------------------------------
+    # OPTION 5: Mock Provider (Testing only)
     # -------------------------------------------------------------------------
     # Best for: Testing, CI/CD, debugging without API calls
     # Requirements: None
@@ -175,7 +185,7 @@ knowledge:
 # SCENARIO CONFIGURATION
 # =============================================================================
 # Choose scenario by changing the "name" field
-# Available scenarios: "travel_planning", "ecommerce", "travel_stochastic"
+# Available scenarios: "travel_planning", "ecommerce", "travel_stochastic", "itsm"
 # =============================================================================
 scenario:
   # =========================================================================
@@ -187,7 +197,7 @@ scenario:
   # =========================================================================
 
   # -------------------------------------------------------------------------
-  # OPTION 1: Travel Planning (Original domain — CURRENTLY ACTIVE)
+  # OPTION 1: Travel Planning (Original domain)
   # system.domain must be: "travel_planning"
   # -------------------------------------------------------------------------
   # name: "travel_planning"
@@ -195,9 +205,9 @@ scenario:
 
   # -------------------------------------------------------------------------
   # OPTION 2: E-commerce (Cross-domain validation) — CURRENTLY ACTIVE
-  # To activate: comment out Option 1 name/difficulty, uncomment below.
+  # To switch: comment the two lines below and uncomment another option.
   # system.domain must be: "ecommerce"
-  # New: tool_schema_drift injected for PlaceOrder → triggers FDKA patch
+  # tool_schema_drift is injected for PlaceOrder → triggers FDKA patch.
   # -------------------------------------------------------------------------
   name: "ecommerce"
   difficulty: "normal"
@@ -237,9 +247,10 @@ scenario:
   task_generation_seed: 7
 
 evaluation:
-  baselines: ["static_nesy", "llm_reflect", "verify_only", "react", "reflexion"]
+  # Baseline keys must match src/baselines AGENT_MAP entries in main.py.
+  baselines: ["static_ns", "llm_reflect", "verify_only", "react", "reflexion"]
   ablations: ["no_governance", "no_verify", "no_arbitration", "no_fdka"]
-  domains: ["travel_planning", "ecommerce", "itsm"]
+  domains: ["travel_planning", "ecommerce", "travel_stochastic", "itsm"]
 
 experiment:
   agent_to_run: "anneal"
