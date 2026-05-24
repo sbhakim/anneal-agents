@@ -75,6 +75,9 @@ data/stress_ecommerce2/
 data/logs/
 data/patches/
 data/traces/
+# Rebuttal stress-runner outputs (capability retention, variant surface, etc.)
+data/results_rebuttal/
+data/logs_rebuttal/
 
 # Internal manuscript helper scripts
 scripts/export_manuscript_metrics.py
