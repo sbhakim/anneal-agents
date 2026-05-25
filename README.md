@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Figures/anneal-logo.png" width="520" alt="ANNEAL logo"/>
+</p>
+
 # ANNEAL: Adapting LLM Agents via Governed Symbolic Patch Learning
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
